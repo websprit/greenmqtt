@@ -1,0 +1,28 @@
+[node]
+id = 1
+name = "greenmqtt-local"
+
+[broker]
+tcp = true
+tls = false
+tls_bind = "127.0.0.1:8883"
+tls_cert = ""
+tls_key = ""
+ws = false
+ws_bind = "127.0.0.1:8083"
+wss = false
+wss_bind = "127.0.0.1:8084"
+quic = false
+quic_bind = "127.0.0.1:14567"
+server_keep_alive_secs = 0
+max_packet_size = 0
+server_reference = ""
+
+[services]
+storage_backend = "sled"
+redis_url = "redis://127.0.0.1:6379/"
+bridge_rules = "demo@devices/#=127.0.0.1:2883"
+sessiondict = "in-memory"
+dist = "in-memory"
+inbox = "in-memory"
+retain = "in-memory"

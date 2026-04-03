@@ -1,0 +1,357 @@
+syntax = "proto3";
+
+package greenmqtt.internal.v1;
+
+import "google/protobuf/empty.proto";
+
+message ClientIdentity {
+  string tenant_id = 1;
+  string user_id = 2;
+  string client_id = 3;
+}
+
+message SessionRecord {
+  string session_id = 1;
+  uint64 node_id = 2;
+  string kind = 3;
+  ClientIdentity identity = 4;
+  uint32 session_expiry_interval_secs = 5;
+  uint64 expires_at_ms = 6;
+}
+
+message RouteRecord {
+  string tenant_id = 1;
+  string topic_filter = 2;
+  string session_id = 3;
+  uint64 node_id = 4;
+  uint32 subscription_identifier = 5;
+  bool no_local = 6;
+  bool retain_as_published = 7;
+  string shared_group = 8;
+  string kind = 9;
+}
+
+message SubscriptionRecord {
+  string session_id = 1;
+  string tenant_id = 2;
+  string topic_filter = 3;
+  uint32 qos = 4;
+  uint32 subscription_identifier = 5;
+  bool no_local = 6;
+  bool retain_as_published = 7;
+  uint32 retain_handling = 8;
+  string shared_group = 9;
+  string kind = 10;
+}
+
+message OfflineMessage {
+  string tenant_id = 1;
+  string session_id = 2;
+  string topic = 3;
+  bytes payload = 4;
+  uint32 qos = 5;
+  bool retain = 6;
+  string from_session_id = 7;
+  PublishProperties properties = 8;
+}
+
+message InflightMessage {
+  string tenant_id = 1;
+  string session_id = 2;
+  uint32 packet_id = 3;
+  string topic = 4;
+  bytes payload = 5;
+  uint32 qos = 6;
+  bool retain = 7;
+  string from_session_id = 8;
+  PublishProperties properties = 9;
+  string phase = 10;
+}
+
+message RetainedMessage {
+  string tenant_id = 1;
+  string topic = 2;
+  bytes payload = 3;
+  uint32 qos = 4;
+}
+
+message Delivery {
+  string tenant_id = 1;
+  string session_id = 2;
+  string topic = 3;
+  bytes payload = 4;
+  uint32 qos = 5;
+  bool retain = 6;
+  string from_session_id = 7;
+  PublishProperties properties = 8;
+}
+
+message UserProperty {
+  string key = 1;
+  string value = 2;
+}
+
+message PublishProperties {
+  uint32 payload_format_indicator = 1;
+  string content_type = 2;
+  uint32 message_expiry_interval_secs = 3;
+  uint64 stored_at_ms = 4;
+  string response_topic = 5;
+  bytes correlation_data = 6;
+  repeated uint32 subscription_identifiers = 7;
+  repeated UserProperty user_properties = 8;
+}
+
+message RegisterSessionRequest {
+  SessionRecord record = 1;
+}
+
+message RegisterSessionReply {
+  SessionRecord replaced = 1;
+}
+
+message UnregisterSessionRequest {
+  string session_id = 1;
+}
+
+message LookupSessionRequest {
+  ClientIdentity identity = 1;
+}
+
+message LookupSessionReply {
+  SessionRecord record = 1;
+}
+
+message LookupSessionByIdRequest {
+  string session_id = 1;
+}
+
+message ListSessionsRequest {
+  string tenant_id = 1;
+}
+
+message ListSessionsReply {
+  repeated SessionRecord records = 1;
+}
+
+message AddRouteRequest {
+  RouteRecord route = 1;
+}
+
+message RemoveRouteRequest {
+  RouteRecord route = 1;
+}
+
+message RemoveSessionRoutesRequest {
+  string session_id = 1;
+}
+
+message RemoveSessionRoutesReply {
+  uint32 removed = 1;
+}
+
+message ListSessionRoutesRequest {
+  string session_id = 1;
+}
+
+message ListSessionRoutesReply {
+  repeated RouteRecord routes = 1;
+}
+
+message MatchTopicRequest {
+  string tenant_id = 1;
+  string topic = 2;
+}
+
+message MatchTopicReply {
+  repeated RouteRecord routes = 1;
+}
+
+message ListRoutesRequest {
+  string tenant_id = 1;
+}
+
+message ListRoutesReply {
+  repeated RouteRecord routes = 1;
+}
+
+message InboxAttachRequest {
+  string session_id = 1;
+}
+
+message InboxSubscribeRequest {
+  string session_id = 1;
+  string tenant_id = 2;
+  string topic_filter = 3;
+  uint32 qos = 4;
+  uint32 subscription_identifier = 5;
+  bool no_local = 6;
+  bool retain_as_published = 7;
+  uint32 retain_handling = 8;
+  string shared_group = 9;
+  string kind = 10;
+}
+
+message InboxDetachRequest {
+  string session_id = 1;
+}
+
+message InboxUnsubscribeRequest {
+  string session_id = 1;
+  string topic_filter = 2;
+  string shared_group = 3;
+}
+
+message InboxUnsubscribeReply {
+  bool removed = 1;
+}
+
+message InboxEnqueueRequest {
+  OfflineMessage message = 1;
+}
+
+message InboxFetchRequest {
+  string session_id = 1;
+}
+
+message InboxPurgeSessionRequest {
+  string session_id = 1;
+}
+
+message InboxListMessagesRequest {
+  string tenant_id = 1;
+  string session_id = 2;
+}
+
+message InboxFetchReply {
+  repeated OfflineMessage messages = 1;
+}
+
+message InboxStageInflightRequest {
+  InflightMessage message = 1;
+}
+
+message InboxAckInflightRequest {
+  string session_id = 1;
+  uint32 packet_id = 2;
+}
+
+message InboxFetchInflightRequest {
+  string session_id = 1;
+}
+
+message InboxFetchInflightReply {
+  repeated InflightMessage messages = 1;
+}
+
+message InboxListSubscriptionsRequest {
+  string session_id = 1;
+}
+
+message InboxLookupSubscriptionRequest {
+  string session_id = 1;
+  string topic_filter = 2;
+  string shared_group = 3;
+}
+
+message InboxListAllSubscriptionsRequest {
+  string tenant_id = 1;
+  string session_id = 2;
+}
+
+message InboxListSubscriptionsReply {
+  repeated SubscriptionRecord subscriptions = 1;
+}
+
+message InboxLookupSubscriptionReply {
+  SubscriptionRecord subscription = 1;
+}
+
+message RetainWriteRequest {
+  RetainedMessage message = 1;
+}
+
+message RetainMatchRequest {
+  string tenant_id = 1;
+  string topic_filter = 2;
+}
+
+message RetainMatchReply {
+  repeated RetainedMessage messages = 1;
+}
+
+message PushDeliveryRequest {
+  Delivery delivery = 1;
+}
+
+message PushDeliveryReply {
+  bool delivered = 1;
+}
+
+message PushDeliveriesRequest {
+  repeated Delivery deliveries = 1;
+}
+
+message PushDeliveriesReply {
+  repeated uint32 undelivered_indices = 1;
+}
+
+message CountReply {
+  uint64 count = 1;
+}
+
+message InboxStatsReply {
+  uint64 subscriptions = 1;
+  uint64 offline_messages = 2;
+  uint64 inflight_messages = 3;
+}
+
+service SessionDictService {
+  rpc RegisterSession(RegisterSessionRequest) returns (RegisterSessionReply);
+  rpc UnregisterSession(UnregisterSessionRequest) returns (RegisterSessionReply);
+  rpc LookupSession(LookupSessionRequest) returns (LookupSessionReply);
+  rpc LookupSessionById(LookupSessionByIdRequest) returns (LookupSessionReply);
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsReply);
+  rpc CountSessions(.google.protobuf.Empty) returns (CountReply);
+}
+
+service DistService {
+  rpc AddRoute(AddRouteRequest) returns (.google.protobuf.Empty);
+  rpc RemoveRoute(RemoveRouteRequest) returns (.google.protobuf.Empty);
+  rpc RemoveSessionRoutes(RemoveSessionRoutesRequest) returns (RemoveSessionRoutesReply);
+  rpc ListSessionRoutes(ListSessionRoutesRequest) returns (ListSessionRoutesReply);
+  rpc MatchTopic(MatchTopicRequest) returns (MatchTopicReply);
+  rpc ListRoutes(ListRoutesRequest) returns (ListRoutesReply);
+  rpc CountRoutes(.google.protobuf.Empty) returns (CountReply);
+}
+
+service InboxService {
+  rpc Attach(InboxAttachRequest) returns (.google.protobuf.Empty);
+  rpc Detach(InboxDetachRequest) returns (.google.protobuf.Empty);
+  rpc PurgeSession(InboxPurgeSessionRequest) returns (.google.protobuf.Empty);
+  rpc Subscribe(InboxSubscribeRequest) returns (.google.protobuf.Empty);
+  rpc Unsubscribe(InboxUnsubscribeRequest) returns (InboxUnsubscribeReply);
+  rpc Enqueue(InboxEnqueueRequest) returns (.google.protobuf.Empty);
+  rpc ListSubscriptions(InboxListSubscriptionsRequest) returns (InboxListSubscriptionsReply);
+  rpc LookupSubscription(InboxLookupSubscriptionRequest) returns (InboxLookupSubscriptionReply);
+  rpc ListAllSubscriptions(InboxListAllSubscriptionsRequest) returns (InboxListSubscriptionsReply);
+  rpc ListOffline(InboxListMessagesRequest) returns (InboxFetchReply);
+  rpc Peek(InboxFetchRequest) returns (InboxFetchReply);
+  rpc Fetch(InboxFetchRequest) returns (InboxFetchReply);
+  rpc StageInflight(InboxStageInflightRequest) returns (.google.protobuf.Empty);
+  rpc AckInflight(InboxAckInflightRequest) returns (.google.protobuf.Empty);
+  rpc ListInflight(InboxListMessagesRequest) returns (InboxFetchInflightReply);
+  rpc FetchInflight(InboxFetchInflightRequest) returns (InboxFetchInflightReply);
+  rpc Stats(.google.protobuf.Empty) returns (InboxStatsReply);
+}
+
+service RetainService {
+  rpc Write(RetainWriteRequest) returns (.google.protobuf.Empty);
+  rpc Match(RetainMatchRequest) returns (RetainMatchReply);
+  rpc CountRetained(.google.protobuf.Empty) returns (CountReply);
+}
+
+service BrokerPeerService {
+  rpc PushDelivery(PushDeliveryRequest) returns (PushDeliveryReply);
+  rpc PushDeliveries(PushDeliveriesRequest) returns (PushDeliveriesReply);
+}

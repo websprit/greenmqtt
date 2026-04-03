@@ -1,0 +1,13 @@
+[package]
+name = "greenmqtt-plugin-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+greenmqtt-core = { path = "../greenmqtt-core" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

@@ -1,0 +1,21 @@
+[package]
+name = "greenmqtt-broker-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+greenmqtt-broker = { path = "../crates/greenmqtt-broker", features = ["fuzzing"] }
+
+[[bin]]
+name = "packet_frame"
+path = "fuzz_targets/packet_frame.rs"
+test = false
+doc = false
+
+[workspace]
+members = ["."]

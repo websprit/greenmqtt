@@ -1,0 +1,26 @@
+[package]
+name = "greenmqtt-http-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+axum = { version = "0.7", features = ["macros"] }
+greenmqtt-broker = { path = "../greenmqtt-broker" }
+greenmqtt-core = { path = "../greenmqtt-core" }
+greenmqtt-dist = { path = "../greenmqtt-dist" }
+greenmqtt-inbox = { path = "../greenmqtt-inbox" }
+greenmqtt-plugin-api = { path = "../greenmqtt-plugin-api" }
+greenmqtt-retain = { path = "../greenmqtt-retain" }
+greenmqtt-sessiondict = { path = "../greenmqtt-sessiondict" }
+metrics-exporter-prometheus.workspace = true
+serde.workspace = true
+sysinfo.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+greenmqtt-storage = { path = "../greenmqtt-storage" }
+serde_json = "1"
+tower = { version = "0.5", features = ["util"] }

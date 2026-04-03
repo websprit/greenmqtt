@@ -1,0 +1,18 @@
+[package]
+name = "greenmqtt-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+greenmqtt-core = { path = "../greenmqtt-core" }
+serde_json = "1"
+sled = "0.34"
+tokio.workspace = true
+rocksdb = "0.22"
+redis = { version = "0.27", features = ["aio", "tokio-comp"] }
+
+[dev-dependencies]
+tempfile = "3"

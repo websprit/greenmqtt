@@ -1,0 +1,7 @@
+services:
+  greenmqtt:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: []
+

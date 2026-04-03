@@ -1,0 +1,34 @@
+[workspace]
+members = [
+    "crates/greenmqtt-core",
+    "crates/greenmqtt-broker",
+    "crates/greenmqtt-proto",
+    "crates/greenmqtt-rpc",
+    "crates/greenmqtt-sessiondict",
+    "crates/greenmqtt-dist",
+    "crates/greenmqtt-inbox",
+    "crates/greenmqtt-retain",
+    "crates/greenmqtt-storage",
+    "crates/greenmqtt-plugin-api",
+    "crates/greenmqtt-http-api",
+    "crates/greenmqtt-cli",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+bytes = { version = "1", features = ["serde"] }
+dashmap = "6"
+metrics = "0.23"
+metrics-exporter-prometheus = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sysinfo = "0.30"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tonic = { version = "0.12", features = ["transport"] }

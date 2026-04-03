@@ -1,0 +1,27 @@
+[package]
+name = "greenmqtt-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+greenmqtt-broker = { path = "../greenmqtt-broker" }
+greenmqtt-core = { path = "../greenmqtt-core" }
+greenmqtt-dist = { path = "../greenmqtt-dist" }
+greenmqtt-http-api = { path = "../greenmqtt-http-api" }
+greenmqtt-inbox = { path = "../greenmqtt-inbox" }
+greenmqtt-retain = { path = "../greenmqtt-retain" }
+greenmqtt-rpc = { path = "../greenmqtt-rpc" }
+greenmqtt-sessiondict = { path = "../greenmqtt-sessiondict" }
+greenmqtt-storage = { path = "../greenmqtt-storage" }
+greenmqtt-plugin-api = { path = "../greenmqtt-plugin-api" }
+metrics-exporter-prometheus.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sysinfo.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

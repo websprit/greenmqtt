@@ -1,0 +1,19 @@
+[package]
+name = "greenmqtt-rpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+greenmqtt-broker = { path = "../greenmqtt-broker" }
+greenmqtt-core = { path = "../greenmqtt-core" }
+greenmqtt-dist = { path = "../greenmqtt-dist" }
+greenmqtt-inbox = { path = "../greenmqtt-inbox" }
+greenmqtt-plugin-api = { path = "../greenmqtt-plugin-api" }
+greenmqtt-proto = { path = "../greenmqtt-proto" }
+greenmqtt-retain = { path = "../greenmqtt-retain" }
+greenmqtt-sessiondict = { path = "../greenmqtt-sessiondict" }
+tokio.workspace = true
+tonic.workspace = true
