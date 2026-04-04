@@ -64,6 +64,22 @@ GREENMQTT_PROFILE_SUMMARY_FILE=/tmp/post-release-hourly.json ./scripts/run-post-
 GREENMQTT_PROFILE_SUMMARY_FILE=/tmp/post-release-daily.json ./scripts/run-post-release-inspection.sh daily
 ```
 
+Unified wrapper:
+
+```bash
+./scripts/run-scheduled-checks.sh hourly
+./scripts/run-scheduled-checks.sh daily
+./scripts/run-scheduled-checks.sh nightly
+```
+
+Dry-run planning:
+
+```bash
+./scripts/run-scheduled-checks.sh hourly --dry-run
+./scripts/run-scheduled-checks.sh daily --dry-run
+./scripts/run-scheduled-checks.sh nightly --dry-run
+```
+
 ## What healthy output looks like
 
 - `post-release-inspection.status == 0`
@@ -118,3 +134,4 @@ Escalation:
   - the `GREENMQTT_HTTP_BIND` value
   - the JSON summary output location
   - the rollback drill entry point
+  - the scheduled wrapper entry point `./scripts/run-scheduled-checks.sh`
