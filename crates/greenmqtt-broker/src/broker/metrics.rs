@@ -57,4 +57,40 @@ impl BrokerMetrics {
             _ => {}
         }
     }
+
+    pub(crate) fn record_shard_move(kind: &str, tenant_id: &str) {
+        counter!(
+            "mqtt_shard_move_total",
+            "kind" => kind.to_string(),
+            "tenant_id" => tenant_id.to_string()
+        )
+        .increment(1);
+    }
+
+    pub(crate) fn record_shard_failover(kind: &str, tenant_id: &str) {
+        counter!(
+            "mqtt_shard_failover_total",
+            "kind" => kind.to_string(),
+            "tenant_id" => tenant_id.to_string()
+        )
+        .increment(1);
+    }
+
+    pub(crate) fn record_shard_anti_entropy(kind: &str, tenant_id: &str) {
+        counter!(
+            "mqtt_shard_anti_entropy_total",
+            "kind" => kind.to_string(),
+            "tenant_id" => tenant_id.to_string()
+        )
+        .increment(1);
+    }
+
+    pub(crate) fn record_shard_fencing_reject(kind: &str, tenant_id: &str) {
+        counter!(
+            "mqtt_shard_fencing_reject_total",
+            "kind" => kind.to_string(),
+            "tenant_id" => tenant_id.to_string()
+        )
+        .increment(1);
+    }
 }

@@ -2,12 +2,16 @@ use super::{
     configured_acl, configured_auth, configured_hooks, configured_webhook, durable_services,
     parse_acl_rules, parse_bench_scenario, parse_bench_scenarios, parse_bridge_rules,
     parse_compare_backends, parse_identity_matchers, parse_topic_rewrite_rules, redis_services,
-    run_bench, run_compare_bench, run_compare_soak, run_profile_bench, run_soak,
-    validate_bench_report, validate_soak_report, BenchConfig, BenchReport, BenchScenario,
-    BenchThresholds, SoakConfig, SoakReport, SoakThresholds,
+    run_bench, run_compare_bench, run_compare_soak, run_profile_bench, run_shard_command, run_soak,
+    shard_command_request, validate_bench_report, validate_soak_report, BenchConfig, BenchReport,
+    BenchScenario, BenchThresholds, SoakConfig, SoakReport, SoakThresholds,
 };
 use greenmqtt_broker::{BrokerConfig, BrokerRuntime};
-use greenmqtt_core::ClientIdentity;
+use greenmqtt_core::{
+    ClientIdentity, ClusterMembershipRegistry, ClusterNodeLifecycle, ClusterNodeMembership,
+    ServiceEndpoint, ServiceEndpointRegistry, ServiceKind, ServiceShardAssignment, ServiceShardKey,
+    ServiceShardLifecycle,
+};
 use greenmqtt_dist::DistHandle;
 use greenmqtt_inbox::InboxHandle;
 use greenmqtt_plugin_api::{
@@ -15,8 +19,10 @@ use greenmqtt_plugin_api::{
     ConfiguredEventHook,
 };
 use greenmqtt_retain::RetainHandle;
+use greenmqtt_rpc::StaticServiceEndpointRegistry;
 use greenmqtt_sessiondict::SessionDictHandle;
 use metrics_exporter_prometheus::PrometheusBuilder;
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -72,6 +78,101 @@ fn test_broker() -> Arc<BrokerRuntime<ConfiguredAuth, ConfiguredAcl, ConfiguredE
         Arc::new(InboxHandle::default()),
         Arc::new(RetainHandle::default()),
     ))
+}
+
+#[test]
+fn shard_cli_command_drives_http_shard_move() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let broker = test_broker();
+        let shards = Arc::new(StaticServiceEndpointRegistry::default());
+        shards
+            .upsert_member(ClusterNodeMembership::new(
+                7,
+                1,
+                ClusterNodeLifecycle::Serving,
+                vec![ServiceEndpoint::new(
+                    ServiceKind::Dist,
+                    7,
+                    "http://127.0.0.1:50070",
+                )],
+            ))
+            .await
+            .unwrap();
+        shards
+            .upsert_member(ClusterNodeMembership::new(
+                9,
+                1,
+                ClusterNodeLifecycle::Serving,
+                vec![ServiceEndpoint::new(
+                    ServiceKind::Dist,
+                    9,
+                    "http://127.0.0.1:50090",
+                )],
+            ))
+            .await
+            .unwrap();
+        shards
+            .upsert_assignment(ServiceShardAssignment::new(
+                ServiceShardKey::dist("t1"),
+                ServiceEndpoint::new(ServiceKind::Dist, 7, "http://127.0.0.1:50070"),
+                1,
+                10,
+                ServiceShardLifecycle::Serving,
+            ))
+            .await
+            .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        drop(broker);
+        let shards_for_server = shards.clone();
+        let server = std::thread::spawn(move || {
+            let listener = TcpListener::bind(addr).unwrap();
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            stream.read_to_string(&mut request).unwrap();
+            assert!(request.contains("POST /v1/shards/dist/t1/*/move HTTP/1.1"));
+            assert!(request.contains(r#"{"target_node_id":9}"#));
+            let assignment = ServiceShardAssignment::new(
+                ServiceShardKey::dist("t1"),
+                ServiceEndpoint::new(ServiceKind::Dist, 9, "http://127.0.0.1:50090"),
+                2,
+                11,
+                ServiceShardLifecycle::Draining,
+            );
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime
+                .block_on(shards_for_server.upsert_assignment(assignment))
+                .unwrap();
+            let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: 26\r\n\r\n{\"previous\":null,\"current\":null}";
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        std::env::set_var("GREENMQTT_HTTP_BIND", addr.to_string());
+        run_shard_command(
+            vec![
+                "move".to_string(),
+                "dist".to_string(),
+                "t1".to_string(),
+                "*".to_string(),
+                "9".to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        std::env::remove_var("GREENMQTT_HTTP_BIND");
+
+        let assignment = shards
+            .resolve_assignment(&ServiceShardKey::dist("t1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(assignment.owner_node_id(), 9);
+
+        server.join().unwrap();
+    });
 }
 
 fn assert_bench_phase_timings(report: &BenchReport) {
@@ -1343,4 +1444,40 @@ fn configured_hooks_accepts_bridge_timeout_and_fail_open_env() {
     std::env::remove_var("GREENMQTT_BRIDGE_RETRY_DELAY_MS");
     std::env::remove_var("GREENMQTT_BRIDGE_MAX_INFLIGHT");
     assert!(hooks.is_ok());
+}
+
+#[test]
+fn shard_command_request_builds_ls_query() {
+    let (method, path, body) = shard_command_request(
+        vec![
+            "ls".to_string(),
+            "--kind".to_string(),
+            "dist".to_string(),
+            "--tenant-id".to_string(),
+            "t1".to_string(),
+        ]
+        .into_iter(),
+    )
+    .unwrap();
+    assert_eq!(method, "GET");
+    assert_eq!(path, "/v1/shards?kind=dist&tenant_id=t1");
+    assert!(body.is_none());
+}
+
+#[test]
+fn shard_command_request_builds_move_request() {
+    let (method, path, body) = shard_command_request(
+        vec![
+            "move".to_string(),
+            "dist".to_string(),
+            "t1".to_string(),
+            "*".to_string(),
+            "9".to_string(),
+        ]
+        .into_iter(),
+    )
+    .unwrap();
+    assert_eq!(method, "POST");
+    assert_eq!(path, "/v1/shards/dist/t1/*/move");
+    assert_eq!(body.as_deref(), Some(r#"{"target_node_id":9}"#));
 }

@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use bytes::Bytes;
 use greenmqtt_broker::{DeliverySink, PeerForwarder, PeerRegistry};
 use greenmqtt_core::{
     ClientIdentity, ClusterMembershipRegistry, ClusterNodeMembership, Delivery, InflightMessage,
@@ -7,7 +8,9 @@ use greenmqtt_core::{
     ServiceShardRecoveryControl, ServiceShardTransition, ServiceShardTransitionKind, Subscription,
 };
 use greenmqtt_dist::{dist_tenant_shard, DistRouter};
-use greenmqtt_inbox::{inbox_session_shard, InboxService};
+use greenmqtt_inbox::{
+    inbox_session_shard, inbox_tenant_scan_shard, inflight_tenant_scan_shard, InboxService,
+};
 use greenmqtt_proto::internal::{
     broker_peer_service_client::BrokerPeerServiceClient,
     broker_peer_service_server::{BrokerPeerService, BrokerPeerServiceServer},
@@ -41,6 +44,7 @@ use greenmqtt_proto::{
 };
 use greenmqtt_retain::{retain_tenant_shard, RetainService as RetainStoreService};
 use greenmqtt_sessiondict::{session_identity_shard, SessionDirectory};
+use metrics::counter;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
@@ -332,6 +336,12 @@ async fn validate_snapshot_assignment(
         .map_err(internal_status)?
         .ok_or_else(|| Status::failed_precondition("missing shard assignment"))?;
     if !current.matches_owner_epoch_fence(&expected) {
+        counter!(
+            "mqtt_shard_fencing_reject_total",
+            "kind" => format!("{:?}", expected.shard.kind).to_lowercase(),
+            "tenant_id" => expected.shard.tenant_id.clone()
+        )
+        .increment(1);
         return Err(Status::failed_precondition("stale shard assignment"));
     }
     Ok(())
@@ -468,6 +478,59 @@ impl SessionDictGrpcClient {
             "sessiondict shard catch-up checksum mismatch"
         );
         Ok(assignment)
+    }
+
+    pub async fn anti_entropy_sync_tenant_replica_via_registry(
+        registry: &DynamicServiceEndpointRegistry,
+        tenant_id: &str,
+        replica_node_id: NodeId,
+    ) -> anyhow::Result<u64> {
+        let shard = greenmqtt_sessiondict::session_scan_shard(tenant_id);
+        let source_assignment = registry.resolve_assignment(&shard).await?.ok_or_else(|| {
+            anyhow::anyhow!("no sessiondict assignment registered for shard {shard:?}")
+        })?;
+        let source =
+            SessionDictGrpcClient::connect(source_assignment.endpoint.endpoint.clone()).await?;
+        let source_snapshot = source.stream_shard_snapshot(&source_assignment).await?;
+
+        let member = registry
+            .resolve_member(replica_node_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("replica member {replica_node_id} not found"))?;
+        let replica_endpoint = member
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.kind == ServiceKind::SessionDict)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!("replica member {replica_node_id} has no sessiondict endpoint")
+            })?;
+        let replica = SessionDictGrpcClient::connect(replica_endpoint.endpoint).await?;
+        let replica_snapshot = replica.export_shard_snapshot(&shard).await?;
+        if source_snapshot.checksum()? != replica_snapshot.checksum()? {
+            for record in &replica_snapshot.sessions {
+                if !source_snapshot
+                    .sessions
+                    .iter()
+                    .any(|candidate| candidate.session_id == record.session_id)
+                {
+                    replica.unregister(&record.session_id).await?;
+                }
+            }
+            for record in &source_snapshot.sessions {
+                if !replica_snapshot.sessions.iter().any(|candidate| {
+                    candidate.session_id == record.session_id && candidate == record
+                }) {
+                    replica.register(record.clone()).await?;
+                }
+            }
+            let repaired = replica.export_shard_snapshot(&shard).await?;
+            anyhow::ensure!(
+                repaired.checksum()? == source_snapshot.checksum()?,
+                "sessiondict shard replica anti-entropy checksum mismatch"
+            );
+        }
+        source_snapshot.checksum()
     }
 }
 
@@ -1159,6 +1222,45 @@ impl PeriodicAntiEntropyReconciler {
         .await
     }
 
+    pub async fn reconcile_sessiondict_tenant_replica(
+        &self,
+        tenant_id: &str,
+        replica_node_id: NodeId,
+    ) -> anyhow::Result<u64> {
+        SessionDictGrpcClient::anti_entropy_sync_tenant_replica_via_registry(
+            &self.registry,
+            tenant_id,
+            replica_node_id,
+        )
+        .await
+    }
+
+    pub async fn reconcile_inbox_tenant_replica(
+        &self,
+        tenant_id: &str,
+        replica_node_id: NodeId,
+    ) -> anyhow::Result<(u64, u64)> {
+        InboxGrpcClient::anti_entropy_sync_tenant_replica_via_registry(
+            &self.registry,
+            tenant_id,
+            replica_node_id,
+        )
+        .await
+    }
+
+    pub async fn reconcile_retain_tenant_replica(
+        &self,
+        tenant_id: &str,
+        replica_node_id: NodeId,
+    ) -> anyhow::Result<u64> {
+        RetainGrpcClient::anti_entropy_sync_tenant_replica_via_registry(
+            &self.registry,
+            tenant_id,
+            replica_node_id,
+        )
+        .await
+    }
+
     pub async fn run_dist_tenant_replica_until_cancelled(
         &self,
         tenant_id: String,
@@ -1174,6 +1276,69 @@ impl PeriodicAntiEntropyReconciler {
                 }
                 _ = tokio::time::sleep(self.interval) => {
                     self.reconcile_dist_tenant_replica(&tenant_id, replica_node_id).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn run_sessiondict_tenant_replica_until_cancelled(
+        &self,
+        tenant_id: String,
+        replica_node_id: NodeId,
+        mut cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        loop {
+            tokio::select! {
+                _ = cancel.changed() => {
+                    if *cancel.borrow() {
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep(self.interval) => {
+                    self.reconcile_sessiondict_tenant_replica(&tenant_id, replica_node_id).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn run_inbox_tenant_replica_until_cancelled(
+        &self,
+        tenant_id: String,
+        replica_node_id: NodeId,
+        mut cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        loop {
+            tokio::select! {
+                _ = cancel.changed() => {
+                    if *cancel.borrow() {
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep(self.interval) => {
+                    self.reconcile_inbox_tenant_replica(&tenant_id, replica_node_id).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn run_retain_tenant_replica_until_cancelled(
+        &self,
+        tenant_id: String,
+        replica_node_id: NodeId,
+        mut cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        loop {
+            tokio::select! {
+                _ = cancel.changed() => {
+                    if *cancel.borrow() {
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep(self.interval) => {
+                    self.reconcile_retain_tenant_replica(&tenant_id, replica_node_id).await?;
                 }
             }
         }
@@ -1392,6 +1557,107 @@ impl InboxGrpcClient {
         );
         Ok(assignment)
     }
+
+    pub async fn anti_entropy_sync_tenant_replica_via_registry(
+        registry: &DynamicServiceEndpointRegistry,
+        tenant_id: &str,
+        replica_node_id: NodeId,
+    ) -> anyhow::Result<(u64, u64)> {
+        let source_assignment = registry
+            .resolve_assignment(&inbox_tenant_scan_shard(tenant_id))
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("no inbox assignment registered for tenant {tenant_id}")
+            })?;
+        let source = InboxGrpcClient::connect(source_assignment.endpoint.endpoint.clone()).await?;
+        let source_inbox_snapshot = source
+            .export_shard_snapshot(&inbox_tenant_scan_shard(tenant_id))
+            .await?;
+        let source_inflight_snapshot = source
+            .export_shard_snapshot(&inflight_tenant_scan_shard(tenant_id))
+            .await?;
+
+        let member = registry
+            .resolve_member(replica_node_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("replica member {replica_node_id} not found"))?;
+        let replica_endpoint = member
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.kind == ServiceKind::Inbox)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!("replica member {replica_node_id} has no inbox endpoint")
+            })?;
+        let replica = InboxGrpcClient::connect(replica_endpoint.endpoint).await?;
+        let replica_inbox_snapshot = replica
+            .export_shard_snapshot(&inbox_tenant_scan_shard(tenant_id))
+            .await?;
+        let replica_inflight_snapshot = replica
+            .export_shard_snapshot(&inflight_tenant_scan_shard(tenant_id))
+            .await?;
+
+        if source_inbox_snapshot.checksum()? != replica_inbox_snapshot.checksum()? {
+            let mut session_ids = BTreeMap::<String, ()>::new();
+            for subscription in &source_inbox_snapshot.subscriptions {
+                session_ids.insert(subscription.session_id.clone(), ());
+            }
+            for subscription in &replica_inbox_snapshot.subscriptions {
+                session_ids.insert(subscription.session_id.clone(), ());
+            }
+            for message in &source_inbox_snapshot.offline_messages {
+                session_ids.insert(message.session_id.clone(), ());
+            }
+            for message in &replica_inbox_snapshot.offline_messages {
+                session_ids.insert(message.session_id.clone(), ());
+            }
+            for session_id in session_ids.keys() {
+                let _ = replica.purge_session_subscriptions_only(session_id).await?;
+                let _ = replica.purge_offline(session_id).await?;
+            }
+            for subscription in &source_inbox_snapshot.subscriptions {
+                replica.subscribe(subscription.clone()).await?;
+            }
+            for message in &source_inbox_snapshot.offline_messages {
+                replica.enqueue(message.clone()).await?;
+            }
+        }
+
+        if source_inflight_snapshot.checksum()? != replica_inflight_snapshot.checksum()? {
+            let mut session_ids = BTreeMap::<String, ()>::new();
+            for message in &source_inflight_snapshot.inflight_messages {
+                session_ids.insert(message.session_id.clone(), ());
+            }
+            for message in &replica_inflight_snapshot.inflight_messages {
+                session_ids.insert(message.session_id.clone(), ());
+            }
+            for session_id in session_ids.keys() {
+                let _ = replica.purge_inflight_session(session_id).await?;
+            }
+            for message in &source_inflight_snapshot.inflight_messages {
+                replica.stage_inflight(message.clone()).await?;
+            }
+        }
+
+        let repaired_inbox_snapshot = replica
+            .export_shard_snapshot(&inbox_tenant_scan_shard(tenant_id))
+            .await?;
+        let repaired_inflight_snapshot = replica
+            .export_shard_snapshot(&inflight_tenant_scan_shard(tenant_id))
+            .await?;
+        anyhow::ensure!(
+            repaired_inbox_snapshot.checksum()? == source_inbox_snapshot.checksum()?,
+            "inbox tenant replica anti-entropy checksum mismatch"
+        );
+        anyhow::ensure!(
+            repaired_inflight_snapshot.checksum()? == source_inflight_snapshot.checksum()?,
+            "inflight tenant replica anti-entropy checksum mismatch"
+        );
+        Ok((
+            source_inbox_snapshot.checksum()?,
+            source_inflight_snapshot.checksum()?,
+        ))
+    }
 }
 
 impl RetainGrpcClient {
@@ -1413,6 +1679,61 @@ impl RetainGrpcClient {
             .await?
             .ok_or_else(|| anyhow::anyhow!("no retain endpoint registered for shard {shard:?}"))?;
         Self::connect(assignment.endpoint.endpoint).await
+    }
+
+    pub async fn anti_entropy_sync_tenant_replica_via_registry(
+        registry: &DynamicServiceEndpointRegistry,
+        tenant_id: &str,
+        replica_node_id: NodeId,
+    ) -> anyhow::Result<u64> {
+        let shard = retain_tenant_shard(tenant_id);
+        let source_assignment = registry.resolve_assignment(&shard).await?.ok_or_else(|| {
+            anyhow::anyhow!("no retain assignment registered for shard {shard:?}")
+        })?;
+        let source = RetainGrpcClient::connect(source_assignment.endpoint.endpoint.clone()).await?;
+        let source_snapshot = source.list_tenant_retained(tenant_id).await?;
+        let source_checksum = snapshot_checksum(&source_snapshot)?;
+
+        let member = registry
+            .resolve_member(replica_node_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("replica member {replica_node_id} not found"))?;
+        let replica_endpoint = member
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.kind == ServiceKind::Retain)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!("replica member {replica_node_id} has no retain endpoint")
+            })?;
+        let replica = RetainGrpcClient::connect(replica_endpoint.endpoint).await?;
+        let replica_snapshot = replica.list_tenant_retained(tenant_id).await?;
+        if source_checksum != snapshot_checksum(&replica_snapshot)? {
+            for message in &replica_snapshot {
+                if !source_snapshot
+                    .iter()
+                    .any(|candidate| candidate.topic == message.topic)
+                {
+                    let mut delete = message.clone();
+                    delete.payload = Bytes::new();
+                    replica.retain(delete).await?;
+                }
+            }
+            for message in &source_snapshot {
+                if !replica_snapshot
+                    .iter()
+                    .any(|candidate| candidate.topic == message.topic && candidate == message)
+                {
+                    replica.retain(message.clone()).await?;
+                }
+            }
+            let repaired = replica.list_tenant_retained(tenant_id).await?;
+            anyhow::ensure!(
+                snapshot_checksum(&repaired)? == source_checksum,
+                "retain shard replica anti-entropy checksum mismatch"
+            );
+        }
+        Ok(source_checksum)
     }
 }
 

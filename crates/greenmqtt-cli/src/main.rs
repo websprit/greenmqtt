@@ -1,7 +1,9 @@
 use greenmqtt_broker::mqtt::{serve_quic, serve_tcp, serve_tls, serve_ws, serve_wss};
 use greenmqtt_broker::{BrokerConfig, BrokerRuntime};
 use greenmqtt_core::{
-    ClientIdentity, ConnectRequest, Lifecycle, PublishProperties, PublishRequest, SessionKind,
+    ClientIdentity, ClusterMembershipRegistry, ClusterNodeLifecycle, ClusterNodeMembership,
+    ConnectRequest, Lifecycle, PublishProperties, PublishRequest, ServiceEndpoint, ServiceKind,
+    SessionKind,
 };
 use greenmqtt_dist::{DistHandle, DistRouter, PersistentDistHandle};
 use greenmqtt_http_api::HttpApi;
@@ -16,7 +18,7 @@ use greenmqtt_plugin_api::{
 use greenmqtt_retain::{PersistentRetainHandle, RetainHandle, RetainService};
 use greenmqtt_rpc::{
     DistGrpcClient, InboxGrpcClient, RetainGrpcClient, RpcRuntime, SessionDictGrpcClient,
-    StaticPeerForwarder,
+    StaticPeerForwarder, StaticServiceEndpointRegistry,
 };
 use greenmqtt_sessiondict::{PersistentSessionDictHandle, SessionDictHandle, SessionDirectory};
 use greenmqtt_storage::{
@@ -28,7 +30,8 @@ use greenmqtt_storage::{
 use metrics_exporter_prometheus::PrometheusBuilder;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::net::SocketAddr;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -180,8 +183,111 @@ struct CompareSoakReport {
     reports: Vec<SoakReport>,
 }
 
+fn run_shard_command(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
+    let addr = std::env::var("GREENMQTT_HTTP_BIND")
+        .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
+        .parse::<SocketAddr>()?;
+    let (method, path, body) = shard_command_request(args)?;
+    println!(
+        "{}",
+        http_request_body(addr, &method, &path, body.as_deref())?
+    );
+    Ok(())
+}
+
+fn shard_command_request(
+    mut args: impl Iterator<Item = String>,
+) -> anyhow::Result<(String, String, Option<String>)> {
+    let subcommand = args
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing shard subcommand"))?;
+    match subcommand.as_str() {
+        "ls" => {
+            let mut query = Vec::new();
+            while let Some(flag) = args.next() {
+                match flag.as_str() {
+                    "--kind" => {
+                        let value = args
+                            .next()
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --kind"))?;
+                        query.push(format!("kind={value}"));
+                    }
+                    "--tenant-id" => {
+                        let value = args
+                            .next()
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --tenant-id"))?;
+                        query.push(format!("tenant_id={value}"));
+                    }
+                    _ => anyhow::bail!("unknown shard ls flag: {flag}"),
+                }
+            }
+            let path = if query.is_empty() {
+                "/v1/shards".to_string()
+            } else {
+                format!("/v1/shards?{}", query.join("&"))
+            };
+            Ok(("GET".into(), path, None))
+        }
+        "move" | "failover" => {
+            let kind = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("missing shard kind"))?;
+            let tenant_id = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("missing tenant_id"))?;
+            let scope = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("missing shard scope"))?;
+            let target_node_id = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("missing target_node_id"))?;
+            let action = if subcommand == "move" {
+                "move"
+            } else {
+                "failover"
+            };
+            Ok((
+                "POST".into(),
+                format!("/v1/shards/{kind}/{tenant_id}/{scope}/{action}"),
+                Some(format!(r#"{{"target_node_id":{target_node_id}}}"#)),
+            ))
+        }
+        _ => anyhow::bail!("unknown shard subcommand: {subcommand}"),
+    }
+}
+
+fn http_request_body(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> anyhow::Result<String> {
+    let mut stream = TcpStream::connect(addr)?;
+    let payload = body.unwrap_or("");
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        payload.len(),
+        payload
+    );
+    stream.write_all(request.as_bytes())?;
+    stream.shutdown(std::net::Shutdown::Write)?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    let body = response
+        .split("\r\n\r\n")
+        .nth(1)
+        .ok_or_else(|| anyhow::anyhow!("invalid http response"))?;
+    Ok(body.to_string())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let mut args = std::env::args().skip(1);
+    let mode = args.next().unwrap_or_else(|| "demo".to_string());
+    if mode == "shard" {
+        return run_shard_command(args);
+    }
+
     let node_id = std::env::var("GREENMQTT_NODE_ID")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -262,9 +368,6 @@ async fn main() -> anyhow::Result<()> {
     ));
     let _ = broker.restore_peer_registry(&peer_forwarder).await?;
 
-    let mode = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "demo".to_string());
     if mode == "serve" {
         let http_bind: SocketAddr = std::env::var("GREENMQTT_HTTP_BIND")
             .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
@@ -296,10 +399,33 @@ async fn main() -> anyhow::Result<()> {
             println!("greenmqtt mqtt quic listening on {bind}");
         }
         println!("greenmqtt internal grpc listening on {rpc_bind}");
+        let shard_registry = Arc::new(StaticServiceEndpointRegistry::default());
+        shard_registry
+            .upsert_member(ClusterNodeMembership::new(
+                node_id,
+                1,
+                ClusterNodeLifecycle::Serving,
+                vec![
+                    ServiceEndpoint::new(
+                        ServiceKind::SessionDict,
+                        node_id,
+                        format!("http://{rpc_bind}"),
+                    ),
+                    ServiceEndpoint::new(ServiceKind::Dist, node_id, format!("http://{rpc_bind}")),
+                    ServiceEndpoint::new(ServiceKind::Inbox, node_id, format!("http://{rpc_bind}")),
+                    ServiceEndpoint::new(
+                        ServiceKind::Retain,
+                        node_id,
+                        format!("http://{rpc_bind}"),
+                    ),
+                ],
+            ))
+            .await?;
         let metrics_handle = PrometheusBuilder::new().install_recorder()?;
-        let http = HttpApi::with_peers_and_metrics(
+        let http = HttpApi::with_peers_shards_and_metrics(
             broker.clone(),
             Arc::new(peer_forwarder.clone()),
+            shard_registry.clone(),
             metrics_handle,
             http_bind,
         );
@@ -348,7 +474,7 @@ async fn main() -> anyhow::Result<()> {
             inbox: broker.inbox.clone(),
             retain: broker.retain.clone(),
             peer_sink: broker.clone(),
-            assignment_registry: None,
+            assignment_registry: Some(shard_registry),
         };
         let http_task = async move { http.start().await };
         let rpc_task = async move { rpc.serve(rpc_bind).await };

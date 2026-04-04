@@ -1,10 +1,11 @@
 use async_trait::async_trait;
 use axum::{
+    extract::DefaultBodyLimit,
     routing::{delete, get, post, put},
     Extension, Router,
 };
 use greenmqtt_broker::{BrokerRuntime, PeerRegistry};
-use greenmqtt_core::Lifecycle;
+use greenmqtt_core::{Lifecycle, ShardControlRegistry};
 use greenmqtt_plugin_api::{AclProvider, AuthProvider, EventHook};
 use metrics_exporter_prometheus::PrometheusHandle;
 use std::net::SocketAddr;
@@ -14,6 +15,7 @@ use std::sync::Arc;
 pub struct HttpApi<A, C, H> {
     broker: Arc<BrokerRuntime<A, C, H>>,
     peers: Option<Arc<dyn PeerRegistry>>,
+    shards: Option<Arc<dyn ShardControlRegistry>>,
     metrics: Option<PrometheusHandle>,
     bind: SocketAddr,
 }
@@ -28,6 +30,7 @@ where
         Self {
             broker,
             peers: None,
+            shards: None,
             metrics: None,
             bind,
         }
@@ -41,7 +44,24 @@ where
         Self {
             broker,
             peers: Some(peers),
+            shards: None,
             metrics: None,
+            bind,
+        }
+    }
+
+    pub fn with_peers_shards_and_metrics(
+        broker: Arc<BrokerRuntime<A, C, H>>,
+        peers: Arc<dyn PeerRegistry>,
+        shards: Arc<dyn ShardControlRegistry>,
+        metrics: PrometheusHandle,
+        bind: SocketAddr,
+    ) -> Self {
+        Self {
+            broker,
+            peers: Some(peers),
+            shards: Some(shards),
+            metrics: Some(metrics),
             bind,
         }
     }
@@ -55,20 +75,21 @@ where
         Self {
             broker,
             peers: Some(peers),
+            shards: None,
             metrics: Some(metrics),
             bind,
         }
     }
 
     pub fn router(broker: Arc<BrokerRuntime<A, C, H>>) -> Router {
-        Self::router_with_peers_and_metrics(broker, None, None)
+        Self::router_with_peers_shards_and_metrics(broker, None, None, None)
     }
 
     pub fn router_with_peers(
         broker: Arc<BrokerRuntime<A, C, H>>,
         peers: Option<Arc<dyn PeerRegistry>>,
     ) -> Router {
-        Self::router_with_peers_and_metrics(broker, peers, None)
+        Self::router_with_peers_shards_and_metrics(broker, peers, None, None)
     }
 
     pub fn router_with_peers_and_metrics(
@@ -76,9 +97,44 @@ where
         peers: Option<Arc<dyn PeerRegistry>>,
         metrics: Option<PrometheusHandle>,
     ) -> Router {
+        Self::router_with_peers_shards_and_metrics(broker, peers, None, metrics)
+    }
+
+    pub fn router_with_peers_shards_and_metrics(
+        broker: Arc<BrokerRuntime<A, C, H>>,
+        peers: Option<Arc<dyn PeerRegistry>>,
+        shards: Option<Arc<dyn ShardControlRegistry>>,
+        metrics: Option<PrometheusHandle>,
+    ) -> Router {
         Router::new()
+            .layer(DefaultBodyLimit::disable())
             .route("/healthz", get(super::healthz))
             .route("/metrics", get(super::query::metrics))
+            .route("/v1/shards", get(super::query::list_shards))
+            .route(
+                "/v1/shards/:kind/:tenant_id/:scope",
+                get(super::query::get_shard),
+            )
+            .route(
+                "/v1/shards/:kind/:tenant_id/:scope/drain",
+                post(super::shard::drain_shard),
+            )
+            .route(
+                "/v1/shards/:kind/:tenant_id/:scope/move",
+                post(super::shard::move_shard),
+            )
+            .route(
+                "/v1/shards/:kind/:tenant_id/:scope/catch-up",
+                post(super::shard::catch_up_shard),
+            )
+            .route(
+                "/v1/shards/:kind/:tenant_id/:scope/repair",
+                post(super::shard::repair_shard),
+            )
+            .route(
+                "/v1/shards/:kind/:tenant_id/:scope/failover",
+                post(super::shard::failover_shard),
+            )
             .route("/v1/audit", get(super::admin::list_admin_audit))
             .route(
                 "/v1/tenants/:tenant_id/quota",
@@ -151,6 +207,7 @@ where
                 get(super::session::drain_deliveries),
             )
             .layer(Extension(peers))
+            .layer(Extension(shards))
             .layer(Extension(metrics))
             .with_state(broker)
     }
@@ -167,9 +224,10 @@ where
         let listener = tokio::net::TcpListener::bind(self.bind).await?;
         axum::serve(
             listener,
-            Self::router_with_peers_and_metrics(
+            Self::router_with_peers_shards_and_metrics(
                 self.broker.clone(),
                 self.peers.clone(),
+                self.shards.clone(),
                 self.metrics.clone(),
             ),
         )

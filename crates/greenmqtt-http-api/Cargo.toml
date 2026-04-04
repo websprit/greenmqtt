@@ -15,6 +15,7 @@ greenmqtt-inbox = { path = "../greenmqtt-inbox" }
 greenmqtt-plugin-api = { path = "../greenmqtt-plugin-api" }
 greenmqtt-retain = { path = "../greenmqtt-retain" }
 greenmqtt-sessiondict = { path = "../greenmqtt-sessiondict" }
+metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 serde.workspace = true
 sysinfo.workspace = true

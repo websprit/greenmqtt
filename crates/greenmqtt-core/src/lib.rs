@@ -343,6 +343,16 @@ pub trait ServiceShardRecoveryControl: Send + Sync {
     ) -> anyhow::Result<Option<ServiceShardAssignment>>;
 }
 
+pub trait ShardControlRegistry:
+    ServiceEndpointRegistry + ClusterMembershipRegistry + ServiceShardRecoveryControl
+{
+}
+
+impl<T> ShardControlRegistry for T where
+    T: ServiceEndpointRegistry + ClusterMembershipRegistry + ServiceShardRecoveryControl
+{
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SessionKind {
     Transient,

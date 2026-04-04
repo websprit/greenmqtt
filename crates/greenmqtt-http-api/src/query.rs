@@ -1,12 +1,13 @@
 use axum::{
-    extract::{Extension, Query, State},
+    extract::{Extension, Path, Query, State},
     http::header,
     response::IntoResponse,
     Json,
 };
 use greenmqtt_broker::{BrokerRuntime, BrokerStats, PeerRegistry};
 use greenmqtt_core::{
-    InflightMessage, OfflineMessage, RetainedMessage, RouteRecord, SessionRecord, Subscription,
+    InflightMessage, OfflineMessage, RetainedMessage, RouteRecord, ServiceShardAssignment,
+    ServiceShardKey, ServiceShardKind, SessionRecord, ShardControlRegistry, Subscription,
 };
 use greenmqtt_plugin_api::{AclProvider, AuthProvider, EventHook};
 use metrics_exporter_prometheus::PrometheusHandle;
@@ -35,6 +36,61 @@ pub struct RouteQuery {
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct MetricsQuery {
     pub tenant_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct ShardListQuery {
+    pub kind: Option<String>,
+    pub tenant_id: Option<String>,
+}
+
+pub(crate) async fn list_shards<A, C, H>(
+    State(_broker): State<Arc<BrokerRuntime<A, C, H>>>,
+    Extension(shards): Extension<Option<Arc<dyn ShardControlRegistry>>>,
+    Query(query): Query<ShardListQuery>,
+) -> Result<Json<Vec<ServiceShardAssignment>>, ApiError>
+where
+    A: AuthProvider + 'static,
+    C: AclProvider + 'static,
+    H: EventHook + 'static,
+{
+    let Some(registry) = shards else {
+        return Ok(Json(Vec::new()));
+    };
+    let kind = query.kind.as_deref().map(parse_shard_kind).transpose()?;
+    let mut assignments = registry
+        .list_assignments(kind)
+        .await
+        .map_err(ApiError::from)?;
+    if let Some(tenant_id) = query.tenant_id.as_deref() {
+        assignments.retain(|assignment| assignment.shard.tenant_id == tenant_id);
+    }
+    Ok(Json(assignments))
+}
+
+pub(crate) async fn get_shard<A, C, H>(
+    State(_broker): State<Arc<BrokerRuntime<A, C, H>>>,
+    Extension(shards): Extension<Option<Arc<dyn ShardControlRegistry>>>,
+    Path((kind, tenant_id, scope)): Path<(String, String, String)>,
+) -> Result<Json<Option<ServiceShardAssignment>>, ApiError>
+where
+    A: AuthProvider + 'static,
+    C: AclProvider + 'static,
+    H: EventHook + 'static,
+{
+    let Some(registry) = shards else {
+        return Ok(Json(None));
+    };
+    let shard = ServiceShardKey {
+        kind: parse_shard_kind(&kind)?,
+        tenant_id,
+        scope,
+    };
+    let assignment = registry
+        .resolve_assignment(&shard)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(assignment))
 }
 
 pub(crate) async fn stats<A, C, H>(
@@ -149,6 +205,17 @@ where
         )],
         output,
     ))
+}
+
+fn parse_shard_kind(kind: &str) -> Result<ServiceShardKind, ApiError> {
+    match kind {
+        "sessiondict" => Ok(ServiceShardKind::SessionDict),
+        "inbox" => Ok(ServiceShardKind::Inbox),
+        "inflight" => Ok(ServiceShardKind::Inflight),
+        "dist" => Ok(ServiceShardKind::Dist),
+        "retain" => Ok(ServiceShardKind::Retain),
+        _ => Err(ApiError::from(anyhow::anyhow!("invalid shard kind"))),
+    }
 }
 
 async fn prometheus_metrics<A, C, H>(

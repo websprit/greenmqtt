@@ -2696,3 +2696,435 @@ async fn periodic_anti_entropy_reconciles_dist_replica_checksum() {
     server1.abort();
     server2.abort();
 }
+
+#[tokio::test]
+async fn periodic_anti_entropy_reconciles_sessiondict_replica_checksum() {
+    let registry = Arc::new(StaticServiceEndpointRegistry::default());
+    let bind1 = "127.0.0.1:50090".parse().unwrap();
+    let bind2 = "127.0.0.1:50091".parse().unwrap();
+    let server1 = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: Some(registry.clone()),
+        }
+        .serve(bind1),
+    );
+    let server2 = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: Some(registry.clone()),
+        }
+        .serve(bind2),
+    );
+    sleep(Duration::from_millis(50)).await;
+
+    registry
+        .upsert_member(ClusterNodeMembership::new(
+            7,
+            1,
+            ClusterNodeLifecycle::Serving,
+            vec![ServiceEndpoint::new(
+                ServiceKind::SessionDict,
+                7,
+                "http://127.0.0.1:50090",
+            )],
+        ))
+        .await
+        .unwrap();
+    registry
+        .upsert_member(ClusterNodeMembership::new(
+            9,
+            1,
+            ClusterNodeLifecycle::Serving,
+            vec![ServiceEndpoint::new(
+                ServiceKind::SessionDict,
+                9,
+                "http://127.0.0.1:50091",
+            )],
+        ))
+        .await
+        .unwrap();
+    registry
+        .upsert_assignment(ServiceShardAssignment::new(
+            greenmqtt_sessiondict::session_scan_shard("t1"),
+            ServiceEndpoint::new(ServiceKind::SessionDict, 7, "http://127.0.0.1:50090"),
+            1,
+            10,
+            ServiceShardLifecycle::Serving,
+        ))
+        .await
+        .unwrap();
+
+    let source = SessionDictGrpcClient::connect("http://127.0.0.1:50090")
+        .await
+        .unwrap();
+    let replica = SessionDictGrpcClient::connect("http://127.0.0.1:50091")
+        .await
+        .unwrap();
+    source
+        .register(SessionRecord {
+            session_id: "s1".into(),
+            node_id: 7,
+            kind: SessionKind::Persistent,
+            identity: ClientIdentity {
+                tenant_id: "t1".into(),
+                user_id: "u1".into(),
+                client_id: "c1".into(),
+            },
+            session_expiry_interval_secs: Some(60),
+            expires_at_ms: Some(1234),
+        })
+        .await
+        .unwrap();
+    replica
+        .register(SessionRecord {
+            session_id: "stale".into(),
+            node_id: 9,
+            kind: SessionKind::Persistent,
+            identity: ClientIdentity {
+                tenant_id: "t1".into(),
+                user_id: "stale".into(),
+                client_id: "stale".into(),
+            },
+            session_expiry_interval_secs: Some(60),
+            expires_at_ms: Some(5678),
+        })
+        .await
+        .unwrap();
+
+    let reconciler =
+        PeriodicAntiEntropyReconciler::new(registry.clone(), Duration::from_millis(20));
+    let (tx, rx) = watch::channel(false);
+    let task = tokio::spawn(async move {
+        reconciler
+            .run_sessiondict_tenant_replica_until_cancelled("t1".to_string(), 9, rx)
+            .await
+    });
+    sleep(Duration::from_millis(120)).await;
+    tx.send(true).unwrap();
+    task.await.unwrap().unwrap();
+
+    let sessions = replica.list_sessions(Some("t1")).await.unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].session_id, "s1");
+    let current = registry
+        .resolve_assignment(&greenmqtt_sessiondict::session_scan_shard("t1"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.owner_node_id(), 7);
+
+    server1.abort();
+    server2.abort();
+}
+
+#[tokio::test]
+async fn periodic_anti_entropy_reconciles_inbox_replica_checksum() {
+    let registry = Arc::new(StaticServiceEndpointRegistry::default());
+    let bind1 = "127.0.0.1:50092".parse().unwrap();
+    let bind2 = "127.0.0.1:50093".parse().unwrap();
+    let server1 = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: Some(registry.clone()),
+        }
+        .serve(bind1),
+    );
+    let server2 = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: Some(registry.clone()),
+        }
+        .serve(bind2),
+    );
+    sleep(Duration::from_millis(50)).await;
+
+    registry
+        .upsert_member(ClusterNodeMembership::new(
+            7,
+            1,
+            ClusterNodeLifecycle::Serving,
+            vec![ServiceEndpoint::new(
+                ServiceKind::Inbox,
+                7,
+                "http://127.0.0.1:50092",
+            )],
+        ))
+        .await
+        .unwrap();
+    registry
+        .upsert_member(ClusterNodeMembership::new(
+            9,
+            1,
+            ClusterNodeLifecycle::Serving,
+            vec![ServiceEndpoint::new(
+                ServiceKind::Inbox,
+                9,
+                "http://127.0.0.1:50093",
+            )],
+        ))
+        .await
+        .unwrap();
+    registry
+        .upsert_assignment(ServiceShardAssignment::new(
+            greenmqtt_inbox::inbox_tenant_scan_shard("t1"),
+            ServiceEndpoint::new(ServiceKind::Inbox, 7, "http://127.0.0.1:50092"),
+            1,
+            10,
+            ServiceShardLifecycle::Serving,
+        ))
+        .await
+        .unwrap();
+
+    let source = InboxGrpcClient::connect("http://127.0.0.1:50092")
+        .await
+        .unwrap();
+    let replica = InboxGrpcClient::connect("http://127.0.0.1:50093")
+        .await
+        .unwrap();
+    source
+        .subscribe(Subscription {
+            session_id: "s1".into(),
+            tenant_id: "t1".into(),
+            topic_filter: "devices/+/state".into(),
+            qos: 1,
+            subscription_identifier: Some(1),
+            no_local: false,
+            retain_as_published: false,
+            retain_handling: 0,
+            shared_group: None,
+            kind: SessionKind::Persistent,
+        })
+        .await
+        .unwrap();
+    source
+        .enqueue(OfflineMessage {
+            tenant_id: "t1".into(),
+            session_id: "s1".into(),
+            topic: "devices/a/state".into(),
+            payload: b"offline".to_vec().into(),
+            qos: 1,
+            retain: false,
+            from_session_id: "publisher".into(),
+            properties: PublishProperties::default(),
+        })
+        .await
+        .unwrap();
+    source
+        .stage_inflight(InflightMessage {
+            tenant_id: "t1".into(),
+            session_id: "s1".into(),
+            packet_id: 11,
+            topic: "devices/a/state".into(),
+            payload: b"inflight".to_vec().into(),
+            qos: 1,
+            retain: false,
+            from_session_id: "publisher".into(),
+            properties: PublishProperties::default(),
+            phase: greenmqtt_core::InflightPhase::Publish,
+        })
+        .await
+        .unwrap();
+
+    replica
+        .subscribe(Subscription {
+            session_id: "stale".into(),
+            tenant_id: "t1".into(),
+            topic_filter: "stale/topic".into(),
+            qos: 1,
+            subscription_identifier: None,
+            no_local: false,
+            retain_as_published: false,
+            retain_handling: 0,
+            shared_group: None,
+            kind: SessionKind::Persistent,
+        })
+        .await
+        .unwrap();
+    replica
+        .enqueue(OfflineMessage {
+            tenant_id: "t1".into(),
+            session_id: "stale".into(),
+            topic: "stale/topic".into(),
+            payload: b"stale-offline".to_vec().into(),
+            qos: 1,
+            retain: false,
+            from_session_id: "publisher".into(),
+            properties: PublishProperties::default(),
+        })
+        .await
+        .unwrap();
+    replica
+        .stage_inflight(InflightMessage {
+            tenant_id: "t1".into(),
+            session_id: "stale".into(),
+            packet_id: 99,
+            topic: "stale/topic".into(),
+            payload: b"stale-inflight".to_vec().into(),
+            qos: 1,
+            retain: false,
+            from_session_id: "publisher".into(),
+            properties: PublishProperties::default(),
+            phase: greenmqtt_core::InflightPhase::Publish,
+        })
+        .await
+        .unwrap();
+
+    let reconciler =
+        PeriodicAntiEntropyReconciler::new(registry.clone(), Duration::from_millis(20));
+    let (tx, rx) = watch::channel(false);
+    let task = tokio::spawn(async move {
+        reconciler
+            .run_inbox_tenant_replica_until_cancelled("t1".to_string(), 9, rx)
+            .await
+    });
+    sleep(Duration::from_millis(120)).await;
+    tx.send(true).unwrap();
+    task.await.unwrap().unwrap();
+
+    let subscriptions = replica.list_tenant_subscriptions("t1").await.unwrap();
+    assert_eq!(subscriptions.len(), 1);
+    assert_eq!(subscriptions[0].session_id, "s1");
+    let offline = replica.list_tenant_offline("t1").await.unwrap();
+    assert_eq!(offline.len(), 1);
+    assert_eq!(offline[0].session_id, "s1");
+    let inflight = replica.list_tenant_inflight("t1").await.unwrap();
+    assert_eq!(inflight.len(), 1);
+    assert_eq!(inflight[0].session_id, "s1");
+
+    server1.abort();
+    server2.abort();
+}
+
+#[tokio::test]
+async fn periodic_anti_entropy_reconciles_retain_replica_checksum() {
+    let registry = Arc::new(StaticServiceEndpointRegistry::default());
+    let bind1 = "127.0.0.1:50094".parse().unwrap();
+    let bind2 = "127.0.0.1:50095".parse().unwrap();
+    let server1 = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: Some(registry.clone()),
+        }
+        .serve(bind1),
+    );
+    let server2 = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: Some(registry.clone()),
+        }
+        .serve(bind2),
+    );
+    sleep(Duration::from_millis(50)).await;
+
+    registry
+        .upsert_member(ClusterNodeMembership::new(
+            7,
+            1,
+            ClusterNodeLifecycle::Serving,
+            vec![ServiceEndpoint::new(
+                ServiceKind::Retain,
+                7,
+                "http://127.0.0.1:50094",
+            )],
+        ))
+        .await
+        .unwrap();
+    registry
+        .upsert_member(ClusterNodeMembership::new(
+            9,
+            1,
+            ClusterNodeLifecycle::Serving,
+            vec![ServiceEndpoint::new(
+                ServiceKind::Retain,
+                9,
+                "http://127.0.0.1:50095",
+            )],
+        ))
+        .await
+        .unwrap();
+    registry
+        .upsert_assignment(ServiceShardAssignment::new(
+            ServiceShardKey::retain("t1"),
+            ServiceEndpoint::new(ServiceKind::Retain, 7, "http://127.0.0.1:50094"),
+            1,
+            10,
+            ServiceShardLifecycle::Serving,
+        ))
+        .await
+        .unwrap();
+
+    let source = RetainGrpcClient::connect("http://127.0.0.1:50094")
+        .await
+        .unwrap();
+    let replica = RetainGrpcClient::connect("http://127.0.0.1:50095")
+        .await
+        .unwrap();
+    source
+        .retain(greenmqtt_core::RetainedMessage {
+            tenant_id: "t1".into(),
+            topic: "devices/a/state".into(),
+            payload: b"online".to_vec().into(),
+            qos: 1,
+        })
+        .await
+        .unwrap();
+    replica
+        .retain(greenmqtt_core::RetainedMessage {
+            tenant_id: "t1".into(),
+            topic: "stale/topic".into(),
+            payload: b"stale".to_vec().into(),
+            qos: 1,
+        })
+        .await
+        .unwrap();
+
+    let reconciler =
+        PeriodicAntiEntropyReconciler::new(registry.clone(), Duration::from_millis(20));
+    let (tx, rx) = watch::channel(false);
+    let task = tokio::spawn(async move {
+        reconciler
+            .run_retain_tenant_replica_until_cancelled("t1".to_string(), 9, rx)
+            .await
+    });
+    sleep(Duration::from_millis(120)).await;
+    tx.send(true).unwrap();
+    task.await.unwrap().unwrap();
+
+    let retained = replica.list_tenant_retained("t1").await.unwrap();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].topic, "devices/a/state");
+    let current = registry
+        .resolve_assignment(&ServiceShardKey::retain("t1"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.owner_node_id(), 7);
+
+    server1.abort();
+    server2.abort();
+}

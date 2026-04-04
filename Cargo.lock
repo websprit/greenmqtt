@@ -783,6 +783,7 @@ dependencies = [
  "greenmqtt-retain",
  "greenmqtt-sessiondict",
  "greenmqtt-storage",
+ "metrics",
  "metrics-exporter-prometheus",
  "serde",
  "serde_json",
@@ -843,6 +844,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bytes",
  "greenmqtt-broker",
  "greenmqtt-core",
  "greenmqtt-dist",
@@ -852,6 +854,7 @@ dependencies = [
  "greenmqtt-retain",
  "greenmqtt-sessiondict",
  "greenmqtt-storage",
+ "metrics",
  "serde",
  "serde_json",
  "tokio",

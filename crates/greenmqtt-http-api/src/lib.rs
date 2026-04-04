@@ -4,6 +4,7 @@ mod http_api;
 mod publish;
 mod query;
 mod session;
+mod shard;
 mod subscription;
 
 pub use admin::{AuditQuery, RetainDeleteQuery};

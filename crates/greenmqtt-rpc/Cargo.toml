@@ -7,6 +7,8 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+bytes.workspace = true
+metrics.workspace = true
 greenmqtt-broker = { path = "../greenmqtt-broker" }
 greenmqtt-core = { path = "../greenmqtt-core" }
 greenmqtt-dist = { path = "../greenmqtt-dist" }
