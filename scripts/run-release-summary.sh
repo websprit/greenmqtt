@@ -3,102 +3,35 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
+source "$ROOT_DIR/scripts/lib/summary.sh"
 
 MODE="release"
 SUMMARY_FILE="${GREENMQTT_PROFILE_SUMMARY_FILE:-}"
-OVERALL_STATUS=0
 TMP_DIR="$(mktemp -d)"
-COMPONENTS=()
+summary_init_state
 
 cleanup() {
   rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
 
-run_component() {
-  local name="$1"
-  shift
-
-  local component_summary="${TMP_DIR}/${name}.json"
-  echo "[release-summary:${MODE}] ${name}"
-
-  local started_at
-  started_at="$(date +%s)"
-  local status=0
-  set +e
-  GREENMQTT_PROFILE_SUMMARY_FILE="$component_summary" "$@"
-  status=$?
-  set -e
-  local finished_at
-  finished_at="$(date +%s)"
-  local duration=$((finished_at - started_at))
-
-  if [[ $status -ne 0 ]]; then
-    OVERALL_STATUS=1
-  fi
-
-  local nested_summary='{"profile":"missing","status":1,"results":[]}'
-  if [[ -f "$component_summary" ]]; then
-    nested_summary="$(cat "$component_summary")"
-  fi
-
-  local component_json
-  component_json="$(ruby -rjson -rtime -e '
-    name = ARGV[0]
-    status = Integer(ARGV[1])
-    duration = Integer(ARGV[2])
-    nested = JSON.parse(ARGV[3])
-    puts JSON.generate({
-      name: name,
-      status: status,
-      duration_seconds: duration,
-      profile: nested["profile"],
-      summary: nested,
-    })
-  ' "$name" "$status" "$duration" "$nested_summary")"
-  COMPONENTS+=("$component_json")
-}
-
-emit_summary() {
-  local joined=""
-  local IFS=,
-  joined="${COMPONENTS[*]}"
-  local summary
-  summary="$(ruby -rjson -rtime -e '
-    generated_at = Time.now.utc.iso8601
-    status = Integer(ARGV[0])
-    components = JSON.parse("[" + ARGV[1] + "]")
-    puts JSON.generate({
-      profile: "release-summary",
-      mode: "release",
-      status: status,
-      generated_at: generated_at,
-      components: components,
-    })
-  ' "$OVERALL_STATUS" "$joined")"
-  if [[ -n "$SUMMARY_FILE" ]]; then
-    printf "%s\n" "$summary" > "$SUMMARY_FILE"
-  fi
-  printf "%s\n" "$summary"
-}
-
-run_component "verification" \
+summary_run_component "release-summary:${MODE}" "$TMP_DIR" "verification" omit \
   "$ROOT_DIR/scripts/run-verification-suite.sh" full --release
 
-run_component "performance" \
+summary_run_component "release-summary:${MODE}" "$TMP_DIR" "performance" omit \
   "$ROOT_DIR/scripts/run-performance-profile.sh" --release
 
-run_component "cluster" \
+summary_run_component "release-summary:${MODE}" "$TMP_DIR" "cluster" omit \
   "$ROOT_DIR/scripts/run-cluster-profile.sh" ci --release
 
-run_component "compatibility" \
+summary_run_component "release-summary:${MODE}" "$TMP_DIR" "compatibility" omit \
   "$ROOT_DIR/scripts/run-compatibility-matrix.sh" --release
 
-run_component "storage-upgrade" \
+summary_run_component "release-summary:${MODE}" "$TMP_DIR" "storage-upgrade" omit \
   "$ROOT_DIR/scripts/run-storage-upgrade-baseline.sh"
 
-run_component "rollback-drill" \
+summary_run_component "release-summary:${MODE}" "$TMP_DIR" "rollback-drill" omit \
   "$ROOT_DIR/scripts/run-rollback-drill.sh"
 
-emit_summary
+summary_emit_components_profile "release-summary" "$SUMMARY_FILE" '{"mode":"release"}'
 exit "$OVERALL_STATUS"

@@ -3,11 +3,11 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
+source "$ROOT_DIR/scripts/lib/summary.sh"
 
 MODE="smoke"
 SUMMARY_FILE="${GREENMQTT_PROFILE_SUMMARY_FILE:-}"
-OVERALL_STATUS=0
-RESULTS=()
+summary_init_state
 
 for arg in "$@"; do
   case "$arg" in
@@ -19,80 +19,49 @@ for arg in "$@"; do
   esac
 done
 
-run_step() {
-  local name="$1"
-  shift
-  echo "[compat:${MODE}] ${name}"
-  local started_at
-  started_at="$(date +%s)"
-  local status=0
-  set +e
-  "$@"
-  status=$?
-  set -e
-  local finished_at
-  finished_at="$(date +%s)"
-  local duration=$((finished_at - started_at))
-  if [[ $status -ne 0 ]]; then
-    OVERALL_STATUS=1
-  fi
-  RESULTS+=("{\"name\":\"${name}\",\"status\":${status},\"duration_seconds\":${duration}}")
-}
-
-emit_summary() {
-  local joined=""
-  local IFS=,
-  joined="${RESULTS[*]}"
-  local summary="{\"profile\":\"compatibility-${MODE}\",\"status\":${OVERALL_STATUS},\"results\":[${joined}]}"
-  if [[ -n "$SUMMARY_FILE" ]]; then
-    printf '%s\n' "$summary" > "$SUMMARY_FILE"
-  fi
-  printf '%s\n' "$summary"
-}
-
 if [[ "$MODE" == "release" ]]; then
-  run_step "mqtt311-baseline" \
+  summary_run_step "compat:${MODE}" "mqtt311-baseline" \
     cargo test --release -p greenmqtt-broker mqtt::tests::publish::mqtt_tcp_connect_subscribe_publish_flow -- --nocapture
 
-  run_step "mqtt5-baseline" \
+  summary_run_step "compat:${MODE}" "mqtt5-baseline" \
     cargo test --release -p greenmqtt-broker mqtt::tests::publish::mqtt_v5_connect_subscribe_publish_flow -- --nocapture
 
-  run_step "tcp-flow" \
+  summary_run_step "compat:${MODE}" "tcp-flow" \
     cargo test --release -p greenmqtt-broker mqtt::tests::publish::mqtt_tcp_connect_subscribe_publish_flow -- --nocapture
 
-  run_step "tls-flow" \
+  summary_run_step "compat:${MODE}" "tls-flow" \
     cargo test --release -p greenmqtt-broker mqtt::tests::publish::mqtt_tls_connect_subscribe_publish_flow -- --nocapture
 
-  run_step "ws-flow" \
+  summary_run_step "compat:${MODE}" "ws-flow" \
     cargo test --release -p greenmqtt-broker mqtt::tests::publish::mqtt_ws_connect_subscribe_publish_flow -- --nocapture
 
-  run_step "wss-flow" \
+  summary_run_step "compat:${MODE}" "wss-flow" \
     cargo test --release -p greenmqtt-broker mqtt::tests::wss_tests::mqtt_wss_connect_subscribe_publish_flow -- --nocapture
 
-  run_step "quic-flow" \
+  summary_run_step "compat:${MODE}" "quic-flow" \
     cargo test --release -p greenmqtt-broker mqtt::tests::quic_tests::mqtt_quic_connect_subscribe_publish_flow -- --nocapture
 else
-  run_step "mqtt311-baseline" \
+  summary_run_step "compat:${MODE}" "mqtt311-baseline" \
     cargo test -p greenmqtt-broker mqtt::tests::publish::mqtt_tcp_connect_subscribe_publish_flow -- --nocapture
 
-  run_step "mqtt5-baseline" \
+  summary_run_step "compat:${MODE}" "mqtt5-baseline" \
     cargo test -p greenmqtt-broker mqtt::tests::publish::mqtt_v5_connect_subscribe_publish_flow -- --nocapture
 
-  run_step "tcp-flow" \
+  summary_run_step "compat:${MODE}" "tcp-flow" \
     cargo test -p greenmqtt-broker mqtt::tests::publish::mqtt_tcp_connect_subscribe_publish_flow -- --nocapture
 
-  run_step "tls-flow" \
+  summary_run_step "compat:${MODE}" "tls-flow" \
     cargo test -p greenmqtt-broker mqtt::tests::publish::mqtt_tls_connect_subscribe_publish_flow -- --nocapture
 
-  run_step "ws-flow" \
+  summary_run_step "compat:${MODE}" "ws-flow" \
     cargo test -p greenmqtt-broker mqtt::tests::publish::mqtt_ws_connect_subscribe_publish_flow -- --nocapture
 
-  run_step "wss-flow" \
+  summary_run_step "compat:${MODE}" "wss-flow" \
     cargo test -p greenmqtt-broker mqtt::tests::wss_tests::mqtt_wss_connect_subscribe_publish_flow -- --nocapture
 
-  run_step "quic-flow" \
+  summary_run_step "compat:${MODE}" "quic-flow" \
     cargo test -p greenmqtt-broker mqtt::tests::quic_tests::mqtt_quic_connect_subscribe_publish_flow -- --nocapture
 fi
 
-emit_summary
+summary_emit_results_profile "compatibility-${MODE}" "$SUMMARY_FILE"
 exit "$OVERALL_STATUS"

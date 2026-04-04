@@ -3,47 +3,16 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
+source "$ROOT_DIR/scripts/lib/summary.sh"
 
 SUMMARY_FILE="${GREENMQTT_PROFILE_SUMMARY_FILE:-}"
-OVERALL_STATUS=0
-RESULTS=()
+summary_init_state
 
-run_step() {
-  local name="$1"
-  shift
-  echo "[storage-upgrade] ${name}"
-  local started_at
-  started_at="$(date +%s)"
-  local status=0
-  set +e
-  "$@"
-  status=$?
-  set -e
-  local finished_at
-  finished_at="$(date +%s)"
-  local duration=$((finished_at - started_at))
-  if [[ $status -ne 0 ]]; then
-    OVERALL_STATUS=1
-  fi
-  RESULTS+=("{\"name\":\"${name}\",\"status\":${status},\"duration_seconds\":${duration}}")
-}
-
-emit_summary() {
-  local joined=""
-  local IFS=,
-  joined="${RESULTS[*]}"
-  local summary="{\"profile\":\"storage-upgrade-baseline\",\"status\":${OVERALL_STATUS},\"results\":[${joined}]}"
-  if [[ -n "$SUMMARY_FILE" ]]; then
-    printf '%s\n' "$summary" > "$SUMMARY_FILE"
-  fi
-  printf '%s\n' "$summary"
-}
-
-run_step "memory-to-durable" \
+summary_run_step "storage-upgrade" "memory-to-durable" \
   cargo test -p greenmqtt-storage memory_to_ -- --nocapture
 
-run_step "durable-switch" \
+summary_run_step "storage-upgrade" "durable-switch" \
   cargo test -p greenmqtt-storage _switch_preserves_session_route_retain_state -- --nocapture
 
-emit_summary
+summary_emit_results_profile "storage-upgrade-baseline" "$SUMMARY_FILE"
 exit "$OVERALL_STATUS"

@@ -3,50 +3,19 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
+source "$ROOT_DIR/scripts/lib/summary.sh"
 
 SUMMARY_FILE="${GREENMQTT_PROFILE_SUMMARY_FILE:-}"
-OVERALL_STATUS=0
-RESULTS=()
+summary_init_state
 
-run_step() {
-  local name="$1"
-  shift
-  echo "[rollback-drill] ${name}"
-  local started_at
-  started_at="$(date +%s)"
-  local status=0
-  set +e
-  "$@"
-  status=$?
-  set -e
-  local finished_at
-  finished_at="$(date +%s)"
-  local duration=$((finished_at - started_at))
-  if [[ $status -ne 0 ]]; then
-    OVERALL_STATUS=1
-  fi
-  RESULTS+=("{\"name\":\"${name}\",\"status\":${status},\"duration_seconds\":${duration}}")
-}
-
-emit_summary() {
-  local joined=""
-  local IFS=,
-  joined="${RESULTS[*]}"
-  local summary="{\"profile\":\"rollback-drill\",\"status\":${OVERALL_STATUS},\"results\":[${joined}]}"
-  if [[ -n "$SUMMARY_FILE" ]]; then
-    printf '%s\n' "$summary" > "$SUMMARY_FILE"
-  fi
-  printf '%s\n' "$summary"
-}
-
-run_step "shard-move-rollback" \
+summary_run_step "rollback-drill" "shard-move-rollback" \
   cargo test -p greenmqtt-cli shard_cli_command_drives_http_shard_move -- --nocapture
 
-run_step "cluster-failover-rollback" \
+summary_run_step "rollback-drill" "cluster-failover-rollback" \
   cargo test -p greenmqtt-cli cluster_redis_failover_falls_back_to_offline_and_recovers_on_reconnect -- --nocapture
 
-run_step "config-rollback" \
+summary_run_step "rollback-drill" "config-rollback" \
   "$ROOT_DIR/scripts/run-storage-upgrade-baseline.sh"
 
-emit_summary
+summary_emit_results_profile "rollback-drill" "$SUMMARY_FILE"
 exit "$OVERALL_STATUS"

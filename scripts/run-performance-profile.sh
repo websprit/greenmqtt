@@ -3,11 +3,11 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
+source "$ROOT_DIR/scripts/lib/summary.sh"
 
 MODE="default"
 SUMMARY_FILE="${GREENMQTT_PROFILE_SUMMARY_FILE:-}"
-OVERALL_STATUS=0
-RESULTS=()
+summary_init_state
 
 for arg in "$@"; do
   case "$arg" in
@@ -18,29 +18,6 @@ for arg in "$@"; do
       ;;
   esac
 done
-
-run_step() {
-  local name="$1"
-  shift
-
-  echo "[profile:${MODE}] ${name}"
-  local started_at
-  started_at="$(date +%s)"
-  local status=0
-  set +e
-  "$@"
-  status=$?
-  set -e
-  local finished_at
-  finished_at="$(date +%s)"
-  local duration=$((finished_at - started_at))
-
-  if [[ $status -ne 0 ]]; then
-    OVERALL_STATUS=1
-  fi
-
-  RESULTS+=("{\"name\":\"${name}\",\"status\":${status},\"duration_seconds\":${duration}}")
-}
 
 run_step_with_retries() {
   local name="$1"
@@ -61,7 +38,7 @@ run_step_with_retries() {
     local finished_at
     finished_at="$(date +%s)"
     local duration=$((finished_at - started_at))
-    RESULTS+=("{\"name\":\"${name}#${attempt}\",\"status\":${status},\"duration_seconds\":${duration}}")
+    summary_record_result "${name}#${attempt}" "$status" "$duration"
     if [[ $status -eq 0 ]]; then
       succeeded=1
       break
@@ -73,18 +50,6 @@ run_step_with_retries() {
     return 1
   fi
   return 0
-}
-
-emit_summary() {
-  local summary
-  local joined=""
-  local IFS=,
-  joined="${RESULTS[*]}"
-  summary="{\"profile\":\"performance-${MODE}\",\"status\":${OVERALL_STATUS},\"results\":[${joined}]}"
-  if [[ -n "$SUMMARY_FILE" ]]; then
-    printf '%s\n' "$summary" > "$SUMMARY_FILE"
-  fi
-  printf '%s\n' "$summary"
 }
 
 TEST_ARGS=()
@@ -99,15 +64,15 @@ if [[ "$MODE" == "release" ]]; then
   run_step_with_retries "backpressure-overhead" 3 \
     cargo test "${TEST_ARGS[@]}" -p greenmqtt-cli backpressure_overhead_stays_below_one_percent_under_normal_load -- --ignored --nocapture
 else
-  run_step "metrics-overhead" \
+  summary_run_step "profile:${MODE}" "metrics-overhead" \
     cargo test "${TEST_ARGS[@]}" -p greenmqtt-cli metrics_collection_overhead_stays_below_one_percent -- --ignored --nocapture
 
-  run_step "backpressure-overhead" \
+  summary_run_step "profile:${MODE}" "backpressure-overhead" \
     cargo test "${TEST_ARGS[@]}" -p greenmqtt-cli backpressure_overhead_stays_below_one_percent_under_normal_load -- --ignored --nocapture
 fi
 
-run_step "bandwidth-shaping-throughput" \
+summary_run_step "profile:${MODE}" "bandwidth-shaping-throughput" \
   cargo test "${TEST_ARGS[@]}" -p greenmqtt-broker mqtt::tests::publish::mqtt_tcp_outbound_bandwidth_limit_keeps_throughput_under_1_2kbps -- --ignored --nocapture
 
-emit_summary
+summary_emit_results_profile "performance-${MODE}" "$SUMMARY_FILE"
 exit "$OVERALL_STATUS"

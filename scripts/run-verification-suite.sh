@@ -3,12 +3,12 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
+source "$ROOT_DIR/scripts/lib/summary.sh"
 
 MODE="${1:-full}"
 RELEASE_MODE="default"
 SUMMARY_FILE="${GREENMQTT_PROFILE_SUMMARY_FILE:-}"
-OVERALL_STATUS=0
-RESULTS=()
+summary_init_state
 
 if [[ "${MODE}" == "--release" ]]; then
   MODE="full"
@@ -17,54 +17,20 @@ elif [[ "${2:-}" == "--release" ]]; then
   RELEASE_MODE="release"
 fi
 
-run_step() {
-  local name="$1"
-  shift
-
-  echo "[verification:${MODE}] ${name}"
-  local started_at
-  started_at="$(date +%s)"
-  local status=0
-  set +e
-  "$@"
-  status=$?
-  set -e
-  local finished_at
-  finished_at="$(date +%s)"
-  local duration=$((finished_at - started_at))
-
-  if [[ $status -ne 0 ]]; then
-    OVERALL_STATUS=1
-  fi
-
-  RESULTS+=("{\"name\":\"${name}\",\"status\":${status},\"duration_seconds\":${duration}}")
-}
-
-emit_summary() {
-  local joined=""
-  local IFS=,
-  joined="${RESULTS[*]}"
-  local summary="{\"profile\":\"verification-${MODE}-${RELEASE_MODE}\",\"status\":${OVERALL_STATUS},\"results\":[${joined}]}"
-  if [[ -n "$SUMMARY_FILE" ]]; then
-    printf '%s\n' "$summary" > "$SUMMARY_FILE"
-  fi
-  printf '%s\n' "$summary"
-}
-
 case "$MODE" in
   full)
     if [[ "$RELEASE_MODE" == "release" ]]; then
-      run_step "performance-profile" env -u GREENMQTT_PROFILE_SUMMARY_FILE "$ROOT_DIR/scripts/run-performance-profile.sh" --release
-      run_step "cluster-local-profile" env -u GREENMQTT_PROFILE_SUMMARY_FILE "$ROOT_DIR/scripts/run-cluster-profile.sh" local --release
-      run_step "workspace-smoke" env -u GREENMQTT_PROFILE_SUMMARY_FILE "$ROOT_DIR/scripts/run-workspace-smoke.sh"
+      summary_run_step "verification:${MODE}" "performance-profile" env -u GREENMQTT_PROFILE_SUMMARY_FILE "$ROOT_DIR/scripts/run-performance-profile.sh" --release
+      summary_run_step "verification:${MODE}" "cluster-local-profile" env -u GREENMQTT_PROFILE_SUMMARY_FILE "$ROOT_DIR/scripts/run-cluster-profile.sh" local --release
+      summary_run_step "verification:${MODE}" "workspace-smoke" env -u GREENMQTT_PROFILE_SUMMARY_FILE "$ROOT_DIR/scripts/run-workspace-smoke.sh"
     else
-      run_step "performance-profile" env -u GREENMQTT_PROFILE_SUMMARY_FILE "$ROOT_DIR/scripts/run-performance-profile.sh"
-      run_step "cluster-local-profile" env -u GREENMQTT_PROFILE_SUMMARY_FILE "$ROOT_DIR/scripts/run-cluster-profile.sh" local
-      run_step "workspace-smoke" env -u GREENMQTT_PROFILE_SUMMARY_FILE "$ROOT_DIR/scripts/run-workspace-smoke.sh"
+      summary_run_step "verification:${MODE}" "performance-profile" env -u GREENMQTT_PROFILE_SUMMARY_FILE "$ROOT_DIR/scripts/run-performance-profile.sh"
+      summary_run_step "verification:${MODE}" "cluster-local-profile" env -u GREENMQTT_PROFILE_SUMMARY_FILE "$ROOT_DIR/scripts/run-cluster-profile.sh" local
+      summary_run_step "verification:${MODE}" "workspace-smoke" env -u GREENMQTT_PROFILE_SUMMARY_FILE "$ROOT_DIR/scripts/run-workspace-smoke.sh"
     fi
     ;;
   quick)
-    run_step "workspace-smoke" env -u GREENMQTT_PROFILE_SUMMARY_FILE "$ROOT_DIR/scripts/run-workspace-smoke.sh"
+    summary_run_step "verification:${MODE}" "workspace-smoke" env -u GREENMQTT_PROFILE_SUMMARY_FILE "$ROOT_DIR/scripts/run-workspace-smoke.sh"
     ;;
   *)
     echo "usage: $0 [full|quick] [--release]" >&2
@@ -72,5 +38,5 @@ case "$MODE" in
     ;;
 esac
 
-emit_summary
+summary_emit_results_profile "verification-${MODE}-${RELEASE_MODE}" "$SUMMARY_FILE"
 exit "$OVERALL_STATUS"
