@@ -2,9 +2,10 @@ use super::{
     configured_acl, configured_auth, configured_hooks, configured_webhook, durable_services,
     parse_acl_rules, parse_bench_scenario, parse_bench_scenarios, parse_bridge_rules,
     parse_compare_backends, parse_identity_matchers, parse_topic_rewrite_rules, redis_services,
-    run_bench, run_compare_bench, run_compare_soak, run_profile_bench, run_shard_command, run_soak,
-    shard_command_request, validate_bench_report, validate_soak_report, BenchConfig, BenchReport,
-    BenchScenario, BenchThresholds, SoakConfig, SoakReport, SoakThresholds,
+    render_shard_response_text, run_bench, run_compare_bench, run_compare_soak, run_profile_bench,
+    run_shard_command, run_soak, shard_command_request, validate_bench_report,
+    validate_soak_report, BenchConfig, BenchReport, BenchScenario, BenchThresholds, OutputMode,
+    SoakConfig, SoakReport, SoakThresholds,
 };
 use greenmqtt_broker::{BrokerConfig, BrokerRuntime};
 use greenmqtt_core::{
@@ -134,7 +135,7 @@ fn shard_cli_command_drives_http_shard_move() {
             let mut request = String::new();
             stream.read_to_string(&mut request).unwrap();
             assert!(request.contains("POST /v1/shards/dist/t1/*/move HTTP/1.1"));
-            assert!(request.contains(r#"{"target_node_id":9}"#));
+            assert!(request.contains(r#"{"target_node_id":9,"dry_run":false}"#));
             let assignment = ServiceShardAssignment::new(
                 ServiceShardKey::dist("t1"),
                 ServiceEndpoint::new(ServiceKind::Dist, 9, "http://127.0.0.1:50090"),
@@ -173,6 +174,148 @@ fn shard_cli_command_drives_http_shard_move() {
 
         server.join().unwrap();
     });
+}
+
+#[test]
+fn shard_cli_command_reads_http_shard_audit() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let server = std::thread::spawn(move || {
+            let listener = TcpListener::bind(addr).unwrap();
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            stream.read_to_string(&mut request).unwrap();
+            assert!(request.contains("GET /v1/audit?shard_only=true&limit=5 HTTP/1.1"));
+            let body = r#"[{"seq":1,"timestamp_ms":1,"action":"shard_move","target":"shards","details":{"tenant_id":"t1"}}]"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        std::env::set_var("GREENMQTT_HTTP_BIND", addr.to_string());
+        std::env::set_var("GREENMQTT_OUTPUT", "json");
+        run_shard_command(
+            vec![
+                "audit".to_string(),
+                "--limit".to_string(),
+                "5".to_string(),
+                "--output".to_string(),
+                "json".to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        std::env::remove_var("GREENMQTT_HTTP_BIND");
+        std::env::remove_var("GREENMQTT_OUTPUT");
+
+        server.join().unwrap();
+    });
+}
+
+fn run_shard_cli_against_mock_http(
+    args: Vec<String>,
+    expected_request_fragment: &'static str,
+    response_body: &'static str,
+) {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let server = std::thread::spawn(move || {
+            let listener = TcpListener::bind(addr).unwrap();
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            stream.read_to_string(&mut request).unwrap();
+            assert!(request.contains(expected_request_fragment));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        std::env::set_var("GREENMQTT_HTTP_BIND", addr.to_string());
+        run_shard_command(args.into_iter()).unwrap();
+        std::env::remove_var("GREENMQTT_HTTP_BIND");
+        server.join().unwrap();
+    });
+}
+
+#[test]
+fn shard_cli_command_drives_http_shard_list() {
+    run_shard_cli_against_mock_http(
+        vec![
+            "ls".into(),
+            "--kind".into(),
+            "dist".into(),
+            "--tenant-id".into(),
+            "t1".into(),
+        ],
+        "GET /v1/shards?kind=dist&tenant_id=t1 HTTP/1.1",
+        "[]",
+    );
+}
+
+#[test]
+fn shard_cli_command_drives_http_shard_drain() {
+    run_shard_cli_against_mock_http(
+        vec!["drain".into(), "dist".into(), "t1".into(), "*".into()],
+        r#"POST /v1/shards/dist/t1/*/drain HTTP/1.1"#,
+        r#"{"previous":null,"current":null}"#,
+    );
+}
+
+#[test]
+fn shard_cli_command_drives_http_shard_catch_up() {
+    run_shard_cli_against_mock_http(
+        vec![
+            "catch-up".into(),
+            "dist".into(),
+            "t1".into(),
+            "*".into(),
+            "9".into(),
+        ],
+        r#"POST /v1/shards/dist/t1/*/catch-up HTTP/1.1"#,
+        r#"{"previous":null,"current":null}"#,
+    );
+}
+
+#[test]
+fn shard_cli_command_drives_http_shard_repair() {
+    run_shard_cli_against_mock_http(
+        vec![
+            "repair".into(),
+            "dist".into(),
+            "t1".into(),
+            "*".into(),
+            "9".into(),
+        ],
+        r#"POST /v1/shards/dist/t1/*/repair HTTP/1.1"#,
+        r#"{"previous":null,"current":null}"#,
+    );
+}
+
+#[test]
+fn shard_cli_command_drives_http_shard_failover() {
+    run_shard_cli_against_mock_http(
+        vec![
+            "failover".into(),
+            "dist".into(),
+            "t1".into(),
+            "*".into(),
+            "9".into(),
+        ],
+        r#"POST /v1/shards/dist/t1/*/failover HTTP/1.1"#,
+        r#"{"previous":null,"current":null}"#,
+    );
 }
 
 fn assert_bench_phase_timings(report: &BenchReport) {
@@ -1448,7 +1591,7 @@ fn configured_hooks_accepts_bridge_timeout_and_fail_open_env() {
 
 #[test]
 fn shard_command_request_builds_ls_query() {
-    let (method, path, body) = shard_command_request(
+    let (method, path, body, output) = shard_command_request(
         vec![
             "ls".to_string(),
             "--kind".to_string(),
@@ -1462,11 +1605,31 @@ fn shard_command_request_builds_ls_query() {
     assert_eq!(method, "GET");
     assert_eq!(path, "/v1/shards?kind=dist&tenant_id=t1");
     assert!(body.is_none());
+    assert_eq!(output, OutputMode::Text);
+}
+
+#[test]
+fn shard_command_request_builds_audit_query() {
+    let (method, path, body, output) = shard_command_request(
+        vec![
+            "audit".to_string(),
+            "--limit".to_string(),
+            "5".to_string(),
+            "--output".to_string(),
+            "json".to_string(),
+        ]
+        .into_iter(),
+    )
+    .unwrap();
+    assert_eq!(method, "GET");
+    assert_eq!(path, "/v1/audit?shard_only=true&limit=5");
+    assert!(body.is_none());
+    assert_eq!(output, OutputMode::Json);
 }
 
 #[test]
 fn shard_command_request_builds_move_request() {
-    let (method, path, body) = shard_command_request(
+    let (method, path, body, output) = shard_command_request(
         vec![
             "move".to_string(),
             "dist".to_string(),
@@ -1479,5 +1642,107 @@ fn shard_command_request_builds_move_request() {
     .unwrap();
     assert_eq!(method, "POST");
     assert_eq!(path, "/v1/shards/dist/t1/*/move");
-    assert_eq!(body.as_deref(), Some(r#"{"target_node_id":9}"#));
+    assert_eq!(
+        body.as_deref(),
+        Some(r#"{"target_node_id":9,"dry_run":false}"#)
+    );
+    assert_eq!(output, OutputMode::Text);
+}
+
+#[test]
+fn shard_command_request_builds_drain_request() {
+    let (method, path, body, output) = shard_command_request(
+        vec![
+            "drain".to_string(),
+            "dist".to_string(),
+            "t1".to_string(),
+            "*".to_string(),
+        ]
+        .into_iter(),
+    )
+    .unwrap();
+    assert_eq!(method, "POST");
+    assert_eq!(path, "/v1/shards/dist/t1/*/drain");
+    assert_eq!(body.as_deref(), Some(r#"{"dry_run":false}"#));
+    assert_eq!(output, OutputMode::Text);
+}
+
+#[test]
+fn shard_command_request_builds_catch_up_request() {
+    let (method, path, body, output) = shard_command_request(
+        vec![
+            "catch-up".to_string(),
+            "dist".to_string(),
+            "t1".to_string(),
+            "*".to_string(),
+            "9".to_string(),
+        ]
+        .into_iter(),
+    )
+    .unwrap();
+    assert_eq!(method, "POST");
+    assert_eq!(path, "/v1/shards/dist/t1/*/catch-up");
+    assert_eq!(
+        body.as_deref(),
+        Some(r#"{"target_node_id":9,"dry_run":false}"#)
+    );
+    assert_eq!(output, OutputMode::Text);
+}
+
+#[test]
+fn shard_command_request_builds_repair_request() {
+    let (method, path, body, output) = shard_command_request(
+        vec![
+            "repair".to_string(),
+            "dist".to_string(),
+            "t1".to_string(),
+            "*".to_string(),
+            "9".to_string(),
+        ]
+        .into_iter(),
+    )
+    .unwrap();
+    assert_eq!(method, "POST");
+    assert_eq!(path, "/v1/shards/dist/t1/*/repair");
+    assert_eq!(
+        body.as_deref(),
+        Some(r#"{"target_node_id":9,"dry_run":false}"#)
+    );
+    assert_eq!(output, OutputMode::Text);
+}
+
+#[test]
+fn shard_command_request_supports_dry_run_and_output_override() {
+    let (method, path, body, output) = shard_command_request(
+        vec![
+            "move".to_string(),
+            "dist".to_string(),
+            "t1".to_string(),
+            "*".to_string(),
+            "9".to_string(),
+            "--dry-run".to_string(),
+            "--output".to_string(),
+            "json".to_string(),
+        ]
+        .into_iter(),
+    )
+    .unwrap();
+    assert_eq!(method, "POST");
+    assert_eq!(path, "/v1/shards/dist/t1/*/move");
+    assert_eq!(
+        body.as_deref(),
+        Some(r#"{"target_node_id":9,"dry_run":true}"#)
+    );
+    assert_eq!(output, OutputMode::Json);
+}
+
+#[test]
+fn render_shard_response_text_formats_action_preview() {
+    let body = r#"{
+      "previous":{"shard":{"kind":"Dist","tenant_id":"t1","scope":"*"},"endpoint":{"kind":"Dist","node_id":7,"endpoint":"http://127.0.0.1:50070"},"epoch":1,"fencing_token":10,"lifecycle":"Serving"},
+      "current":{"shard":{"kind":"Dist","tenant_id":"t1","scope":"*"},"endpoint":{"kind":"Dist","node_id":9,"endpoint":"http://127.0.0.1:50090"},"epoch":2,"fencing_token":11,"lifecycle":"Draining"}
+    }"#;
+    let text = render_shard_response_text(body).unwrap();
+    assert!(text.contains("previous=t1:* owner=7"));
+    assert!(text.contains("current=t1:* owner=9"));
 }

@@ -31,6 +31,8 @@ pub struct AuditQuery {
     pub since_timestamp_ms: Option<u64>,
     pub details_key: Option<String>,
     pub details_value: Option<String>,
+    #[serde(default)]
+    pub shard_only: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -49,7 +51,7 @@ where
     C: AclProvider + 'static,
     H: EventHook + 'static,
 {
-    Ok(Json(broker.list_admin_audit_filtered(
+    let mut entries = broker.list_admin_audit_filtered(
         query.action.as_deref(),
         query.target.as_deref(),
         query.since_seq,
@@ -58,7 +60,11 @@ where
         query.details_key.as_deref(),
         query.details_value.as_deref(),
         query.limit,
-    )))
+    );
+    if query.shard_only {
+        entries.retain(|entry| entry.action.starts_with("shard_"));
+    }
+    Ok(Json(entries))
 }
 
 pub(crate) async fn get_tenant_quota<A, C, H>(

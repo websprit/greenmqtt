@@ -1604,6 +1604,130 @@ async fn move_inbox_shard_preserves_messages_at_least_once_during_concurrent_enq
 }
 
 #[tokio::test]
+async fn move_inbox_shard_survives_source_restart_mid_transfer() {
+    let registry = StaticServiceEndpointRegistry::default();
+    let bind1 = "127.0.0.1:50096".parse().unwrap();
+    let bind2 = "127.0.0.1:50097".parse().unwrap();
+    let server1 = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: None,
+        }
+        .serve(bind1),
+    );
+    let server2 = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: None,
+        }
+        .serve(bind2),
+    );
+    sleep(Duration::from_millis(50)).await;
+
+    let shard = ServiceShardKey::inbox("t1", "s1");
+    registry
+        .upsert_member(ClusterNodeMembership::new(
+            7,
+            1,
+            ClusterNodeLifecycle::Serving,
+            vec![ServiceEndpoint::new(
+                ServiceKind::Inbox,
+                7,
+                "http://127.0.0.1:50096",
+            )],
+        ))
+        .await
+        .unwrap();
+    registry
+        .upsert_member(ClusterNodeMembership::new(
+            9,
+            1,
+            ClusterNodeLifecycle::Serving,
+            vec![ServiceEndpoint::new(
+                ServiceKind::Inbox,
+                9,
+                "http://127.0.0.1:50097",
+            )],
+        ))
+        .await
+        .unwrap();
+    registry
+        .upsert_assignment(ServiceShardAssignment::new(
+            shard.clone(),
+            ServiceEndpoint::new(ServiceKind::Inbox, 7, "http://127.0.0.1:50096"),
+            1,
+            10,
+            ServiceShardLifecycle::Serving,
+        ))
+        .await
+        .unwrap();
+
+    let source = InboxGrpcClient::connect("http://127.0.0.1:50096")
+        .await
+        .unwrap();
+    source
+        .subscribe(Subscription {
+            session_id: "s1".into(),
+            tenant_id: "t1".into(),
+            topic_filter: "devices/+/state".into(),
+            qos: 1,
+            subscription_identifier: Some(1),
+            no_local: false,
+            retain_as_published: false,
+            retain_handling: 0,
+            shared_group: None,
+            kind: SessionKind::Persistent,
+        })
+        .await
+        .unwrap();
+    for index in 0..64u16 {
+        source
+            .enqueue(OfflineMessage {
+                tenant_id: "t1".into(),
+                session_id: "s1".into(),
+                topic: format!("devices/restart/{index}"),
+                payload: format!("restart-{index}").into_bytes().into(),
+                qos: 1,
+                retain: false,
+                from_session_id: "publisher".into(),
+                properties: PublishProperties::default(),
+            })
+            .await
+            .unwrap();
+    }
+
+    let move_task = tokio::spawn({
+        let registry = registry.clone();
+        let shard = shard.clone();
+        async move { InboxGrpcClient::move_shard_via_registry(&registry, shard, 9).await }
+    });
+    sleep(Duration::from_millis(1)).await;
+    server1.abort();
+
+    let assignment = move_task.await.unwrap().unwrap();
+    assert_eq!(assignment.owner_node_id(), 9);
+
+    let target = InboxGrpcClient::connect("http://127.0.0.1:50097")
+        .await
+        .unwrap();
+    let target_messages = target.peek(&"s1".to_string()).await.unwrap();
+    assert!(target_messages.len() >= 64);
+    assert!(target_messages
+        .iter()
+        .any(|message| message.topic == "devices/restart/0"));
+
+    server2.abort();
+}
+
+#[tokio::test]
 async fn catch_up_inbox_shard_via_registry_restores_state_and_verifies_checksum() {
     let registry = StaticServiceEndpointRegistry::default();
     let bind1 = "127.0.0.1:50069".parse().unwrap();
@@ -2008,6 +2132,162 @@ async fn catch_up_inbox_shard_state_survives_restart_via_storage() {
 }
 
 #[tokio::test]
+async fn catch_up_inbox_shard_survives_target_restart_mid_recovery() {
+    let registry = StaticServiceEndpointRegistry::default();
+    let bind1 = "127.0.0.1:50098".parse().unwrap();
+    let bind2 = "127.0.0.1:50099".parse().unwrap();
+    let subscription_store = Arc::new(MemorySubscriptionStore::default());
+    let inbox_store = Arc::new(MemoryInboxStore::default());
+    let inflight_store = Arc::new(MemoryInflightStore::default());
+    let server1 = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: None,
+        }
+        .serve(bind1),
+    );
+    let server2 = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(PersistentInboxHandle::open(
+                subscription_store.clone(),
+                inbox_store.clone(),
+                inflight_store.clone(),
+            )),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: None,
+        }
+        .serve(bind2),
+    );
+    sleep(Duration::from_millis(50)).await;
+
+    let shard = ServiceShardKey::inbox("t1", "s1");
+    registry
+        .upsert_member(ClusterNodeMembership::new(
+            7,
+            1,
+            ClusterNodeLifecycle::Serving,
+            vec![ServiceEndpoint::new(
+                ServiceKind::Inbox,
+                7,
+                "http://127.0.0.1:50098",
+            )],
+        ))
+        .await
+        .unwrap();
+    registry
+        .upsert_member(ClusterNodeMembership::new(
+            9,
+            1,
+            ClusterNodeLifecycle::Serving,
+            vec![ServiceEndpoint::new(
+                ServiceKind::Inbox,
+                9,
+                "http://127.0.0.1:50099",
+            )],
+        ))
+        .await
+        .unwrap();
+    registry
+        .upsert_assignment(ServiceShardAssignment::new(
+            shard.clone(),
+            ServiceEndpoint::new(ServiceKind::Inbox, 7, "http://127.0.0.1:50098"),
+            1,
+            10,
+            ServiceShardLifecycle::Serving,
+        ))
+        .await
+        .unwrap();
+
+    let source = InboxGrpcClient::connect("http://127.0.0.1:50098")
+        .await
+        .unwrap();
+    source
+        .subscribe(Subscription {
+            session_id: "s1".into(),
+            tenant_id: "t1".into(),
+            topic_filter: "devices/+/state".into(),
+            qos: 1,
+            subscription_identifier: Some(1),
+            no_local: false,
+            retain_as_published: false,
+            retain_handling: 0,
+            shared_group: None,
+            kind: SessionKind::Persistent,
+        })
+        .await
+        .unwrap();
+    source
+        .stage_inflight(InflightMessage {
+            tenant_id: "t1".into(),
+            session_id: "s1".into(),
+            packet_id: 21,
+            topic: "devices/a/state".into(),
+            payload: b"inflight".to_vec().into(),
+            qos: 1,
+            retain: false,
+            from_session_id: "publisher".into(),
+            properties: PublishProperties::default(),
+            phase: greenmqtt_core::InflightPhase::Publish,
+        })
+        .await
+        .unwrap();
+
+    let assignment = InboxGrpcClient::catch_up_shard_via_registry(&registry, shard.clone(), 9)
+        .await
+        .unwrap();
+    assert_eq!(assignment.owner_node_id(), 9);
+
+    server2.abort();
+    sleep(Duration::from_millis(50)).await;
+    let restarted = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(PersistentInboxHandle::open(
+                subscription_store.clone(),
+                inbox_store.clone(),
+                inflight_store.clone(),
+            )),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: None,
+        }
+        .serve(bind2),
+    );
+    sleep(Duration::from_millis(50)).await;
+
+    let target = InboxGrpcClient::connect("http://127.0.0.1:50099")
+        .await
+        .unwrap();
+    assert_eq!(
+        target
+            .list_subscriptions(&"s1".to_string())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        target
+            .fetch_inflight(&"s1".to_string())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    server1.abort();
+    restarted.abort();
+}
+
+#[tokio::test]
 async fn anti_entropy_repair_tenant_shard_via_registry_reconciles_target_routes() {
     let registry = StaticServiceEndpointRegistry::default();
     let bind1 = "127.0.0.1:50075".parse().unwrap();
@@ -2249,6 +2529,104 @@ async fn stream_shard_snapshot_with_stale_fencing_is_rejected_by_service() {
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
 
     server.abort();
+}
+
+#[tokio::test]
+async fn shard_fencing_reject_can_be_retried_with_current_assignment() {
+    let registry = Arc::new(StaticServiceEndpointRegistry::default());
+    let bind1 = "127.0.0.1:50102".parse().unwrap();
+    let bind2 = "127.0.0.1:50103".parse().unwrap();
+    let server1 = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: Some(registry.clone()),
+        }
+        .serve(bind1),
+    );
+    let server2 = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: Some(registry.clone()),
+        }
+        .serve(bind2),
+    );
+    sleep(Duration::from_millis(50)).await;
+
+    let shard = ServiceShardKey::dist("t1");
+    registry
+        .upsert_member(ClusterNodeMembership::new(
+            7,
+            1,
+            ClusterNodeLifecycle::Serving,
+            vec![ServiceEndpoint::new(
+                ServiceKind::Dist,
+                7,
+                "http://127.0.0.1:50102",
+            )],
+        ))
+        .await
+        .unwrap();
+    registry
+        .upsert_member(ClusterNodeMembership::new(
+            9,
+            1,
+            ClusterNodeLifecycle::Serving,
+            vec![ServiceEndpoint::new(
+                ServiceKind::Dist,
+                9,
+                "http://127.0.0.1:50103",
+            )],
+        ))
+        .await
+        .unwrap();
+    registry
+        .upsert_assignment(ServiceShardAssignment::new(
+            shard.clone(),
+            ServiceEndpoint::new(ServiceKind::Dist, 7, "http://127.0.0.1:50102"),
+            2,
+            12,
+            ServiceShardLifecycle::Serving,
+        ))
+        .await
+        .unwrap();
+
+    let stale = ServiceShardAssignment::new(
+        shard.clone(),
+        ServiceEndpoint::new(ServiceKind::Dist, 7, "http://127.0.0.1:50102"),
+        1,
+        11,
+        ServiceShardLifecycle::Serving,
+    );
+    let error = registry
+        .move_shard_to_member_with_fencing(&stale, 9)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("stale shard assignment"));
+
+    let current = registry.resolve_assignment(&shard).await.unwrap().unwrap();
+    let moved = registry
+        .move_shard_to_member_with_fencing(&current, 9)
+        .await
+        .unwrap();
+    assert_eq!(moved.owner_node_id(), 9);
+    assert_eq!(moved.lifecycle, ServiceShardLifecycle::Draining);
+
+    let client = DistGrpcClient::connect("http://127.0.0.1:50103")
+        .await
+        .unwrap();
+    let snapshot = client.stream_shard_snapshot(&moved).await.unwrap();
+    assert!(snapshot.routes.is_empty());
+
+    server1.abort();
+    server2.abort();
 }
 
 #[tokio::test]
@@ -2692,6 +3070,128 @@ async fn periodic_anti_entropy_reconciles_dist_replica_checksum() {
         .unwrap()
         .unwrap();
     assert_eq!(current.owner_node_id(), 7);
+
+    server1.abort();
+    server2.abort();
+}
+
+#[tokio::test]
+async fn anti_entropy_dist_replica_converges_under_concurrent_write() {
+    let registry = Arc::new(StaticServiceEndpointRegistry::default());
+    let bind1 = "127.0.0.1:50100".parse().unwrap();
+    let bind2 = "127.0.0.1:50101".parse().unwrap();
+    let server1 = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: Some(registry.clone()),
+        }
+        .serve(bind1),
+    );
+    let server2 = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: Some(registry.clone()),
+        }
+        .serve(bind2),
+    );
+    sleep(Duration::from_millis(50)).await;
+
+    registry
+        .upsert_member(ClusterNodeMembership::new(
+            7,
+            1,
+            ClusterNodeLifecycle::Serving,
+            vec![ServiceEndpoint::new(
+                ServiceKind::Dist,
+                7,
+                "http://127.0.0.1:50100",
+            )],
+        ))
+        .await
+        .unwrap();
+    registry
+        .upsert_member(ClusterNodeMembership::new(
+            9,
+            1,
+            ClusterNodeLifecycle::Serving,
+            vec![ServiceEndpoint::new(
+                ServiceKind::Dist,
+                9,
+                "http://127.0.0.1:50101",
+            )],
+        ))
+        .await
+        .unwrap();
+    registry
+        .upsert_assignment(ServiceShardAssignment::new(
+            ServiceShardKey::dist("t1"),
+            ServiceEndpoint::new(ServiceKind::Dist, 7, "http://127.0.0.1:50100"),
+            1,
+            10,
+            ServiceShardLifecycle::Serving,
+        ))
+        .await
+        .unwrap();
+
+    let source = DistGrpcClient::connect("http://127.0.0.1:50100")
+        .await
+        .unwrap();
+    let replica = DistGrpcClient::connect("http://127.0.0.1:50101")
+        .await
+        .unwrap();
+    source
+        .add_route(RouteRecord {
+            tenant_id: "t1".into(),
+            topic_filter: "devices/+/state".into(),
+            session_id: "s1".into(),
+            node_id: 7,
+            subscription_identifier: None,
+            no_local: false,
+            retain_as_published: false,
+            shared_group: None,
+            kind: SessionKind::Persistent,
+        })
+        .await
+        .unwrap();
+
+    let reconciler =
+        PeriodicAntiEntropyReconciler::new(registry.clone(), Duration::from_millis(20));
+    let (tx, rx) = watch::channel(false);
+    let task = tokio::spawn(async move {
+        reconciler
+            .run_dist_tenant_replica_until_cancelled("t1".to_string(), 9, rx)
+            .await
+    });
+    sleep(Duration::from_millis(30)).await;
+    source
+        .add_route(RouteRecord {
+            tenant_id: "t1".into(),
+            topic_filter: "devices/late/state".into(),
+            session_id: "s2".into(),
+            node_id: 7,
+            subscription_identifier: None,
+            no_local: false,
+            retain_as_published: false,
+            shared_group: None,
+            kind: SessionKind::Persistent,
+        })
+        .await
+        .unwrap();
+    sleep(Duration::from_millis(120)).await;
+    tx.send(true).unwrap();
+    task.await.unwrap().unwrap();
+
+    let routes = replica.list_routes(Some("t1")).await.unwrap();
+    assert_eq!(routes.len(), 2);
+    assert!(routes.iter().any(|route| route.topic_filter == "devices/late/state"));
 
     server1.abort();
     server2.abort();

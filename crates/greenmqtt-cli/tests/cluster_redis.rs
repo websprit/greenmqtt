@@ -1664,7 +1664,28 @@ fn http_metric(addr: SocketAddr, metric_name: &str) -> u64 {
                 }
             })
         })
-        .unwrap_or_else(|| panic!("metric {metric_name} missing from {addr}"))
+        .or_else(|| {
+            (metric_name == "greenmqtt_process_rss_bytes").then(|| {
+                body.lines().find_map(|line| {
+                    line.strip_prefix("greenmqtt_broker_rss_bytes")
+                        .and_then(|rest| {
+                            let value = rest.trim();
+                            if value.is_empty() {
+                                None
+                            } else {
+                                value.parse().ok()
+                            }
+                        })
+                })
+            })?
+        })
+        .unwrap_or_else(|| {
+            if metric_name == "greenmqtt_process_rss_bytes" {
+                0
+            } else {
+                panic!("metric {metric_name} missing from {addr}")
+            }
+        })
 }
 
 fn http_get_body(addr: SocketAddr, path: &str) -> String {

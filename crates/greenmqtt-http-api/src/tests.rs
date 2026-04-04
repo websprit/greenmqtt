@@ -8206,6 +8206,36 @@ async fn http_audit_restores_persisted_entries_after_restart() {
 }
 
 #[tokio::test]
+async fn http_audit_supports_shard_only_filter() {
+    let broker = broker();
+    broker.record_admin_audit(
+        "shard_move",
+        "shards",
+        BTreeMap::from([("tenant_id".into(), "t1".into())]),
+    );
+    broker.record_admin_audit(
+        "purge_offline",
+        "offline",
+        BTreeMap::from([("tenant_id".into(), "t1".into())]),
+    );
+
+    let app = HttpApi::router(broker);
+    let response = app
+        .oneshot(
+            Request::get("/v1/audit?shard_only=true&limit=10")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let audit: Vec<AdminAuditEntry> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].action, "shard_move");
+}
+
+#[tokio::test]
 async fn http_lists_shards_with_optional_filters() {
     let broker = broker();
     let shards = Arc::new(TestShardRegistry::default());
@@ -8426,4 +8456,77 @@ async fn http_dry_run_drain_shard_does_not_mutate_or_audit() {
         assignment
     );
     assert!(broker.list_admin_audit(None).is_empty());
+}
+
+#[tokio::test]
+async fn http_failover_shard_records_audit_and_metrics() {
+    let metrics = test_prometheus_handle();
+    let broker = broker();
+    let shards = Arc::new(TestShardRegistry::default());
+    shards
+        .upsert_member(ClusterNodeMembership::new(
+            7,
+            1,
+            ClusterNodeLifecycle::Serving,
+            vec![ServiceEndpoint::new(
+                ServiceKind::Dist,
+                7,
+                "http://127.0.0.1:50070",
+            )],
+        ))
+        .await
+        .unwrap();
+    shards
+        .upsert_member(ClusterNodeMembership::new(
+            9,
+            1,
+            ClusterNodeLifecycle::Serving,
+            vec![ServiceEndpoint::new(
+                ServiceKind::Dist,
+                9,
+                "http://127.0.0.1:50090",
+            )],
+        ))
+        .await
+        .unwrap();
+    shards
+        .upsert_assignment(ServiceShardAssignment::new(
+            ServiceShardKey::dist("t1"),
+            ServiceEndpoint::new(ServiceKind::Dist, 7, "http://127.0.0.1:50070"),
+            1,
+            10,
+            ServiceShardLifecycle::Serving,
+        ))
+        .await
+        .unwrap();
+
+    let app = HttpApi::router_with_peers_shards_and_metrics(
+        broker.clone(),
+        None,
+        Some(shards.clone()),
+        Some(metrics),
+    );
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/shards/dist/t1/*/failover")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"target_node_id":9}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let audit = broker.list_admin_audit(None);
+    assert!(audit.iter().any(|entry| entry.action == "shard_failover"));
+
+    let response = app
+        .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("mqtt_shard_failover_total"));
 }

@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+MODE="${1:-full}"
 SUMMARY_FILE="${GREENMQTT_PROFILE_SUMMARY_FILE:-}"
 OVERALL_STATUS=0
 RESULTS=()
@@ -12,7 +13,7 @@ run_step() {
   local name="$1"
   shift
 
-  echo "[profile] ${name}"
+  echo "[verification:${MODE}] ${name}"
   local started_at
   started_at="$(date +%s)"
   local status=0
@@ -32,25 +33,30 @@ run_step() {
 }
 
 emit_summary() {
-  local summary
   local joined=""
   local IFS=,
   joined="${RESULTS[*]}"
-  summary="{\"profile\":\"performance\",\"status\":${OVERALL_STATUS},\"results\":[${joined}]}"
+  local summary="{\"profile\":\"verification-${MODE}\",\"status\":${OVERALL_STATUS},\"results\":[${joined}]}"
   if [[ -n "$SUMMARY_FILE" ]]; then
     printf '%s\n' "$summary" > "$SUMMARY_FILE"
   fi
   printf '%s\n' "$summary"
 }
 
-run_step "metrics-overhead" \
-  cargo test -p greenmqtt-cli metrics_collection_overhead_stays_below_one_percent -- --ignored --nocapture
-
-run_step "backpressure-overhead" \
-  cargo test -p greenmqtt-cli backpressure_overhead_stays_below_one_percent_under_normal_load -- --ignored --nocapture
-
-run_step "bandwidth-shaping-throughput" \
-  cargo test -p greenmqtt-broker mqtt::tests::publish::mqtt_tcp_outbound_bandwidth_limit_keeps_throughput_under_1_2kbps -- --ignored --nocapture
+case "$MODE" in
+  full)
+    run_step "performance-profile" env -u GREENMQTT_PROFILE_SUMMARY_FILE "$ROOT_DIR/scripts/run-performance-profile.sh"
+    run_step "cluster-local-profile" env -u GREENMQTT_PROFILE_SUMMARY_FILE "$ROOT_DIR/scripts/run-cluster-profile.sh" local
+    run_step "workspace-smoke" env -u GREENMQTT_PROFILE_SUMMARY_FILE "$ROOT_DIR/scripts/run-workspace-smoke.sh"
+    ;;
+  quick)
+    run_step "workspace-smoke" env -u GREENMQTT_PROFILE_SUMMARY_FILE "$ROOT_DIR/scripts/run-workspace-smoke.sh"
+    ;;
+  *)
+    echo "usage: $0 [full|quick]" >&2
+    exit 2
+    ;;
+esac
 
 emit_summary
 exit "$OVERALL_STATUS"

@@ -183,27 +183,35 @@ struct CompareSoakReport {
     reports: Vec<SoakReport>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct ShardActionEnvelope {
+    previous: Option<greenmqtt_core::ServiceShardAssignment>,
+    current: Option<greenmqtt_core::ServiceShardAssignment>,
+}
+
 fn run_shard_command(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let addr = std::env::var("GREENMQTT_HTTP_BIND")
         .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
         .parse::<SocketAddr>()?;
-    let (method, path, body) = shard_command_request(args)?;
-    println!(
-        "{}",
-        http_request_body(addr, &method, &path, body.as_deref())?
-    );
+    let (method, path, body, output_mode) = shard_command_request(args)?;
+    let response = http_request_body(addr, &method, &path, body.as_deref())?;
+    match output_mode {
+        OutputMode::Json => println!("{response}"),
+        OutputMode::Text => println!("{}", render_shard_response_text(&response)?),
+    }
     Ok(())
 }
 
 fn shard_command_request(
     mut args: impl Iterator<Item = String>,
-) -> anyhow::Result<(String, String, Option<String>)> {
+) -> anyhow::Result<(String, String, Option<String>, OutputMode)> {
     let subcommand = args
         .next()
         .ok_or_else(|| anyhow::anyhow!("missing shard subcommand"))?;
     match subcommand.as_str() {
         "ls" => {
             let mut query = Vec::new();
+            let mut output_mode = output_mode();
             while let Some(flag) = args.next() {
                 match flag.as_str() {
                     "--kind" => {
@@ -218,6 +226,13 @@ fn shard_command_request(
                             .ok_or_else(|| anyhow::anyhow!("missing value for --tenant-id"))?;
                         query.push(format!("tenant_id={value}"));
                     }
+                    "--output" => {
+                        output_mode = parse_output_mode(
+                            &args
+                                .next()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --output"))?,
+                        )?;
+                    }
                     _ => anyhow::bail!("unknown shard ls flag: {flag}"),
                 }
             }
@@ -226,9 +241,68 @@ fn shard_command_request(
             } else {
                 format!("/v1/shards?{}", query.join("&"))
             };
-            Ok(("GET".into(), path, None))
+            Ok(("GET".into(), path, None, output_mode))
         }
-        "move" | "failover" => {
+        "audit" => {
+            let mut limit = None;
+            let mut output_mode = output_mode();
+            while let Some(flag) = args.next() {
+                match flag.as_str() {
+                    "--limit" => {
+                        limit = Some(
+                            args.next()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --limit"))?,
+                        );
+                    }
+                    "--output" => {
+                        output_mode = parse_output_mode(
+                            &args
+                                .next()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --output"))?,
+                        )?;
+                    }
+                    _ => anyhow::bail!("unknown shard audit flag: {flag}"),
+                }
+            }
+            let path = match limit {
+                Some(limit) => format!("/v1/audit?shard_only=true&limit={limit}"),
+                None => "/v1/audit?shard_only=true".to_string(),
+            };
+            Ok(("GET".into(), path, None, output_mode))
+        }
+        "drain" => {
+            let kind = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("missing shard kind"))?;
+            let tenant_id = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("missing tenant_id"))?;
+            let scope = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("missing shard scope"))?;
+            let mut dry_run = false;
+            let mut output_mode = output_mode();
+            while let Some(flag) = args.next() {
+                match flag.as_str() {
+                    "--dry-run" => dry_run = true,
+                    "--output" => {
+                        output_mode = parse_output_mode(
+                            &args
+                                .next()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --output"))?,
+                        )?;
+                    }
+                    _ => anyhow::bail!("unknown shard drain flag: {flag}"),
+                }
+            }
+            Ok((
+                "POST".into(),
+                format!("/v1/shards/{kind}/{tenant_id}/{scope}/drain"),
+                Some(format!(r#"{{"dry_run":{dry_run}}}"#)),
+                output_mode,
+            ))
+        }
+        "move" | "failover" | "catch-up" | "repair" => {
             let kind = args
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("missing shard kind"))?;
@@ -241,19 +315,119 @@ fn shard_command_request(
             let target_node_id = args
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("missing target_node_id"))?;
-            let action = if subcommand == "move" {
-                "move"
-            } else {
-                "failover"
+            let mut dry_run = false;
+            let mut output_mode = output_mode();
+            while let Some(flag) = args.next() {
+                match flag.as_str() {
+                    "--dry-run" => dry_run = true,
+                    "--output" => {
+                        output_mode = parse_output_mode(
+                            &args
+                                .next()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --output"))?,
+                        )?;
+                    }
+                    _ => anyhow::bail!("unknown shard {subcommand} flag: {flag}"),
+                }
+            }
+            let action = match subcommand.as_str() {
+                "move" => "move",
+                "failover" => "failover",
+                "catch-up" => "catch-up",
+                _ => "repair",
             };
             Ok((
                 "POST".into(),
                 format!("/v1/shards/{kind}/{tenant_id}/{scope}/{action}"),
-                Some(format!(r#"{{"target_node_id":{target_node_id}}}"#)),
+                Some(format!(
+                    r#"{{"target_node_id":{target_node_id},"dry_run":{dry_run}}}"#
+                )),
+                output_mode,
             ))
         }
         _ => anyhow::bail!("unknown shard subcommand: {subcommand}"),
     }
+}
+
+fn parse_output_mode(value: &str) -> anyhow::Result<OutputMode> {
+    match value {
+        "json" => Ok(OutputMode::Json),
+        "text" => Ok(OutputMode::Text),
+        _ => anyhow::bail!("invalid output mode: {value}"),
+    }
+}
+
+fn render_shard_response_text(body: &str) -> anyhow::Result<String> {
+    if let Ok(assignments) =
+        serde_json::from_str::<Vec<greenmqtt_core::ServiceShardAssignment>>(body)
+    {
+        return Ok(assignments
+            .into_iter()
+            .map(|assignment| {
+                format!(
+                    "{} tenant={} scope={} owner={} epoch={} fence={} lifecycle={:?}",
+                    format!("{:?}", assignment.shard.kind).to_lowercase(),
+                    assignment.shard.tenant_id,
+                    assignment.shard.scope,
+                    assignment.owner_node_id(),
+                    assignment.epoch,
+                    assignment.fencing_token,
+                    assignment.lifecycle,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"));
+    }
+    if let Ok(assignment) =
+        serde_json::from_str::<Option<greenmqtt_core::ServiceShardAssignment>>(body)
+    {
+        return Ok(assignment
+            .map(|assignment| {
+                format!(
+                    "{} tenant={} scope={} owner={} epoch={} fence={} lifecycle={:?}",
+                    format!("{:?}", assignment.shard.kind).to_lowercase(),
+                    assignment.shard.tenant_id,
+                    assignment.shard.scope,
+                    assignment.owner_node_id(),
+                    assignment.epoch,
+                    assignment.fencing_token,
+                    assignment.lifecycle,
+                )
+            })
+            .unwrap_or_else(|| "shard not found".to_string()));
+    }
+    let reply: ShardActionEnvelope = serde_json::from_str(body)?;
+    let previous = reply
+        .previous
+        .as_ref()
+        .map(|assignment| {
+            format!(
+                "{}:{} owner={} epoch={} fence={} lifecycle={:?}",
+                assignment.shard.tenant_id,
+                assignment.shard.scope,
+                assignment.owner_node_id(),
+                assignment.epoch,
+                assignment.fencing_token,
+                assignment.lifecycle,
+            )
+        })
+        .unwrap_or_else(|| "none".to_string());
+    let current = reply
+        .current
+        .as_ref()
+        .map(|assignment| {
+            format!(
+                "{}:{} owner={} epoch={} fence={} lifecycle={:?}",
+                assignment.shard.tenant_id,
+                assignment.shard.scope,
+                assignment.owner_node_id(),
+                assignment.epoch,
+                assignment.fencing_token,
+                assignment.lifecycle,
+            )
+        })
+        .unwrap_or_else(|| "none".to_string());
+    Ok(format!("previous={previous}\ncurrent={current}"))
 }
 
 fn http_request_body(
