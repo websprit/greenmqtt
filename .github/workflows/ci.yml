@@ -32,6 +32,97 @@ jobs:
       - name: Run workspace smoke
         run: ./scripts/run-workspace-smoke.sh
 
+      - name: Upload workspace smoke baseline marker
+        run: |
+          mkdir -p ci-artifacts
+          printf '%s\n' '{"profile":"workspace-smoke","status":0}' > ci-artifacts/workspace-smoke.json
+
+      - name: Upload workspace smoke artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: workspace-smoke-artifact
+          path: ci-artifacts/workspace-smoke.json
+
+  release-summary:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y redis-server pkg-config libclang-dev clang cmake ruby
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run release summary
+        run: |
+          mkdir -p ci-artifacts
+          GREENMQTT_PROFILE_SUMMARY_FILE=ci-artifacts/release-summary.json \
+            ./scripts/run-release-summary.sh
+
+      - name: Run rollback drill
+        run: |
+          GREENMQTT_PROFILE_SUMMARY_FILE=ci-artifacts/rollback-drill.json \
+            ./scripts/run-rollback-drill.sh
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-summary-artifacts
+          path: |
+            ci-artifacts/release-summary.json
+            ci-artifacts/rollback-drill.json
+
+  post-release-inspection:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y redis-server pkg-config libclang-dev clang cmake ruby
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Prepare inspection inputs
+        run: |
+          mkdir -p ci-artifacts
+          cat > ci-artifacts/post-release-metrics.prom <<'EOF'
+          mqtt_shard_move_total 1
+          mqtt_shard_failover_total{tenant_id="t1"} 1
+          mqtt_shard_anti_entropy_total 2
+          mqtt_shard_fencing_reject_total{kind="dist"} 0
+          EOF
+
+      - name: Run post-release inspection
+        run: |
+          GREENMQTT_PROFILE_SUMMARY_FILE=ci-artifacts/post-release-inspection.json \
+          GREENMQTT_POST_RELEASE_AUDIT_JSON='[]' \
+          GREENMQTT_METRICS_FILE=ci-artifacts/post-release-metrics.prom \
+            ./scripts/run-post-release-inspection.sh
+
+      - name: Upload post-release inspection artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: post-release-inspection-artifact
+          path: ci-artifacts/post-release-inspection.json
+
   cluster-ci-profile:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest

@@ -227,9 +227,7 @@ fn run_shard_cli_against_mock_http(
     runtime.block_on(async {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        drop(listener);
         let server = std::thread::spawn(move || {
-            let listener = TcpListener::bind(addr).unwrap();
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = String::new();
             stream.read_to_string(&mut request).unwrap();

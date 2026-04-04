@@ -88,6 +88,40 @@ case "$PROFILE" in
     fi
     ;;
 
+  nightly)
+    if [[ "$MODE" == "release" ]]; then
+      run_step "extended-failover-recovery" \
+        cargo test --release -p greenmqtt-cli cluster_redis_failover_falls_back_to_offline_and_recovers_on_reconnect -- --nocapture
+
+      run_step "extended-repeated-failover-soak" \
+        env GREENMQTT_CLUSTER_FAILOVER_SOAK_ITERATIONS="${GREENMQTT_CLUSTER_FAILOVER_SOAK_ITERATIONS:-6}" \
+        cargo test --release -p greenmqtt-cli cluster_redis_repeated_failover_replays_without_offline_leak -- --nocapture
+
+      run_step "extended-sessiondict-handoff" \
+        cargo test --release -p greenmqtt-cli cluster_redis_sessiondict_reassign_moves_offline_replay_to_new_node -- --nocapture
+    else
+      run_step "extended-failover-recovery" \
+        cargo test -p greenmqtt-cli cluster_redis_failover_falls_back_to_offline_and_recovers_on_reconnect -- --nocapture
+
+      run_step "extended-repeated-failover-soak" \
+        env GREENMQTT_CLUSTER_FAILOVER_SOAK_ITERATIONS="${GREENMQTT_CLUSTER_FAILOVER_SOAK_ITERATIONS:-6}" \
+        cargo test -p greenmqtt-cli cluster_redis_repeated_failover_replays_without_offline_leak -- --nocapture
+
+      run_step "extended-sessiondict-handoff" \
+        cargo test -p greenmqtt-cli cluster_redis_sessiondict_reassign_moves_offline_replay_to_new_node -- --nocapture
+    fi
+    ;;
+
+  flaky)
+    if [[ "$MODE" == "release" ]]; then
+      run_step "optional-flaky-soak" \
+        cargo test --release -p greenmqtt-cli cluster_redis_soak_leaves_no_residual_state -- --ignored --nocapture
+    else
+      run_step "optional-flaky-soak" \
+        cargo test -p greenmqtt-cli cluster_redis_soak_leaves_no_residual_state -- --ignored --nocapture
+    fi
+    ;;
+
   ci)
     if [[ "$MODE" == "release" ]]; then
       run_step "cross-node-bench" \
@@ -121,7 +155,7 @@ case "$PROFILE" in
     ;;
 
   *)
-    echo "usage: $0 [local|ci] [--release]" >&2
+    echo "usage: $0 [local|nightly|flaky|ci] [--release]" >&2
     exit 2
     ;;
 esac
