@@ -1,7 +1,9 @@
 use crate::broker::metrics::BrokerMetrics;
 use crate::broker::send_quota::SendQuotaManager;
+use crate::broker::token_bucket::TokenBucket;
 use crate::mqtt::connect::{
-    build_connack_error_packet, build_connack_packet_with_properties, connect_error_reason_code,
+    build_connack_error_packet, build_connack_packet_with_properties,
+    build_disconnect_packet_with_server_reference, connect_error_reason_code,
     connect_error_reason_string, prepare_connect,
 };
 use crate::mqtt::state::ProtocolStateError;
@@ -15,7 +17,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
 
-use super::codec::{parse_packet_frame, read_packet, Packet};
+use super::codec::{parse_packet_frame, read_packet_with_size, Packet};
 use super::util::packet_exceeds_limit;
 
 #[async_trait]
@@ -26,15 +28,39 @@ pub(crate) trait SessionTransport: Send + Sync + Unpin + 'static {
         max_packet_size: Option<u32>,
     ) -> anyhow::Result<Option<Packet>>;
     async fn write_bytes(&mut self, payload: &[u8]) -> anyhow::Result<()>;
+    fn reconfigure_bandwidth(
+        &mut self,
+        inbound_limit: Option<(u64, u64)>,
+        outbound_limit: Option<(u64, u64)>,
+    );
 }
 
 pub(crate) struct TcpTransport<S> {
     pub stream: S,
+    inbound_limiter: Option<TokenBucket>,
+    outbound_limiter: Option<TokenBucket>,
 }
 
 impl<S> TcpTransport<S> {
+    #[allow(dead_code)]
     pub(crate) fn new(stream: S) -> Self {
-        Self { stream }
+        Self {
+            stream,
+            inbound_limiter: None,
+            outbound_limiter: None,
+        }
+    }
+
+    pub(crate) fn with_bandwidth(
+        stream: S,
+        inbound_limit: Option<(u64, u64)>,
+        outbound_limit: Option<(u64, u64)>,
+    ) -> Self {
+        Self {
+            stream,
+            inbound_limiter: inbound_limit.map(|(rate, burst)| TokenBucket::new(rate, burst)),
+            outbound_limiter: outbound_limit.map(|(rate, burst)| TokenBucket::new(rate, burst)),
+        }
     }
 }
 
@@ -48,8 +74,19 @@ where
         protocol_level: u8,
         max_packet_size: Option<u32>,
     ) -> anyhow::Result<Option<Packet>> {
-        match read_packet(&mut self.stream, protocol_level, max_packet_size).await {
-            Ok(packet) => Ok(Some(packet)),
+        match read_packet_with_size(&mut self.stream, protocol_level, max_packet_size).await {
+            Ok((packet, packet_size)) => {
+                if let Some(limiter) = &self.inbound_limiter {
+                    let burst = limiter.burst().max(1) as usize;
+                    let mut remaining = packet_size;
+                    while remaining > 0 {
+                        let step = remaining.min(burst);
+                        let _ = limiter.acquire(step as u64).await;
+                        remaining -= step;
+                    }
+                }
+                Ok(Some(packet))
+            }
             Err(e) => {
                 if let Some(err) = e.downcast_ref::<std::io::Error>() {
                     if err.kind() == std::io::ErrorKind::UnexpectedEof {
@@ -62,18 +99,54 @@ where
     }
 
     async fn write_bytes(&mut self, payload: &[u8]) -> anyhow::Result<()> {
+        if let Some(limiter) = &self.outbound_limiter {
+            let burst = limiter.burst().max(1) as usize;
+            for chunk in payload.chunks(burst) {
+                let _ = limiter.acquire(chunk.len() as u64).await;
+                self.stream.write_all(chunk).await?;
+            }
+            return Ok(());
+        }
         self.stream.write_all(payload).await?;
         Ok(())
+    }
+
+    fn reconfigure_bandwidth(
+        &mut self,
+        inbound_limit: Option<(u64, u64)>,
+        outbound_limit: Option<(u64, u64)>,
+    ) {
+        self.inbound_limiter = inbound_limit.map(|(rate, burst)| TokenBucket::new(rate, burst));
+        self.outbound_limiter = outbound_limit.map(|(rate, burst)| TokenBucket::new(rate, burst));
     }
 }
 
 pub(crate) struct WsTransport<S> {
     pub stream: WebSocketStream<S>,
+    inbound_limiter: Option<TokenBucket>,
+    outbound_limiter: Option<TokenBucket>,
 }
 
 impl<S> WsTransport<S> {
+    #[allow(dead_code)]
     pub(crate) fn new(stream: WebSocketStream<S>) -> Self {
-        Self { stream }
+        Self {
+            stream,
+            inbound_limiter: None,
+            outbound_limiter: None,
+        }
+    }
+
+    pub(crate) fn with_bandwidth(
+        stream: WebSocketStream<S>,
+        inbound_limit: Option<(u64, u64)>,
+        outbound_limit: Option<(u64, u64)>,
+    ) -> Self {
+        Self {
+            stream,
+            inbound_limiter: inbound_limit.map(|(rate, burst)| TokenBucket::new(rate, burst)),
+            outbound_limiter: outbound_limit.map(|(rate, burst)| TokenBucket::new(rate, burst)),
+        }
     }
 }
 
@@ -93,6 +166,15 @@ where
                     if packet_exceeds_limit(frame.len(), max_packet_size) {
                         anyhow::bail!("packet exceeds configured maximum packet size");
                     }
+                    if let Some(limiter) = &self.inbound_limiter {
+                        let burst = limiter.burst().max(1) as usize;
+                        let mut remaining = frame.len();
+                        while remaining > 0 {
+                            let step = remaining.min(burst);
+                            let _ = limiter.acquire(step as u64).await;
+                            remaining -= step;
+                        }
+                    }
                     return Ok(Some(parse_packet_frame(&frame, protocol_level)?));
                 }
                 Some(Ok(Message::Close(_))) => return Ok(None),
@@ -107,8 +189,26 @@ where
     }
 
     async fn write_bytes(&mut self, payload: &[u8]) -> anyhow::Result<()> {
+        if let Some(limiter) = &self.outbound_limiter {
+            let burst = limiter.burst().max(1) as usize;
+            let mut remaining = payload.len();
+            while remaining > 0 {
+                let step = remaining.min(burst);
+                let _ = limiter.acquire(step as u64).await;
+                remaining -= step;
+            }
+        }
         self.stream.send(Message::Binary(payload.to_vec())).await?;
         Ok(())
+    }
+
+    fn reconfigure_bandwidth(
+        &mut self,
+        inbound_limit: Option<(u64, u64)>,
+        outbound_limit: Option<(u64, u64)>,
+    ) {
+        self.inbound_limiter = inbound_limit.map(|(rate, burst)| TokenBucket::new(rate, burst));
+        self.outbound_limiter = outbound_limit.map(|(rate, burst)| TokenBucket::new(rate, burst));
     }
 }
 
@@ -237,6 +337,9 @@ where
                             }
                         };
                         protocol_level = prepared.protocol_level;
+                        let tenant_bandwidth = broker
+                            .bandwidth_limits_for_tenant(&prepared.connect_request.identity.tenant_id);
+                        stream.reconfigure_bandwidth(tenant_bandwidth.0, tenant_bandwidth.1);
                         will_publish = prepared.will_publish.clone();
                         receive_maximum = prepared.receive_maximum;
                         include_problem_information = prepared.include_problem_information;
@@ -1164,6 +1267,23 @@ where
             _ = tokio::time::sleep(Duration::from_millis(50)), if protocol_session_state.has_active_session() => {
                 if keep_alive_timed_out(last_activity, keep_alive) {
                     break 'session Err(anyhow::anyhow!("keep alive timeout"));
+                }
+                if let Some(identity) = protocol_session_state.current_identity_cloned() {
+                    if let Some(redirection) = broker.client_balancer.need_redirect(&identity) {
+                        let packet = build_disconnect_packet_with_server_reference(
+                            protocol_level,
+                            Some(if redirection.permanent { 0x9D } else { 0x9C }),
+                            include_problem_information.then_some(if redirection.permanent {
+                                "server moved"
+                            } else {
+                                "use another server"
+                            }),
+                            Some(&redirection.server_reference),
+                        );
+                        protocol_session_state.begin_disconnect(None);
+                        let _ = stream.write_bytes(&packet).await;
+                        break 'session Ok(());
+                    }
                 }
                 if push_paused_until.is_some_and(|until: Instant| Instant::now() < until) {
                     continue;

@@ -15,5 +15,8 @@ greenmqtt-plugin-api = { path = "../greenmqtt-plugin-api" }
 greenmqtt-proto = { path = "../greenmqtt-proto" }
 greenmqtt-retain = { path = "../greenmqtt-retain" }
 greenmqtt-sessiondict = { path = "../greenmqtt-sessiondict" }
+greenmqtt-storage = { path = "../greenmqtt-storage" }
+serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tonic.workspace = true

@@ -1,8 +1,8 @@
 use super::{
     desired_peer_membership, desired_peer_registry, now_millis, placement_candidates,
     placement_candidates_excluding, placement_node_for_session, shard_index_for_session,
-    AdminAuditEntry, BrokerConfig, BrokerRuntime, PeerForwarder, PeerRegistry,
-    ShardedLocalDeliveries, ShardedLocalSessions, ShardedWillGenerations,
+    AdminAuditEntry, BrokerConfig, BrokerRuntime, ClientBalancer, PeerForwarder, PeerRegistry,
+    RoundRobinBalancer, ShardedLocalDeliveries, ShardedLocalSessions, ShardedWillGenerations,
 };
 use crate::broker::pressure::PressureLevel;
 use async_trait::async_trait;
@@ -448,6 +448,31 @@ impl PeerRegistry for TestPeerRegistry {
             .insert(node_id, endpoint);
         Ok(())
     }
+}
+
+#[test]
+fn round_robin_balancer_redirects_to_peer_endpoints() {
+    let peers = Arc::new(TestPeerRegistry::default());
+    peers
+        .endpoints
+        .write()
+        .expect("peer registry poisoned")
+        .extend(BTreeMap::from([
+            (2, "http://127.0.0.1:50062".into()),
+            (3, "http://127.0.0.1:50063".into()),
+        ]));
+    let balancer = RoundRobinBalancer::new(1, peers, false);
+    let identity = ClientIdentity {
+        tenant_id: "demo".into(),
+        user_id: "alice".into(),
+        client_id: "sub".into(),
+    };
+
+    let first = balancer.need_redirect(&identity).unwrap();
+    let second = balancer.need_redirect(&identity).unwrap();
+    assert_eq!(first.server_reference, "http://127.0.0.1:50062");
+    assert_eq!(second.server_reference, "http://127.0.0.1:50063");
+    assert!(!first.permanent);
 }
 
 #[tokio::test]

@@ -16,14 +16,38 @@ use greenmqtt_plugin_api::{
 };
 use greenmqtt_retain::RetainHandle;
 use greenmqtt_sessiondict::SessionDictHandle;
+use metrics_exporter_prometheus::PrometheusBuilder;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static DURABLE_TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn install_metrics_recorder_once() {
+    static METRICS_READY: OnceLock<()> = OnceLock::new();
+    let _ = METRICS_READY.get_or_init(|| {
+        let _ = PrometheusBuilder::new().install_recorder();
+    });
+}
+
+fn backpressure_test_broker(
+) -> Arc<BrokerRuntime<ConfiguredAuth, ConfiguredAcl, ConfiguredEventHook>> {
+    let mut broker = test_broker();
+    if let Some(broker) = Arc::get_mut(&mut broker) {
+        broker.set_max_online_sessions(1_000_000);
+        broker.set_publish_rate_limit_per_connection(1_000_000, 1_000_000);
+        broker.set_publish_rate_limit_per_tenant(1_000_000, 1_000_000);
+        broker.set_connection_slowdown(1_000_000, Duration::from_millis(1));
+    }
+    broker
+}
+
+fn throughput_drop_within_one_percent(baseline: f64, instrumented: f64) -> bool {
+    instrumented >= baseline * 0.99
+}
 
 fn test_broker() -> Arc<BrokerRuntime<ConfiguredAuth, ConfiguredAcl, ConfiguredEventHook>> {
     Arc::new(BrokerRuntime::with_plugins(
@@ -910,6 +934,64 @@ fn bench_threshold_validation_passes_and_fails_as_expected() {
         }
     )
     .is_err());
+}
+
+#[tokio::test]
+#[ignore = "manual performance gate for metrics overhead"]
+async fn metrics_collection_overhead_stays_below_one_percent() {
+    let config = BenchConfig {
+        subscribers: 8,
+        publishers: 2,
+        messages_per_publisher: 100,
+        qos: 1,
+        scenario: BenchScenario::Live,
+    };
+    let baseline = run_bench(test_broker(), 1, config, "memory-baseline")
+        .await
+        .unwrap();
+
+    install_metrics_recorder_once();
+    let instrumented = run_bench(test_broker(), 1, config, "memory-metrics")
+        .await
+        .unwrap();
+
+    assert!(
+        throughput_drop_within_one_percent(
+            baseline.deliveries_per_sec,
+            instrumented.deliveries_per_sec,
+        ),
+        "metrics overhead too high: baseline {:.2} vs instrumented {:.2}",
+        baseline.deliveries_per_sec,
+        instrumented.deliveries_per_sec,
+    );
+}
+
+#[tokio::test]
+#[ignore = "manual performance gate for backpressure overhead"]
+async fn backpressure_overhead_stays_below_one_percent_under_normal_load() {
+    let config = BenchConfig {
+        subscribers: 8,
+        publishers: 2,
+        messages_per_publisher: 100,
+        qos: 1,
+        scenario: BenchScenario::Live,
+    };
+    let baseline = run_bench(test_broker(), 1, config, "memory-baseline")
+        .await
+        .unwrap();
+    let instrumented = run_bench(backpressure_test_broker(), 1, config, "memory-backpressure")
+        .await
+        .unwrap();
+
+    assert!(
+        throughput_drop_within_one_percent(
+            baseline.deliveries_per_sec,
+            instrumented.deliveries_per_sec,
+        ),
+        "backpressure overhead too high: baseline {:.2} vs instrumented {:.2}",
+        baseline.deliveries_per_sec,
+        instrumented.deliveries_per_sec,
+    );
 }
 
 #[test]

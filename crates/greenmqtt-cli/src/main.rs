@@ -13,7 +13,6 @@ use greenmqtt_plugin_api::{
     StaticEnhancedAuthProvider, TopicRewriteEventHook, TopicRewriteRule, WebHookConfig,
     WebHookEventHook, BRIDGE_CLIENT_ID_PREFIX,
 };
-use metrics_exporter_prometheus::PrometheusBuilder;
 use greenmqtt_retain::{PersistentRetainHandle, RetainHandle, RetainService};
 use greenmqtt_rpc::{
     DistGrpcClient, InboxGrpcClient, RetainGrpcClient, RpcRuntime, SessionDictGrpcClient,
@@ -26,6 +25,7 @@ use greenmqtt_storage::{
     RocksSessionStore, RocksSubscriptionStore, SledInboxStore, SledInflightStore, SledRetainStore,
     SledRouteStore, SledSessionStore, SledSubscriptionStore,
 };
+use metrics_exporter_prometheus::PrometheusBuilder;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::net::SocketAddr;
@@ -348,6 +348,7 @@ async fn main() -> anyhow::Result<()> {
             inbox: broker.inbox.clone(),
             retain: broker.retain.clone(),
             peer_sink: broker.clone(),
+            assignment_registry: None,
         };
         let http_task = async move { http.start().await };
         let rpc_task = async move { rpc.serve(rpc_bind).await };

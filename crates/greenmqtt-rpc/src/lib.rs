@@ -3,7 +3,7 @@ use greenmqtt_broker::{DeliverySink, PeerForwarder, PeerRegistry};
 use greenmqtt_core::{
     ClientIdentity, ClusterMembershipRegistry, ClusterNodeMembership, Delivery, InflightMessage,
     NodeId, OfflineMessage, RetainedMessage, RouteRecord, ServiceEndpoint, ServiceEndpointRegistry,
-    ServiceShardAssignment, ServiceShardKey, ServiceShardKind, ServiceShardLifecycle,
+    ServiceKind, ServiceShardAssignment, ServiceShardKey, ServiceShardKind, ServiceShardLifecycle,
     ServiceShardRecoveryControl, ServiceShardTransition, ServiceShardTransitionKind, Subscription,
 };
 use greenmqtt_dist::{dist_tenant_shard, DistRouter};
@@ -31,7 +31,7 @@ use greenmqtt_proto::internal::{
     PushDeliveriesRequest, PushDeliveryReply, PushDeliveryRequest, RegisterSessionReply,
     RegisterSessionRequest, RemoveRouteRequest, RemoveSessionRoutesReply,
     RemoveSessionRoutesRequest, RetainMatchReply, RetainMatchRequest, RetainWriteRequest,
-    UnregisterSessionRequest,
+    ShardSnapshotChunk, ShardSnapshotRequest, UnregisterSessionRequest,
 };
 use greenmqtt_proto::{
     from_proto_client_identity, from_proto_delivery, from_proto_inflight, from_proto_offline,
@@ -41,13 +41,17 @@ use greenmqtt_proto::{
 };
 use greenmqtt_retain::{retain_tenant_shard, RetainService as RetainStoreService};
 use greenmqtt_sessiondict::{session_identity_shard, SessionDirectory};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex;
 use tonic::transport::{Channel, Server};
 use tonic::{Request, Response, Status};
+
+const SNAPSHOT_CHUNK_BYTES: usize = 64 * 1024;
 
 #[derive(Clone)]
 pub struct RpcRuntime {
@@ -56,6 +60,7 @@ pub struct RpcRuntime {
     pub inbox: Arc<dyn InboxService>,
     pub retain: Arc<dyn RetainStoreService>,
     pub peer_sink: Arc<dyn DeliverySink>,
+    pub assignment_registry: Option<Arc<dyn ServiceEndpointRegistry>>,
 }
 
 #[derive(Clone)]
@@ -78,6 +83,23 @@ pub struct RetainGrpcClient {
     inner: Arc<Mutex<RetainServiceClient<Channel>>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SessionDictShardSnapshot {
+    pub sessions: Vec<greenmqtt_core::SessionRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct DistShardSnapshot {
+    pub routes: Vec<RouteRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct InboxShardSnapshot {
+    pub subscriptions: Vec<Subscription>,
+    pub offline_messages: Vec<OfflineMessage>,
+    pub inflight_messages: Vec<InflightMessage>,
+}
+
 #[derive(Clone, Default)]
 pub struct StaticPeerForwarder {
     peers: Arc<RwLock<HashMap<NodeId, StaticPeerClient>>>,
@@ -86,10 +108,18 @@ pub struct StaticPeerForwarder {
 }
 
 #[derive(Clone, Default)]
-pub struct StaticServiceEndpointRegistry {
+pub struct DynamicServiceEndpointRegistry {
     assignments: Arc<RwLock<BTreeMap<ServiceShardKey, ServiceShardAssignment>>>,
     members: Arc<RwLock<BTreeMap<NodeId, ClusterNodeMembership>>>,
 }
+
+#[derive(Clone)]
+pub struct PeriodicAntiEntropyReconciler {
+    registry: Arc<DynamicServiceEndpointRegistry>,
+    interval: std::time::Duration,
+}
+
+pub type StaticServiceEndpointRegistry = DynamicServiceEndpointRegistry;
 
 #[derive(Clone)]
 struct StaticPeerClient {
@@ -103,16 +133,19 @@ pub struct NoopDeliverySink;
 #[derive(Clone)]
 struct SessionDictRpc {
     inner: Arc<dyn SessionDirectory>,
+    assignment_registry: Option<Arc<dyn ServiceEndpointRegistry>>,
 }
 
 #[derive(Clone)]
 struct DistRpc {
     inner: Arc<dyn DistRouter>,
+    assignment_registry: Option<Arc<dyn ServiceEndpointRegistry>>,
 }
 
 #[derive(Clone)]
 struct InboxRpc {
     inner: Arc<dyn InboxService>,
+    assignment_registry: Option<Arc<dyn ServiceEndpointRegistry>>,
 }
 
 #[derive(Clone)]
@@ -123,6 +156,185 @@ struct RetainRpc {
 #[derive(Clone)]
 struct BrokerPeerRpc {
     inner: Arc<dyn DeliverySink>,
+}
+
+impl SessionDictShardSnapshot {
+    pub fn encode(&self) -> anyhow::Result<Vec<u8>> {
+        Ok(serde_json::to_vec(self)?)
+    }
+
+    pub fn decode(bytes: &[u8]) -> anyhow::Result<Self> {
+        Ok(serde_json::from_slice(bytes)?)
+    }
+
+    pub fn checksum(&self) -> anyhow::Result<u64> {
+        snapshot_checksum(self)
+    }
+}
+
+impl DistShardSnapshot {
+    pub fn encode(&self) -> anyhow::Result<Vec<u8>> {
+        Ok(serde_json::to_vec(self)?)
+    }
+
+    pub fn decode(bytes: &[u8]) -> anyhow::Result<Self> {
+        Ok(serde_json::from_slice(bytes)?)
+    }
+
+    pub fn checksum(&self) -> anyhow::Result<u64> {
+        snapshot_checksum(self)
+    }
+}
+
+impl InboxShardSnapshot {
+    pub fn encode(&self) -> anyhow::Result<Vec<u8>> {
+        Ok(serde_json::to_vec(self)?)
+    }
+
+    pub fn decode(bytes: &[u8]) -> anyhow::Result<Self> {
+        Ok(serde_json::from_slice(bytes)?)
+    }
+
+    pub fn checksum(&self) -> anyhow::Result<u64> {
+        snapshot_checksum(self)
+    }
+}
+
+fn snapshot_checksum<T: Serialize>(value: &T) -> anyhow::Result<u64> {
+    let bytes = serde_json::to_vec(value)?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Ok(hasher.finish())
+}
+
+fn sessiondict_scope(identity: &ClientIdentity) -> String {
+    format!("identity:{}:{}", identity.user_id, identity.client_id)
+}
+
+fn shard_matches_session_scope(shard: &ServiceShardKey, session_id: &str) -> bool {
+    shard.scope == "*" || shard.scope == session_id
+}
+
+fn shard_matches_sessiondict_record(
+    shard: &ServiceShardKey,
+    record: &greenmqtt_core::SessionRecord,
+) -> bool {
+    shard.tenant_id == record.identity.tenant_id
+        && (shard.scope == "*"
+            || shard.scope == record.session_id
+            || shard.scope == sessiondict_scope(&record.identity))
+}
+
+fn shard_matches_inbox_session(shard: &ServiceShardKey, tenant_id: &str, session_id: &str) -> bool {
+    shard.tenant_id == tenant_id && shard_matches_session_scope(shard, session_id)
+}
+
+fn shard_snapshot_request_for_assignment(
+    assignment: &ServiceShardAssignment,
+) -> ShardSnapshotRequest {
+    ShardSnapshotRequest {
+        tenant_id: assignment.shard.tenant_id.clone(),
+        scope: assignment.shard.scope.clone(),
+        owner_node_id: assignment.owner_node_id(),
+        epoch: assignment.epoch,
+        fencing_token: assignment.fencing_token,
+    }
+}
+
+fn sessiondict_shard_from_request(request: ShardSnapshotRequest) -> ServiceShardKey {
+    ServiceShardKey {
+        kind: ServiceShardKind::SessionDict,
+        tenant_id: request.tenant_id,
+        scope: if request.scope.is_empty() {
+            "*".into()
+        } else {
+            request.scope
+        },
+    }
+}
+
+fn inbox_shard_from_request(request: ShardSnapshotRequest) -> ServiceShardKey {
+    ServiceShardKey {
+        kind: ServiceShardKind::Inbox,
+        tenant_id: request.tenant_id,
+        scope: if request.scope.is_empty() {
+            "*".into()
+        } else {
+            request.scope
+        },
+    }
+}
+
+fn assignment_from_snapshot_request(
+    kind: ServiceShardKind,
+    request: &ShardSnapshotRequest,
+    service_kind: ServiceKind,
+) -> Option<ServiceShardAssignment> {
+    if request.owner_node_id == 0 && request.epoch == 0 && request.fencing_token == 0 {
+        return None;
+    }
+    Some(ServiceShardAssignment::new(
+        ServiceShardKey {
+            kind,
+            tenant_id: request.tenant_id.clone(),
+            scope: if request.scope.is_empty() {
+                "*".into()
+            } else {
+                request.scope.clone()
+            },
+        },
+        ServiceEndpoint::new(service_kind, request.owner_node_id, String::new()),
+        request.epoch,
+        request.fencing_token,
+        ServiceShardLifecycle::Serving,
+    ))
+}
+
+fn snapshot_chunks(bytes: Vec<u8>, checksum: u64) -> Vec<ShardSnapshotChunk> {
+    if bytes.is_empty() {
+        return vec![ShardSnapshotChunk {
+            data: Vec::new(),
+            sequence: 0,
+            checksum,
+            done: true,
+        }];
+    }
+    let last_index = bytes.chunks(SNAPSHOT_CHUNK_BYTES).count().saturating_sub(1);
+    bytes
+        .chunks(SNAPSHOT_CHUNK_BYTES)
+        .enumerate()
+        .map(|(index, chunk)| ShardSnapshotChunk {
+            data: chunk.to_vec(),
+            sequence: index as u32,
+            checksum,
+            done: index == last_index,
+        })
+        .collect()
+}
+
+fn same_route_identity(left: &RouteRecord, right: &RouteRecord) -> bool {
+    left.tenant_id == right.tenant_id
+        && left.topic_filter == right.topic_filter
+        && left.session_id == right.session_id
+        && left.shared_group == right.shared_group
+}
+
+async fn validate_snapshot_assignment(
+    registry: &Option<Arc<dyn ServiceEndpointRegistry>>,
+    expected: Option<ServiceShardAssignment>,
+) -> Result<(), Status> {
+    let (Some(registry), Some(expected)) = (registry.as_ref(), expected) else {
+        return Ok(());
+    };
+    let current = registry
+        .resolve_assignment(&expected.shard)
+        .await
+        .map_err(internal_status)?
+        .ok_or_else(|| Status::failed_precondition("missing shard assignment"))?;
+    if !current.matches_owner_epoch_fence(&expected) {
+        return Err(Status::failed_precondition("stale shard assignment"));
+    }
+    Ok(())
 }
 
 impl SessionDictGrpcClient {
@@ -144,6 +356,119 @@ impl SessionDictGrpcClient {
         })?;
         Self::connect(assignment.endpoint.endpoint).await
     }
+
+    pub async fn export_shard_snapshot(
+        &self,
+        shard: &ServiceShardKey,
+    ) -> anyhow::Result<SessionDictShardSnapshot> {
+        anyhow::ensure!(
+            shard.kind == ServiceShardKind::SessionDict,
+            "sessiondict snapshot requires SessionDict shard"
+        );
+        let sessions = self
+            .list_sessions(Some(&shard.tenant_id))
+            .await?
+            .into_iter()
+            .filter(|record| shard_matches_sessiondict_record(shard, record))
+            .collect();
+        Ok(SessionDictShardSnapshot { sessions })
+    }
+
+    pub async fn stream_shard_snapshot(
+        &self,
+        assignment: &ServiceShardAssignment,
+    ) -> anyhow::Result<SessionDictShardSnapshot> {
+        let mut client = self.inner.lock().await;
+        let mut stream = client
+            .stream_shard_snapshot(shard_snapshot_request_for_assignment(assignment))
+            .await?
+            .into_inner();
+        let mut bytes = Vec::new();
+        let mut expected_checksum = None;
+        while let Some(chunk) = stream.message().await? {
+            if let Some(checksum) = expected_checksum {
+                anyhow::ensure!(
+                    checksum == chunk.checksum,
+                    "sessiondict stream checksum drift"
+                );
+            } else {
+                expected_checksum = Some(chunk.checksum);
+            }
+            bytes.extend_from_slice(&chunk.data);
+            if chunk.done {
+                break;
+            }
+        }
+        let snapshot = SessionDictShardSnapshot::decode(&bytes)?;
+        if let Some(checksum) = expected_checksum {
+            anyhow::ensure!(
+                snapshot.checksum()? == checksum,
+                "sessiondict stream checksum mismatch"
+            );
+        }
+        Ok(snapshot)
+    }
+
+    pub async fn import_shard_snapshot(
+        &self,
+        snapshot: &SessionDictShardSnapshot,
+    ) -> anyhow::Result<usize> {
+        for session in &snapshot.sessions {
+            self.register(session.clone()).await?;
+        }
+        Ok(snapshot.sessions.len())
+    }
+
+    pub async fn move_shard_via_registry(
+        registry: &DynamicServiceEndpointRegistry,
+        shard: ServiceShardKey,
+        target_node_id: NodeId,
+    ) -> anyhow::Result<ServiceShardAssignment> {
+        let source_assignment = registry.resolve_assignment(&shard).await?.ok_or_else(|| {
+            anyhow::anyhow!("no sessiondict assignment registered for shard {shard:?}")
+        })?;
+        let source =
+            SessionDictGrpcClient::connect(source_assignment.endpoint.endpoint.clone()).await?;
+        let snapshot = source.stream_shard_snapshot(&source_assignment).await?;
+
+        let assignment = registry
+            .move_shard_to_member(shard.clone(), target_node_id)
+            .await?;
+        let target = SessionDictGrpcClient::connect(assignment.endpoint.endpoint.clone()).await?;
+        target.import_shard_snapshot(&snapshot).await?;
+
+        for session in snapshot.sessions {
+            source.unregister(&session.session_id).await?;
+        }
+
+        Ok(assignment)
+    }
+
+    pub async fn catch_up_shard_via_registry(
+        registry: &DynamicServiceEndpointRegistry,
+        shard: ServiceShardKey,
+        target_node_id: NodeId,
+    ) -> anyhow::Result<ServiceShardAssignment> {
+        let source_assignment = registry.resolve_assignment(&shard).await?.ok_or_else(|| {
+            anyhow::anyhow!("no sessiondict assignment registered for shard {shard:?}")
+        })?;
+        let source =
+            SessionDictGrpcClient::connect(source_assignment.endpoint.endpoint.clone()).await?;
+        let snapshot = source.stream_shard_snapshot(&source_assignment).await?;
+        let expected_checksum = snapshot.checksum()?;
+
+        let assignment = registry
+            .catch_up_shard_on_member(shard.clone(), target_node_id)
+            .await?;
+        let target = SessionDictGrpcClient::connect(assignment.endpoint.endpoint.clone()).await?;
+        target.import_shard_snapshot(&snapshot).await?;
+        let restored = target.export_shard_snapshot(&shard).await?;
+        anyhow::ensure!(
+            restored.checksum()? == expected_checksum,
+            "sessiondict shard catch-up checksum mismatch"
+        );
+        Ok(assignment)
+    }
 }
 
 impl StaticPeerForwarder {
@@ -156,7 +481,49 @@ impl StaticPeerForwarder {
     }
 }
 
-impl StaticServiceEndpointRegistry {
+impl DynamicServiceEndpointRegistry {
+    async fn validate_current_assignment(
+        &self,
+        expected: &ServiceShardAssignment,
+    ) -> anyhow::Result<ServiceShardAssignment> {
+        let current = self
+            .resolve_assignment(&expected.shard)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("no assignment registered for shard {:?}", expected.shard)
+            })?;
+        anyhow::ensure!(
+            current.matches_owner_epoch_fence(expected),
+            "stale shard assignment for {:?}: expected owner={} epoch={} fence={}, current owner={} epoch={} fence={}",
+            expected.shard,
+            expected.owner_node_id(),
+            expected.epoch,
+            expected.fencing_token,
+            current.owner_node_id(),
+            current.epoch,
+            current.fencing_token,
+        );
+        Ok(current)
+    }
+
+    pub async fn sync_members(&self, members: Vec<ClusterNodeMembership>) -> anyhow::Result<usize> {
+        let mut guard = self.members.write().expect("service registry poisoned");
+        let mut next = BTreeMap::new();
+        let mut changed = 0usize;
+        for member in members {
+            if guard.get(&member.node_id) != Some(&member) {
+                changed += 1;
+            }
+            next.insert(member.node_id, member);
+        }
+        changed += guard
+            .keys()
+            .filter(|node_id| !next.contains_key(node_id))
+            .count();
+        *guard = next;
+        Ok(changed)
+    }
+
     pub async fn transition_shard_to_member(
         &self,
         kind: ServiceShardTransitionKind,
@@ -204,19 +571,52 @@ impl StaticServiceEndpointRegistry {
         Ok(assignment)
     }
 
+    fn select_replacement_member(
+        &self,
+        service_kind: ServiceKind,
+        excluded_node_id: NodeId,
+    ) -> Option<NodeId> {
+        let members = self.members.read().expect("service registry poisoned");
+        members
+            .values()
+            .filter(|member| {
+                member.node_id != excluded_node_id
+                    && matches!(
+                        member.lifecycle,
+                        greenmqtt_core::ClusterNodeLifecycle::Serving
+                    )
+                    && member
+                        .endpoints
+                        .iter()
+                        .any(|endpoint| endpoint.kind == service_kind)
+            })
+            .map(|member| member.node_id)
+            .min()
+    }
+
     pub async fn move_shard_to_member(
         &self,
         shard: ServiceShardKey,
         target_node_id: NodeId,
     ) -> anyhow::Result<ServiceShardAssignment> {
-        let source_node_id = self
+        let current = self
             .resolve_assignment(&shard)
             .await?
-            .map(|assignment| assignment.owner_node_id());
+            .ok_or_else(|| anyhow::anyhow!("no assignment registered for shard {:?}", shard))?;
+        self.move_shard_to_member_with_fencing(&current, target_node_id)
+            .await
+    }
+
+    pub async fn move_shard_to_member_with_fencing(
+        &self,
+        expected_source: &ServiceShardAssignment,
+        target_node_id: NodeId,
+    ) -> anyhow::Result<ServiceShardAssignment> {
+        self.validate_current_assignment(expected_source).await?;
         self.transition_shard_to_member(
             ServiceShardTransitionKind::Migration,
-            shard,
-            source_node_id,
+            expected_source.shard.clone(),
+            Some(expected_source.owner_node_id()),
             target_node_id,
             ServiceShardLifecycle::Draining,
         )
@@ -262,14 +662,24 @@ impl StaticServiceEndpointRegistry {
         shard: ServiceShardKey,
         target_node_id: NodeId,
     ) -> anyhow::Result<ServiceShardAssignment> {
-        let source_node_id = self
+        let current = self
             .resolve_assignment(&shard)
             .await?
-            .map(|assignment| assignment.owner_node_id());
+            .ok_or_else(|| anyhow::anyhow!("no assignment registered for shard {:?}", shard))?;
+        self.catch_up_shard_on_member_with_fencing(&current, target_node_id)
+            .await
+    }
+
+    pub async fn catch_up_shard_on_member_with_fencing(
+        &self,
+        expected_source: &ServiceShardAssignment,
+        target_node_id: NodeId,
+    ) -> anyhow::Result<ServiceShardAssignment> {
+        self.validate_current_assignment(expected_source).await?;
         self.transition_shard_to_member(
             ServiceShardTransitionKind::CatchUp,
-            shard,
-            source_node_id,
+            expected_source.shard.clone(),
+            Some(expected_source.owner_node_id()),
             target_node_id,
             ServiceShardLifecycle::Recovering,
         )
@@ -281,23 +691,102 @@ impl StaticServiceEndpointRegistry {
         shard: ServiceShardKey,
         target_node_id: NodeId,
     ) -> anyhow::Result<ServiceShardAssignment> {
-        let source_node_id = self
+        let current = self
             .resolve_assignment(&shard)
             .await?
-            .map(|assignment| assignment.owner_node_id());
+            .ok_or_else(|| anyhow::anyhow!("no assignment registered for shard {:?}", shard))?;
+        self.repair_shard_on_member_with_fencing(&current, target_node_id)
+            .await
+    }
+
+    pub async fn repair_shard_on_member_with_fencing(
+        &self,
+        expected_source: &ServiceShardAssignment,
+        target_node_id: NodeId,
+    ) -> anyhow::Result<ServiceShardAssignment> {
+        self.validate_current_assignment(expected_source).await?;
         self.transition_shard_to_member(
             ServiceShardTransitionKind::AntiEntropy,
-            shard,
-            source_node_id,
+            expected_source.shard.clone(),
+            Some(expected_source.owner_node_id()),
             target_node_id,
             ServiceShardLifecycle::Serving,
         )
         .await
     }
+
+    pub async fn drain_shard(
+        &self,
+        shard: ServiceShardKey,
+    ) -> anyhow::Result<Option<ServiceShardAssignment>> {
+        let Some(current) = self.resolve_assignment(&shard).await? else {
+            return Ok(None);
+        };
+        self.drain_shard_with_fencing(&current).await
+    }
+
+    pub async fn drain_shard_with_fencing(
+        &self,
+        expected_source: &ServiceShardAssignment,
+    ) -> anyhow::Result<Option<ServiceShardAssignment>> {
+        let current = self.validate_current_assignment(expected_source).await?;
+        let drained = ServiceShardAssignment::new(
+            current.shard.clone(),
+            current.endpoint.clone(),
+            current.epoch + 1,
+            current.fencing_token + 1,
+            ServiceShardLifecycle::Draining,
+        );
+        self.apply_transition(ServiceShardTransition::new(
+            ServiceShardTransitionKind::Migration,
+            current.shard.clone(),
+            Some(current.owner_node_id()),
+            drained.clone(),
+        ))
+        .await?;
+        Ok(Some(drained))
+    }
+
+    pub async fn handle_member_lifecycle_transition(
+        &self,
+        node_id: NodeId,
+        lifecycle: greenmqtt_core::ClusterNodeLifecycle,
+    ) -> anyhow::Result<Vec<ServiceShardAssignment>> {
+        let _ = self
+            .set_member_lifecycle(node_id, lifecycle.clone())
+            .await?;
+        let owned: Vec<_> = self
+            .list_assignments(None)
+            .await?
+            .into_iter()
+            .filter(|assignment| assignment.owner_node_id() == node_id)
+            .collect();
+        let mut transitioned = Vec::new();
+        for assignment in owned {
+            let Some(target_node_id) =
+                self.select_replacement_member(assignment.shard.service_kind(), node_id)
+            else {
+                continue;
+            };
+            let next = match lifecycle {
+                greenmqtt_core::ClusterNodeLifecycle::Leaving => {
+                    self.move_shard_to_member_with_fencing(&assignment, target_node_id)
+                        .await?
+                }
+                greenmqtt_core::ClusterNodeLifecycle::Offline => {
+                    self.failover_shard_to_member(assignment.shard.clone(), target_node_id)
+                        .await?
+                }
+                _ => continue,
+            };
+            transitioned.push(next);
+        }
+        Ok(transitioned)
+    }
 }
 
 #[async_trait]
-impl ServiceEndpointRegistry for StaticServiceEndpointRegistry {
+impl ServiceEndpointRegistry for DynamicServiceEndpointRegistry {
     async fn upsert_assignment(
         &self,
         assignment: ServiceShardAssignment,
@@ -354,7 +843,7 @@ impl ServiceEndpointRegistry for StaticServiceEndpointRegistry {
 }
 
 #[async_trait]
-impl ClusterMembershipRegistry for StaticServiceEndpointRegistry {
+impl ClusterMembershipRegistry for DynamicServiceEndpointRegistry {
     async fn upsert_member(
         &self,
         member: ClusterNodeMembership,
@@ -403,7 +892,7 @@ impl ClusterMembershipRegistry for StaticServiceEndpointRegistry {
 }
 
 #[async_trait]
-impl ServiceShardRecoveryControl for StaticServiceEndpointRegistry {
+impl ServiceShardRecoveryControl for DynamicServiceEndpointRegistry {
     async fn apply_transition(
         &self,
         transition: ServiceShardTransition,
@@ -441,6 +930,255 @@ impl DistGrpcClient {
             .ok_or_else(|| anyhow::anyhow!("no dist endpoint registered for shard {shard:?}"))?;
         Self::connect(assignment.endpoint.endpoint).await
     }
+
+    pub async fn export_shard_snapshot(
+        &self,
+        tenant_id: &str,
+    ) -> anyhow::Result<DistShardSnapshot> {
+        Ok(DistShardSnapshot {
+            routes: self.list_routes(Some(tenant_id)).await?,
+        })
+    }
+
+    pub async fn stream_shard_snapshot(
+        &self,
+        assignment: &ServiceShardAssignment,
+    ) -> anyhow::Result<DistShardSnapshot> {
+        let mut client = self.inner.lock().await;
+        let mut stream = client
+            .stream_shard_snapshot(shard_snapshot_request_for_assignment(assignment))
+            .await?
+            .into_inner();
+        let mut bytes = Vec::new();
+        let mut expected_checksum = None;
+        while let Some(chunk) = stream.message().await? {
+            if let Some(checksum) = expected_checksum {
+                anyhow::ensure!(checksum == chunk.checksum, "dist stream checksum drift");
+            } else {
+                expected_checksum = Some(chunk.checksum);
+            }
+            bytes.extend_from_slice(&chunk.data);
+            if chunk.done {
+                break;
+            }
+        }
+        let snapshot = DistShardSnapshot::decode(&bytes)?;
+        if let Some(checksum) = expected_checksum {
+            anyhow::ensure!(
+                snapshot.checksum()? == checksum,
+                "dist stream checksum mismatch"
+            );
+        }
+        Ok(snapshot)
+    }
+
+    pub async fn import_shard_snapshot(
+        &self,
+        snapshot: &DistShardSnapshot,
+    ) -> anyhow::Result<usize> {
+        for route in &snapshot.routes {
+            self.add_route(route.clone()).await?;
+        }
+        Ok(snapshot.routes.len())
+    }
+
+    pub async fn move_tenant_shard_via_registry(
+        registry: &DynamicServiceEndpointRegistry,
+        tenant_id: &str,
+        target_node_id: NodeId,
+    ) -> anyhow::Result<ServiceShardAssignment> {
+        let shard = dist_tenant_shard(tenant_id);
+        let source_assignment = registry
+            .resolve_assignment(&shard)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no dist assignment registered for shard {shard:?}"))?;
+        let source = DistGrpcClient::connect(source_assignment.endpoint.endpoint.clone()).await?;
+        let snapshot = source.stream_shard_snapshot(&source_assignment).await?;
+
+        let assignment = registry
+            .move_shard_to_member(shard.clone(), target_node_id)
+            .await?;
+        let target = DistGrpcClient::connect(assignment.endpoint.endpoint.clone()).await?;
+
+        for route in snapshot.routes {
+            let mut migrated = route.clone();
+            migrated.node_id = target_node_id;
+            target.add_route(migrated.clone()).await?;
+            source.remove_route(&route).await?;
+        }
+
+        Ok(assignment)
+    }
+
+    pub async fn catch_up_tenant_shard_via_registry(
+        registry: &DynamicServiceEndpointRegistry,
+        tenant_id: &str,
+        target_node_id: NodeId,
+    ) -> anyhow::Result<ServiceShardAssignment> {
+        let shard = dist_tenant_shard(tenant_id);
+        let source_assignment = registry
+            .resolve_assignment(&shard)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no dist assignment registered for shard {shard:?}"))?;
+        let source = DistGrpcClient::connect(source_assignment.endpoint.endpoint.clone()).await?;
+        let snapshot = source.stream_shard_snapshot(&source_assignment).await?;
+        let expected_checksum = snapshot.checksum()?;
+
+        let assignment = registry
+            .catch_up_shard_on_member(shard.clone(), target_node_id)
+            .await?;
+        let target = DistGrpcClient::connect(assignment.endpoint.endpoint.clone()).await?;
+        target.import_shard_snapshot(&snapshot).await?;
+        let restored = target.export_shard_snapshot(tenant_id).await?;
+        anyhow::ensure!(
+            restored.checksum()? == expected_checksum,
+            "dist shard catch-up checksum mismatch"
+        );
+        Ok(assignment)
+    }
+
+    pub async fn anti_entropy_repair_tenant_shard_via_registry(
+        registry: &DynamicServiceEndpointRegistry,
+        tenant_id: &str,
+        target_node_id: NodeId,
+    ) -> anyhow::Result<ServiceShardAssignment> {
+        let shard = dist_tenant_shard(tenant_id);
+        let source_assignment = registry
+            .resolve_assignment(&shard)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no dist assignment registered for shard {shard:?}"))?;
+        let source = DistGrpcClient::connect(source_assignment.endpoint.endpoint.clone()).await?;
+        let source_snapshot = source.stream_shard_snapshot(&source_assignment).await?;
+
+        let assignment = registry
+            .repair_shard_on_member(shard.clone(), target_node_id)
+            .await?;
+        let target = DistGrpcClient::connect(assignment.endpoint.endpoint.clone()).await?;
+        let target_snapshot = target.stream_shard_snapshot(&assignment).await?;
+        if source_snapshot.checksum()? != target_snapshot.checksum()? {
+            for route in &target_snapshot.routes {
+                if !source_snapshot
+                    .routes
+                    .iter()
+                    .any(|candidate| same_route_identity(candidate, route))
+                {
+                    target.remove_route(route).await?;
+                }
+            }
+            for route in &source_snapshot.routes {
+                if !target_snapshot
+                    .routes
+                    .iter()
+                    .any(|candidate| same_route_identity(candidate, route))
+                {
+                    target.add_route(route.clone()).await?;
+                }
+            }
+            let repaired = target.stream_shard_snapshot(&assignment).await?;
+            anyhow::ensure!(
+                repaired.checksum()? == source_snapshot.checksum()?,
+                "dist shard anti-entropy checksum mismatch"
+            );
+        }
+        Ok(assignment)
+    }
+
+    pub async fn anti_entropy_sync_tenant_replica_via_registry(
+        registry: &DynamicServiceEndpointRegistry,
+        tenant_id: &str,
+        replica_node_id: NodeId,
+    ) -> anyhow::Result<u64> {
+        let shard = dist_tenant_shard(tenant_id);
+        let source_assignment = registry
+            .resolve_assignment(&shard)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no dist assignment registered for shard {shard:?}"))?;
+        let source = DistGrpcClient::connect(source_assignment.endpoint.endpoint.clone()).await?;
+        let source_snapshot = source.stream_shard_snapshot(&source_assignment).await?;
+        let member = registry
+            .resolve_member(replica_node_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("replica member {replica_node_id} not found"))?;
+        let replica_endpoint = member
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.kind == ServiceKind::Dist)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!("replica member {replica_node_id} has no dist endpoint")
+            })?;
+        let replica = DistGrpcClient::connect(replica_endpoint.endpoint).await?;
+        let replica_snapshot = replica.export_shard_snapshot(tenant_id).await?;
+        if source_snapshot.checksum()? != replica_snapshot.checksum()? {
+            for route in &replica_snapshot.routes {
+                if !source_snapshot
+                    .routes
+                    .iter()
+                    .any(|candidate| same_route_identity(candidate, route))
+                {
+                    replica.remove_route(route).await?;
+                }
+            }
+            for route in &source_snapshot.routes {
+                if !replica_snapshot
+                    .routes
+                    .iter()
+                    .any(|candidate| same_route_identity(candidate, route))
+                {
+                    replica.add_route(route.clone()).await?;
+                }
+            }
+            let repaired = replica.export_shard_snapshot(tenant_id).await?;
+            anyhow::ensure!(
+                repaired.checksum()? == source_snapshot.checksum()?,
+                "dist shard replica anti-entropy checksum mismatch"
+            );
+        }
+        source_snapshot.checksum()
+    }
+}
+
+impl PeriodicAntiEntropyReconciler {
+    pub fn new(
+        registry: Arc<DynamicServiceEndpointRegistry>,
+        interval: std::time::Duration,
+    ) -> Self {
+        Self { registry, interval }
+    }
+
+    pub async fn reconcile_dist_tenant_replica(
+        &self,
+        tenant_id: &str,
+        replica_node_id: NodeId,
+    ) -> anyhow::Result<u64> {
+        DistGrpcClient::anti_entropy_sync_tenant_replica_via_registry(
+            &self.registry,
+            tenant_id,
+            replica_node_id,
+        )
+        .await
+    }
+
+    pub async fn run_dist_tenant_replica_until_cancelled(
+        &self,
+        tenant_id: String,
+        replica_node_id: NodeId,
+        mut cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        loop {
+            tokio::select! {
+                _ = cancel.changed() => {
+                    if *cancel.borrow() {
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep(self.interval) => {
+                    self.reconcile_dist_tenant_replica(&tenant_id, replica_node_id).await?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl InboxGrpcClient {
@@ -463,6 +1201,196 @@ impl InboxGrpcClient {
             .await?
             .ok_or_else(|| anyhow::anyhow!("no inbox endpoint registered for shard {shard:?}"))?;
         Self::connect(assignment.endpoint.endpoint).await
+    }
+
+    pub async fn export_shard_snapshot(
+        &self,
+        shard: &ServiceShardKey,
+    ) -> anyhow::Result<InboxShardSnapshot> {
+        anyhow::ensure!(
+            matches!(
+                shard.kind,
+                ServiceShardKind::Inbox | ServiceShardKind::Inflight
+            ),
+            "inbox snapshot requires Inbox or Inflight shard"
+        );
+        let subscriptions = if shard.kind == ServiceShardKind::Inflight {
+            Vec::new()
+        } else {
+            self.list_all_subscriptions()
+                .await?
+                .into_iter()
+                .filter(|subscription| {
+                    shard_matches_inbox_session(
+                        shard,
+                        &subscription.tenant_id,
+                        &subscription.session_id,
+                    )
+                })
+                .collect()
+        };
+        let offline_messages = if shard.kind == ServiceShardKind::Inflight {
+            Vec::new()
+        } else {
+            self.list_all_offline()
+                .await?
+                .into_iter()
+                .filter(|message| {
+                    shard_matches_inbox_session(shard, &message.tenant_id, &message.session_id)
+                })
+                .collect()
+        };
+        let inflight_messages = self
+            .list_all_inflight()
+            .await?
+            .into_iter()
+            .filter(|message| {
+                shard_matches_inbox_session(shard, &message.tenant_id, &message.session_id)
+            })
+            .collect();
+        Ok(InboxShardSnapshot {
+            subscriptions,
+            offline_messages,
+            inflight_messages,
+        })
+    }
+
+    pub async fn stream_shard_snapshot(
+        &self,
+        assignment: &ServiceShardAssignment,
+    ) -> anyhow::Result<InboxShardSnapshot> {
+        let mut client = self.inner.lock().await;
+        let mut stream = client
+            .stream_shard_snapshot(shard_snapshot_request_for_assignment(assignment))
+            .await?
+            .into_inner();
+        let mut bytes = Vec::new();
+        let mut expected_checksum = None;
+        while let Some(chunk) = stream.message().await? {
+            if let Some(checksum) = expected_checksum {
+                anyhow::ensure!(checksum == chunk.checksum, "inbox stream checksum drift");
+            } else {
+                expected_checksum = Some(chunk.checksum);
+            }
+            bytes.extend_from_slice(&chunk.data);
+            if chunk.done {
+                break;
+            }
+        }
+        let snapshot = InboxShardSnapshot::decode(&bytes)?;
+        if let Some(checksum) = expected_checksum {
+            anyhow::ensure!(
+                snapshot.checksum()? == checksum,
+                "inbox stream checksum mismatch"
+            );
+        }
+        Ok(snapshot)
+    }
+
+    pub async fn import_shard_snapshot(
+        &self,
+        snapshot: &InboxShardSnapshot,
+    ) -> anyhow::Result<usize> {
+        for subscription in &snapshot.subscriptions {
+            self.subscribe(subscription.clone()).await?;
+        }
+        for message in &snapshot.offline_messages {
+            self.enqueue(message.clone()).await?;
+        }
+        for message in &snapshot.inflight_messages {
+            self.stage_inflight(message.clone()).await?;
+        }
+        Ok(snapshot.subscriptions.len()
+            + snapshot.offline_messages.len()
+            + snapshot.inflight_messages.len())
+    }
+
+    pub async fn move_shard_via_registry(
+        registry: &DynamicServiceEndpointRegistry,
+        shard: ServiceShardKey,
+        target_node_id: NodeId,
+    ) -> anyhow::Result<ServiceShardAssignment> {
+        anyhow::ensure!(
+            matches!(
+                shard.kind,
+                ServiceShardKind::Inbox | ServiceShardKind::Inflight
+            ),
+            "inbox move requires Inbox or Inflight shard"
+        );
+        let source_assignment = registry
+            .resolve_assignment(&shard)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no inbox assignment registered for shard {shard:?}"))?;
+        let source = InboxGrpcClient::connect(source_assignment.endpoint.endpoint.clone()).await?;
+        let snapshot = source.stream_shard_snapshot(&source_assignment).await?;
+
+        let assignment = registry
+            .move_shard_to_member(shard.clone(), target_node_id)
+            .await?;
+        let target = InboxGrpcClient::connect(assignment.endpoint.endpoint.clone()).await?;
+        target.import_shard_snapshot(&snapshot).await?;
+        #[cfg(test)]
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let late_snapshot = source.export_shard_snapshot(&shard).await?;
+        target.import_shard_snapshot(&late_snapshot).await?;
+
+        let mut session_ids = BTreeMap::<String, ()>::new();
+        for subscription in &snapshot.subscriptions {
+            session_ids.insert(subscription.session_id.clone(), ());
+        }
+        for message in &snapshot.offline_messages {
+            session_ids.insert(message.session_id.clone(), ());
+        }
+        for message in &snapshot.inflight_messages {
+            session_ids.insert(message.session_id.clone(), ());
+        }
+        for subscription in &late_snapshot.subscriptions {
+            session_ids.insert(subscription.session_id.clone(), ());
+        }
+        for message in &late_snapshot.offline_messages {
+            session_ids.insert(message.session_id.clone(), ());
+        }
+        for message in &late_snapshot.inflight_messages {
+            session_ids.insert(message.session_id.clone(), ());
+        }
+        for session_id in session_ids.into_keys() {
+            source.purge_session(&session_id).await?;
+        }
+
+        Ok(assignment)
+    }
+
+    pub async fn catch_up_shard_via_registry(
+        registry: &DynamicServiceEndpointRegistry,
+        shard: ServiceShardKey,
+        target_node_id: NodeId,
+    ) -> anyhow::Result<ServiceShardAssignment> {
+        anyhow::ensure!(
+            matches!(
+                shard.kind,
+                ServiceShardKind::Inbox | ServiceShardKind::Inflight
+            ),
+            "inbox catch-up requires Inbox or Inflight shard"
+        );
+        let source_assignment = registry
+            .resolve_assignment(&shard)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no inbox assignment registered for shard {shard:?}"))?;
+        let source = InboxGrpcClient::connect(source_assignment.endpoint.endpoint.clone()).await?;
+        let snapshot = source.stream_shard_snapshot(&source_assignment).await?;
+        let expected_checksum = snapshot.checksum()?;
+
+        let assignment = registry
+            .catch_up_shard_on_member(shard.clone(), target_node_id)
+            .await?;
+        let target = InboxGrpcClient::connect(assignment.endpoint.endpoint.clone()).await?;
+        target.import_shard_snapshot(&snapshot).await?;
+        let restored = target.export_shard_snapshot(&shard).await?;
+        anyhow::ensure!(
+            restored.checksum()? == expected_checksum,
+            "inbox shard catch-up checksum mismatch"
+        );
+        Ok(assignment)
     }
 }
 
@@ -556,9 +1484,16 @@ impl RpcRuntime {
         Server::builder()
             .add_service(SessionDictServiceServer::new(SessionDictRpc {
                 inner: self.sessiondict,
+                assignment_registry: self.assignment_registry.clone(),
             }))
-            .add_service(DistServiceServer::new(DistRpc { inner: self.dist }))
-            .add_service(InboxServiceServer::new(InboxRpc { inner: self.inbox }))
+            .add_service(DistServiceServer::new(DistRpc {
+                inner: self.dist,
+                assignment_registry: self.assignment_registry.clone(),
+            }))
+            .add_service(InboxServiceServer::new(InboxRpc {
+                inner: self.inbox,
+                assignment_registry: self.assignment_registry.clone(),
+            }))
             .add_service(RetainServiceServer::new(RetainRpc { inner: self.retain }))
             .add_service(BrokerPeerServiceServer::new(BrokerPeerRpc {
                 inner: self.peer_sink,
@@ -1095,6 +2030,8 @@ impl DeliverySink for NoopDeliverySink {
 
 #[tonic::async_trait]
 impl SessionDictService for SessionDictRpc {
+    type StreamShardSnapshotStream = tonic::codegen::BoxStream<ShardSnapshotChunk>;
+
     async fn register_session(
         &self,
         request: Request<RegisterSessionRequest>,
@@ -1185,10 +2122,44 @@ impl SessionDictService for SessionDictRpc {
             records: records.iter().map(to_proto_session).collect(),
         }))
     }
+
+    async fn stream_shard_snapshot(
+        &self,
+        request: Request<ShardSnapshotRequest>,
+    ) -> Result<Response<Self::StreamShardSnapshotStream>, Status> {
+        let request = request.into_inner();
+        validate_snapshot_assignment(
+            &self.assignment_registry,
+            assignment_from_snapshot_request(
+                ServiceShardKind::SessionDict,
+                &request,
+                ServiceKind::SessionDict,
+            ),
+        )
+        .await?;
+        let shard = sessiondict_shard_from_request(request);
+        let sessions = self
+            .inner
+            .list_sessions(Some(&shard.tenant_id))
+            .await
+            .map_err(internal_status)?
+            .into_iter()
+            .filter(|record| shard_matches_sessiondict_record(&shard, record))
+            .collect();
+        let snapshot = SessionDictShardSnapshot { sessions };
+        let bytes = snapshot.encode().map_err(internal_status)?;
+        let checksum = snapshot.checksum().map_err(internal_status)?;
+        let output = tonic::codegen::tokio_stream::iter(
+            snapshot_chunks(bytes, checksum).into_iter().map(Ok),
+        );
+        Ok(Response::new(Box::pin(output)))
+    }
 }
 
 #[tonic::async_trait]
 impl DistService for DistRpc {
+    type StreamShardSnapshotStream = tonic::codegen::BoxStream<ShardSnapshotChunk>;
+
     async fn add_route(&self, request: Request<AddRouteRequest>) -> Result<Response<()>, Status> {
         let route = request
             .into_inner()
@@ -1285,10 +2256,38 @@ impl DistService for DistRpc {
             count: count as u64,
         }))
     }
+
+    async fn stream_shard_snapshot(
+        &self,
+        request: Request<ShardSnapshotRequest>,
+    ) -> Result<Response<Self::StreamShardSnapshotStream>, Status> {
+        let request = request.into_inner();
+        validate_snapshot_assignment(
+            &self.assignment_registry,
+            assignment_from_snapshot_request(ServiceShardKind::Dist, &request, ServiceKind::Dist),
+        )
+        .await?;
+        let tenant_id = request.tenant_id;
+        let snapshot = DistShardSnapshot {
+            routes: self
+                .inner
+                .list_routes(Some(&tenant_id))
+                .await
+                .map_err(internal_status)?,
+        };
+        let bytes = snapshot.encode().map_err(internal_status)?;
+        let checksum = snapshot.checksum().map_err(internal_status)?;
+        let output = tonic::codegen::tokio_stream::iter(
+            snapshot_chunks(bytes, checksum).into_iter().map(Ok),
+        );
+        Ok(Response::new(Box::pin(output)))
+    }
 }
 
 #[tonic::async_trait]
 impl ProtoInboxService for InboxRpc {
+    type StreamShardSnapshotStream = tonic::codegen::BoxStream<ShardSnapshotChunk>;
+
     async fn attach(&self, request: Request<InboxAttachRequest>) -> Result<Response<()>, Status> {
         self.inner
             .attach(&request.into_inner().session_id)
@@ -1562,6 +2561,64 @@ impl ProtoInboxService for InboxRpc {
             offline_messages: offline_messages as u64,
             inflight_messages: inflight_messages as u64,
         }))
+    }
+
+    async fn stream_shard_snapshot(
+        &self,
+        request: Request<ShardSnapshotRequest>,
+    ) -> Result<Response<Self::StreamShardSnapshotStream>, Status> {
+        let request = request.into_inner();
+        validate_snapshot_assignment(
+            &self.assignment_registry,
+            assignment_from_snapshot_request(ServiceShardKind::Inbox, &request, ServiceKind::Inbox),
+        )
+        .await?;
+        let shard = inbox_shard_from_request(request);
+        let subscriptions = self
+            .inner
+            .list_all_subscriptions()
+            .await
+            .map_err(internal_status)?
+            .into_iter()
+            .filter(|subscription| {
+                shard_matches_inbox_session(
+                    &shard,
+                    &subscription.tenant_id,
+                    &subscription.session_id,
+                )
+            })
+            .collect();
+        let offline_messages = self
+            .inner
+            .list_all_offline()
+            .await
+            .map_err(internal_status)?
+            .into_iter()
+            .filter(|message| {
+                shard_matches_inbox_session(&shard, &message.tenant_id, &message.session_id)
+            })
+            .collect();
+        let inflight_messages = self
+            .inner
+            .list_all_inflight()
+            .await
+            .map_err(internal_status)?
+            .into_iter()
+            .filter(|message| {
+                shard_matches_inbox_session(&shard, &message.tenant_id, &message.session_id)
+            })
+            .collect();
+        let snapshot = InboxShardSnapshot {
+            subscriptions,
+            offline_messages,
+            inflight_messages,
+        };
+        let bytes = snapshot.encode().map_err(internal_status)?;
+        let checksum = snapshot.checksum().map_err(internal_status)?;
+        let output = tonic::codegen::tokio_stream::iter(
+            snapshot_chunks(bytes, checksum).into_iter().map(Ok),
+        );
+        Ok(Response::new(Box::pin(output)))
     }
 }
 

@@ -1,0 +1,13 @@
+[package]
+name = "greenmqtt-cluster"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+foca = { version = "0.18", features = ["std", "serde"] }
+greenmqtt-core = { path = "../greenmqtt-core" }
+serde.workspace = true
+tokio.workspace = true

@@ -306,6 +306,21 @@ message InboxStatsReply {
   uint64 inflight_messages = 3;
 }
 
+message ShardSnapshotRequest {
+  string tenant_id = 1;
+  string scope = 2;
+  uint64 owner_node_id = 3;
+  uint64 epoch = 4;
+  uint64 fencing_token = 5;
+}
+
+message ShardSnapshotChunk {
+  bytes data = 1;
+  uint32 sequence = 2;
+  uint64 checksum = 3;
+  bool done = 4;
+}
+
 service SessionDictService {
   rpc RegisterSession(RegisterSessionRequest) returns (RegisterSessionReply);
   rpc UnregisterSession(UnregisterSessionRequest) returns (RegisterSessionReply);
@@ -313,6 +328,7 @@ service SessionDictService {
   rpc LookupSessionById(LookupSessionByIdRequest) returns (LookupSessionReply);
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsReply);
   rpc CountSessions(.google.protobuf.Empty) returns (CountReply);
+  rpc StreamShardSnapshot(ShardSnapshotRequest) returns (stream ShardSnapshotChunk);
 }
 
 service DistService {
@@ -323,6 +339,7 @@ service DistService {
   rpc MatchTopic(MatchTopicRequest) returns (MatchTopicReply);
   rpc ListRoutes(ListRoutesRequest) returns (ListRoutesReply);
   rpc CountRoutes(.google.protobuf.Empty) returns (CountReply);
+  rpc StreamShardSnapshot(ShardSnapshotRequest) returns (stream ShardSnapshotChunk);
 }
 
 service InboxService {
@@ -343,6 +360,7 @@ service InboxService {
   rpc ListInflight(InboxListMessagesRequest) returns (InboxFetchInflightReply);
   rpc FetchInflight(InboxFetchInflightRequest) returns (InboxFetchInflightReply);
   rpc Stats(.google.protobuf.Empty) returns (InboxStatsReply);
+  rpc StreamShardSnapshot(ShardSnapshotRequest) returns (stream ShardSnapshotChunk);
 }
 
 service RetainService {

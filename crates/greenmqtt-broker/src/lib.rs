@@ -6,6 +6,7 @@ use broker::admission::AdmissionController;
 use broker::balancer::{NoopClientBalancer, SharedClientBalancer};
 use broker::tenant::TenantResourceManager;
 use broker::throttle::MessageRateLimiter;
+use dashmap::DashMap;
 use greenmqtt_core::{
     Delivery, NodeId, RetainedMessage, SessionId, SessionKind, SessionRecord, Subscription,
 };
@@ -426,6 +427,10 @@ pub struct BrokerRuntime<A, C = AllowAllAcl, H = NoopEventHook> {
     admission: AdmissionController,
     publish_rate_limiter: MessageRateLimiter,
     tenant_resources: Arc<TenantResourceManager>,
+    inbound_bandwidth_limit: Option<(u64, u64)>,
+    outbound_bandwidth_limit: Option<(u64, u64)>,
+    inbound_bandwidth_overrides: DashMap<String, (u64, u64)>,
+    outbound_bandwidth_overrides: DashMap<String, (u64, u64)>,
     connect_debounce_window_ms: Option<u64>,
     recent_connect_attempts: Arc<ShardedWillGenerations>,
 }

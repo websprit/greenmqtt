@@ -37,6 +37,7 @@ pub(crate) enum Packet {
     Auth(AuthPacket),
 }
 
+#[allow(dead_code)]
 pub(super) async fn read_packet<S>(
     stream: &mut S,
     protocol_level: u8,
@@ -55,6 +56,30 @@ where
     let mut body = vec![0u8; remaining_len];
     stream.read_exact(&mut body).await?;
     parse_packet_parts(packet_type, flags, &body, protocol_level)
+}
+
+pub(super) async fn read_packet_with_size<S>(
+    stream: &mut S,
+    protocol_level: u8,
+    max_packet_size: Option<u32>,
+) -> anyhow::Result<(Packet, usize)>
+where
+    S: AsyncRead + Unpin,
+{
+    let header = stream.read_u8().await?;
+    let packet_type = header >> 4;
+    let flags = header & 0x0f;
+    let (remaining_len, len_bytes) = read_remaining_length(stream).await?;
+    let packet_size = 1 + len_bytes + remaining_len;
+    if super::packet_exceeds_limit(packet_size, max_packet_size) {
+        anyhow::bail!("packet exceeds configured maximum packet size");
+    }
+    let mut body = vec![0u8; remaining_len];
+    stream.read_exact(&mut body).await?;
+    Ok((
+        parse_packet_parts(packet_type, flags, &body, protocol_level)?,
+        packet_size,
+    ))
 }
 
 pub(super) fn parse_packet_frame(frame: &[u8], protocol_level: u8) -> anyhow::Result<Packet> {

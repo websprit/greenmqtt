@@ -68,6 +68,7 @@ where
     loop {
         let (stream, _) = listener.accept().await?;
         let broker = broker.clone();
+        let bandwidth = broker.bandwidth_limits();
         let permit = match broker.try_acquire_connection_slot() {
             Ok(permit) => permit,
             Err(()) => {
@@ -77,7 +78,12 @@ where
         };
         tokio::spawn(async move {
             let permit_guard = permit;
-            if let Err(error) = drive_session(TcpTransport::new(stream), broker).await {
+            if let Err(error) = drive_session(
+                TcpTransport::with_bandwidth(stream, bandwidth.0, bandwidth.1),
+                broker,
+            )
+            .await
+            {
                 eprintln!("greenmqtt tcp session error: {error:#}");
             }
             drop(permit_guard);
@@ -101,6 +107,7 @@ where
     loop {
         let (stream, _) = listener.accept().await?;
         let broker = broker.clone();
+        let bandwidth = broker.bandwidth_limits();
         let acceptor = acceptor.clone();
         let permit = match broker.try_acquire_connection_slot() {
             Ok(permit) => permit,
@@ -113,7 +120,12 @@ where
             let permit_guard = permit;
             match acceptor.accept(stream).await {
                 Ok(stream) => {
-                    if let Err(error) = drive_session(TcpTransport::new(stream), broker).await {
+                    if let Err(error) = drive_session(
+                        TcpTransport::with_bandwidth(stream, bandwidth.0, bandwidth.1),
+                        broker,
+                    )
+                    .await
+                    {
                         eprintln!("greenmqtt tls session error: {error:#}");
                     }
                 }
@@ -139,6 +151,7 @@ where
     loop {
         let (stream, _) = listener.accept().await?;
         let broker = broker.clone();
+        let bandwidth = broker.bandwidth_limits();
         let permit = match broker.try_acquire_connection_slot() {
             Ok(permit) => permit,
             Err(()) => {
@@ -150,7 +163,12 @@ where
             let permit_guard = permit;
             match accept_async(stream).await {
                 Ok(stream) => {
-                    if let Err(error) = drive_session(WsTransport::new(stream), broker).await {
+                    if let Err(error) = drive_session(
+                        WsTransport::with_bandwidth(stream, bandwidth.0, bandwidth.1),
+                        broker,
+                    )
+                    .await
+                    {
                         eprintln!("greenmqtt ws session error: {error:#}");
                     }
                 }
@@ -179,6 +197,7 @@ where
     loop {
         let (stream, _) = listener.accept().await?;
         let broker = broker.clone();
+        let bandwidth = broker.bandwidth_limits();
         let acceptor = acceptor.clone();
         let permit = match broker.try_acquire_connection_slot() {
             Ok(permit) => permit,
@@ -192,7 +211,12 @@ where
             match acceptor.accept(stream).await {
                 Ok(stream) => match accept_async(stream).await {
                     Ok(stream) => {
-                        if let Err(error) = drive_session(WsTransport::new(stream), broker).await {
+                        if let Err(error) = drive_session(
+                            WsTransport::with_bandwidth(stream, bandwidth.0, bandwidth.1),
+                            broker,
+                        )
+                        .await
+                        {
                             eprintln!("greenmqtt wss session error: {error:#}");
                         }
                     }
@@ -229,6 +253,7 @@ where
             return Ok(());
         };
         let broker = broker.clone();
+        let bandwidth = broker.bandwidth_limits();
         tokio::spawn(async move {
             match incoming.await {
                 Ok(connection) => {
@@ -246,7 +271,11 @@ where
                                 let broker = broker.clone();
                                 tokio::spawn(async move {
                                     if let Err(error) = drive_session(
-                                        TcpTransport::new(QuicBiStream { send, recv }),
+                                        TcpTransport::with_bandwidth(
+                                            QuicBiStream { send, recv },
+                                            bandwidth.0,
+                                            bandwidth.1,
+                                        ),
                                         broker,
                                     )
                                     .await

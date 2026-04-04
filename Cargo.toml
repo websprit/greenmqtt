@@ -12,6 +12,7 @@ members = [
     "crates/greenmqtt-plugin-api",
     "crates/greenmqtt-http-api",
     "crates/greenmqtt-cli",
+    "crates/greenmqtt-cluster",
 ]
 resolver = "2"
 

@@ -1,4 +1,7 @@
 use super::*;
+use crate::mqtt::session::{SessionTransport, TcpTransport};
+use std::time::Instant;
+use tokio::io::{duplex, AsyncReadExt};
 
 #[tokio::test]
 async fn mqtt_tcp_connect_subscribe_publish_flow() {
@@ -2558,6 +2561,26 @@ async fn mqtt_v5_tenant_publish_quota_exceeded_returns_quota_exceeded_puback() {
     );
 
     server.abort();
+}
+
+#[tokio::test]
+#[ignore = "manual throughput gate for outbound bandwidth shaping"]
+async fn mqtt_tcp_outbound_bandwidth_limit_keeps_throughput_under_1_2kbps() {
+    let (writer, mut reader) = duplex(8192);
+    let mut transport = TcpTransport::with_bandwidth(writer, None, Some((1024, 1024)));
+    let payload = vec![b'x'; 8192];
+    let write_payload = payload.clone();
+    let started = Instant::now();
+    let write_task = tokio::spawn(async move { transport.write_bytes(&write_payload).await });
+    let mut received = vec![0u8; payload.len()];
+    reader.read_exact(&mut received).await.unwrap();
+    write_task.await.unwrap().unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(6500),
+        "expected 8KB payload at 1KB/s with 1KB burst to take at least ~6.5s, got {:?}",
+        elapsed
+    );
 }
 
 #[tokio::test]

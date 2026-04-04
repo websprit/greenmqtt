@@ -366,6 +366,15 @@ impl ProtocolSessionState {
         self.active_session_id().cloned()
     }
 
+    pub(super) fn current_identity_cloned(&self) -> Option<ClientIdentity> {
+        match &self.phase {
+            SessionPhase::Established(state) => Some(state.identity.clone()),
+            SessionPhase::ReAuthenticating(_)
+            | SessionPhase::Disconnecting(_)
+            | SessionPhase::AwaitConnect => None,
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn is_disconnecting(&self) -> bool {
         matches!(self.phase, SessionPhase::Disconnecting(_))

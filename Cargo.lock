@@ -525,6 +525,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
+name = "foca"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76a802ad7c0d11586f22b361c7bd5b70c3344461b661520dcc67de46bc936e30"
+dependencies = [
+ "bytes",
+ "rand 0.8.5",
+ "serde",
+]
+
+[[package]]
 name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -725,6 +736,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "greenmqtt-cluster"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "foca",
+ "greenmqtt-core",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "greenmqtt-core"
 version = "0.1.0"
 dependencies = [
@@ -828,6 +851,9 @@ dependencies = [
  "greenmqtt-proto",
  "greenmqtt-retain",
  "greenmqtt-sessiondict",
+ "greenmqtt-storage",
+ "serde",
+ "serde_json",
  "tokio",
  "tonic",
 ]

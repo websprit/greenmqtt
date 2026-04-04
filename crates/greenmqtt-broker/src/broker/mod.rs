@@ -8,3 +8,4 @@ pub(crate) mod session_mgr;
 pub(crate) mod stats;
 pub(crate) mod tenant;
 pub(crate) mod throttle;
+pub(crate) mod token_bucket;

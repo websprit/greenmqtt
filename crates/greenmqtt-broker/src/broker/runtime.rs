@@ -13,6 +13,9 @@ use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Duration;
 
+type BandwidthLimit = Option<(u64, u64)>;
+type BandwidthLimits = (BandwidthLimit, BandwidthLimit);
+
 impl<A, C, H> BrokerRuntime<A, C, H>
 where
     A: AuthProvider,
@@ -80,6 +83,10 @@ where
             admission: AdmissionController::default(),
             publish_rate_limiter: MessageRateLimiter::default(),
             tenant_resources: Arc::new(TenantResourceManager::default()),
+            inbound_bandwidth_limit: None,
+            outbound_bandwidth_limit: None,
+            inbound_bandwidth_overrides: DashMap::new(),
+            outbound_bandwidth_overrides: DashMap::new(),
             connect_debounce_window_ms: None,
             recent_connect_attempts: Arc::new(ShardedWillGenerations::default()),
         }
@@ -146,12 +153,58 @@ where
         self.client_balancer = balancer;
     }
 
+    pub fn set_inbound_bandwidth_limit(&mut self, rate_bytes_per_sec: u64, burst_bytes: u64) {
+        self.inbound_bandwidth_limit = Some((rate_bytes_per_sec, burst_bytes));
+    }
+
+    pub fn set_outbound_bandwidth_limit(&mut self, rate_bytes_per_sec: u64, burst_bytes: u64) {
+        self.outbound_bandwidth_limit = Some((rate_bytes_per_sec, burst_bytes));
+    }
+
+    pub fn set_tenant_inbound_bandwidth_limit(
+        &self,
+        tenant_id: impl Into<String>,
+        rate_bytes_per_sec: u64,
+        burst_bytes: u64,
+    ) {
+        self.inbound_bandwidth_overrides
+            .insert(tenant_id.into(), (rate_bytes_per_sec, burst_bytes));
+    }
+
+    pub fn set_tenant_outbound_bandwidth_limit(
+        &self,
+        tenant_id: impl Into<String>,
+        rate_bytes_per_sec: u64,
+        burst_bytes: u64,
+    ) {
+        self.outbound_bandwidth_overrides
+            .insert(tenant_id.into(), (rate_bytes_per_sec, burst_bytes));
+    }
+
     pub fn tenant_quota(&self, tenant_id: &str) -> Option<TenantQuota> {
         self.tenant_resources.quota(tenant_id)
     }
 
     pub fn tenant_usage(&self, tenant_id: &str) -> Option<TenantUsageSnapshot> {
         self.tenant_resources.usage(tenant_id)
+    }
+
+    pub(crate) fn bandwidth_limits(&self) -> BandwidthLimits {
+        (self.inbound_bandwidth_limit, self.outbound_bandwidth_limit)
+    }
+
+    pub(crate) fn bandwidth_limits_for_tenant(&self, tenant_id: &str) -> BandwidthLimits {
+        let inbound = self
+            .inbound_bandwidth_overrides
+            .get(tenant_id)
+            .map(|entry| *entry.value())
+            .or(self.inbound_bandwidth_limit);
+        let outbound = self
+            .outbound_bandwidth_overrides
+            .get(tenant_id)
+            .map(|entry| *entry.value())
+            .or(self.outbound_bandwidth_limit);
+        (inbound, outbound)
     }
 
     pub(crate) fn connect_debounce_exceeded(&self, identity: &ClientIdentity) -> bool {

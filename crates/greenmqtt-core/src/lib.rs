@@ -175,6 +175,13 @@ impl ServiceShardAssignment {
     pub fn owner_node_id(&self) -> NodeId {
         self.endpoint.node_id
     }
+
+    pub fn matches_owner_epoch_fence(&self, other: &ServiceShardAssignment) -> bool {
+        self.shard == other.shard
+            && self.owner_node_id() == other.owner_node_id()
+            && self.epoch == other.epoch
+            && self.fencing_token == other.fencing_token
+    }
 }
 
 #[async_trait]
@@ -244,6 +251,23 @@ impl ClusterNodeMembership {
             endpoints,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct HealthScore(pub u8);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum NodeStatus {
+    Alive,
+    Suspect,
+    ConfirmedDead,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClusterMember {
+    pub membership: ClusterNodeMembership,
+    pub health_score: HealthScore,
+    pub status: NodeStatus,
 }
 
 #[async_trait]

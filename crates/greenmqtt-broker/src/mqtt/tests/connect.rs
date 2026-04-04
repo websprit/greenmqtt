@@ -1,5 +1,8 @@
 use super::*;
 use crate::{ClientBalancer, Redirection};
+use crate::{PeerRegistry, RoundRobinBalancer};
+use std::collections::BTreeMap;
+use std::sync::RwLock;
 
 #[derive(Default)]
 struct RedirectBalancer;
@@ -10,6 +13,46 @@ impl ClientBalancer for RedirectBalancer {
             permanent: false,
             server_reference: "mqtt://127.0.0.1:2883".into(),
         })
+    }
+}
+
+#[derive(Default)]
+struct RedirectPeerRegistry {
+    endpoints: RwLock<BTreeMap<u64, String>>,
+}
+
+#[async_trait::async_trait]
+impl PeerRegistry for RedirectPeerRegistry {
+    fn list_peer_nodes(&self) -> Vec<u64> {
+        self.endpoints
+            .read()
+            .expect("peer registry poisoned")
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    fn list_peer_endpoints(&self) -> BTreeMap<u64, String> {
+        self.endpoints
+            .read()
+            .expect("peer registry poisoned")
+            .clone()
+    }
+
+    fn remove_peer_node(&self, node_id: u64) -> bool {
+        self.endpoints
+            .write()
+            .expect("peer registry poisoned")
+            .remove(&node_id)
+            .is_some()
+    }
+
+    async fn add_peer_node(&self, node_id: u64, endpoint: String) -> anyhow::Result<()> {
+        self.endpoints
+            .write()
+            .expect("peer registry poisoned")
+            .insert(node_id, endpoint);
+        Ok(())
     }
 }
 
@@ -202,6 +245,68 @@ async fn mqtt_v5_client_balancer_redirect_returns_use_another_server_connack() {
         Some("mqtt://127.0.0.1:2883")
     );
 
+    server.abort();
+}
+
+#[tokio::test]
+async fn mqtt_v5_high_load_node_redirects_new_connection_to_peer() {
+    let mut broker = test_broker();
+    let peer_registry = Arc::new(RedirectPeerRegistry::default());
+    peer_registry
+        .endpoints
+        .write()
+        .expect("peer registry poisoned")
+        .insert(2, "mqtt://127.0.0.1:2883".into());
+    let local_load = Arc::new(AtomicUsize::new(0));
+    let balancer = RoundRobinBalancer::with_threshold(
+        1,
+        peer_registry,
+        Arc::new({
+            let local_load = Arc::clone(&local_load);
+            move || local_load.load(Ordering::Relaxed)
+        }),
+        1,
+        false,
+    );
+    Arc::get_mut(&mut broker)
+        .expect("broker should be uniquely owned before serve")
+        .set_client_balancer(Arc::new(balancer));
+    let active = broker
+        .connect(ConnectRequest {
+            identity: ClientIdentity {
+                tenant_id: "tenant-a".into(),
+                user_id: "user-a".into(),
+                client_id: "busy".into(),
+            },
+            node_id: 1,
+            kind: SessionKind::Persistent,
+            clean_start: true,
+            session_expiry_interval_secs: None,
+        })
+        .await
+        .unwrap();
+    local_load.store(1, Ordering::Relaxed);
+    let bind = next_test_bind();
+    let server = tokio::spawn(serve_tcp(broker.clone(), bind));
+    sleep(Duration::from_millis(100)).await;
+
+    let mut client = connect_tcp_with_retry(bind).await.unwrap();
+    client
+        .write_all(&connect_packet_v5("redirected-high-load"))
+        .await
+        .unwrap();
+    assert_eq!(client.read_u8().await.unwrap() >> 4, PACKET_TYPE_CONNACK);
+    let connack_len = read_remaining_length_for_test(&mut client).await;
+    let mut connack = vec![0u8; connack_len];
+    client.read_exact(&mut connack).await.unwrap();
+    let parsed = parse_v5_connack_packet(&connack);
+    assert_eq!(parsed.reason_code, 0x9C);
+    assert_eq!(
+        parsed.server_reference.as_deref(),
+        Some("mqtt://127.0.0.1:2883")
+    );
+
+    broker.disconnect(&active.session.session_id).await.unwrap();
     server.abort();
 }
 #[tokio::test]

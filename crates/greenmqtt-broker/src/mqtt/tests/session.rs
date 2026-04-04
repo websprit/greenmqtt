@@ -1,4 +1,23 @@
 use super::*;
+use crate::{ClientBalancer, Redirection};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[derive(Default)]
+struct SessionRedirectBalancer {
+    checks: AtomicUsize,
+}
+
+impl ClientBalancer for SessionRedirectBalancer {
+    fn need_redirect(&self, _identity: &ClientIdentity) -> Option<Redirection> {
+        if self.checks.fetch_add(1, Ordering::Relaxed) == 0 {
+            return None;
+        }
+        Some(Redirection {
+            permanent: false,
+            server_reference: "mqtt://127.0.0.1:3883".into(),
+        })
+    }
+}
 
 #[tokio::test]
 async fn mqtt_tcp_persistent_replay_on_reconnect() {
@@ -60,6 +79,44 @@ async fn mqtt_tcp_persistent_replay_on_reconnect() {
     let mut publish = vec![0u8; publish_len];
     resumed.read_exact(&mut publish).await.unwrap();
     assert!(publish.windows(7).any(|window| window == b"offline"));
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn mqtt_v5_session_balancer_recheck_disconnects_with_server_reference() {
+    let mut broker = test_broker();
+    Arc::get_mut(&mut broker)
+        .expect("broker should be uniquely owned before serve")
+        .set_client_balancer(Arc::new(SessionRedirectBalancer::default()));
+    let bind = next_test_bind();
+    let server = tokio::spawn(serve_tcp(broker, bind));
+    sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(bind).await.unwrap();
+    client
+        .write_all(&connect_packet_v5("session-redirect"))
+        .await
+        .unwrap();
+    assert_eq!(client.read_u8().await.unwrap() >> 4, PACKET_TYPE_CONNACK);
+    let connack_len = read_remaining_length_for_test(&mut client).await;
+    let mut connack = vec![0u8; connack_len];
+    client.read_exact(&mut connack).await.unwrap();
+
+    assert_eq!(client.read_u8().await.unwrap() >> 4, PACKET_TYPE_DISCONNECT);
+    let disconnect_len = read_remaining_length_for_test(&mut client).await;
+    let mut disconnect = vec![0u8; disconnect_len];
+    client.read_exact(&mut disconnect).await.unwrap();
+    let disconnect = parse_v5_disconnect_packet(&disconnect);
+    assert_eq!(disconnect.reason_code, 0x9C);
+    assert_eq!(
+        disconnect.reason_string.as_deref(),
+        Some("use another server")
+    );
+    assert_eq!(
+        disconnect.server_reference.as_deref(),
+        Some("mqtt://127.0.0.1:3883")
+    );
 
     server.abort();
 }
