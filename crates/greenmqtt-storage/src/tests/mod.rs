@@ -1,6 +1,6 @@
 use super::{
-        InboxStore, InflightStore, MemoryInboxStore, MemoryInflightStore, MemoryRetainStore,
-        MemoryRouteStore, MemorySessionStore, MemorySubscriptionStore, RedisInboxStore,
+    InboxStore, InflightStore, MemoryInboxStore, MemoryInflightStore, MemoryRetainStore,
+    MemoryRouteStore, MemorySessionStore, MemorySubscriptionStore, RedisInboxStore,
     RedisInflightStore, RedisRetainStore, RedisRouteStore, RedisSessionStore,
     RedisSubscriptionStore, RetainStore, RocksInboxStore, RocksInflightStore, RocksRetainStore,
     RocksRouteStore, RocksSessionStore, RocksSubscriptionStore, RouteStore, SessionStore,
@@ -98,6 +98,153 @@ async fn redis_stores_round_trip_data() {
     )
     .await;
     assert_route_store_roundtrip(&route_store).await;
+}
+
+#[tokio::test]
+async fn memory_to_sled_upgrade_preserves_session_route_retain_state() {
+    let source_session = MemorySessionStore::default();
+    let source_route = MemoryRouteStore::default();
+    let source_retain = MemoryRetainStore::default();
+    seed_upgrade_state(&source_session, &source_route, &source_retain).await;
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let target_session = SledSessionStore::open(tempdir.path().join("sessions")).unwrap();
+    let target_route = SledRouteStore::open(tempdir.path().join("routes")).unwrap();
+    let target_retain = SledRetainStore::open(tempdir.path().join("retain")).unwrap();
+
+    migrate_upgrade_state(
+        &source_session,
+        &target_session,
+        &source_route,
+        &target_route,
+        &source_retain,
+        &target_retain,
+    )
+    .await;
+    assert_upgrade_state(&target_session, &target_route, &target_retain).await;
+}
+
+#[tokio::test]
+async fn memory_to_rocksdb_upgrade_preserves_session_route_retain_state() {
+    let source_session = MemorySessionStore::default();
+    let source_route = MemoryRouteStore::default();
+    let source_retain = MemoryRetainStore::default();
+    seed_upgrade_state(&source_session, &source_route, &source_retain).await;
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let target_session = RocksSessionStore::open(tempdir.path().join("sessions")).unwrap();
+    let target_route = RocksRouteStore::open(tempdir.path().join("routes")).unwrap();
+    let target_retain = RocksRetainStore::open(tempdir.path().join("retain")).unwrap();
+
+    migrate_upgrade_state(
+        &source_session,
+        &target_session,
+        &source_route,
+        &target_route,
+        &source_retain,
+        &target_retain,
+    )
+    .await;
+    assert_upgrade_state(&target_session, &target_route, &target_retain).await;
+}
+
+#[tokio::test]
+async fn memory_to_redis_upgrade_preserves_session_route_retain_state() {
+    let source_session = MemorySessionStore::default();
+    let source_route = MemoryRouteStore::default();
+    let source_retain = MemoryRetainStore::default();
+    seed_upgrade_state(&source_session, &source_route, &source_retain).await;
+
+    let server = RedisTestServer::start();
+    let target_session = RedisSessionStore::open(&server.url).unwrap();
+    let target_route = RedisRouteStore::open(&server.url).unwrap();
+    let target_retain = RedisRetainStore::open(&server.url).unwrap();
+
+    migrate_upgrade_state(
+        &source_session,
+        &target_session,
+        &source_route,
+        &target_route,
+        &source_retain,
+        &target_retain,
+    )
+    .await;
+    assert_upgrade_state(&target_session, &target_route, &target_retain).await;
+}
+
+#[tokio::test]
+async fn sled_to_rocksdb_switch_preserves_session_route_retain_state() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let source_session = SledSessionStore::open(source_dir.path().join("sessions")).unwrap();
+    let source_route = SledRouteStore::open(source_dir.path().join("routes")).unwrap();
+    let source_retain = SledRetainStore::open(source_dir.path().join("retain")).unwrap();
+    seed_upgrade_state(&source_session, &source_route, &source_retain).await;
+
+    let target_dir = tempfile::tempdir().unwrap();
+    let target_session = RocksSessionStore::open(target_dir.path().join("sessions")).unwrap();
+    let target_route = RocksRouteStore::open(target_dir.path().join("routes")).unwrap();
+    let target_retain = RocksRetainStore::open(target_dir.path().join("retain")).unwrap();
+
+    migrate_upgrade_state(
+        &source_session,
+        &target_session,
+        &source_route,
+        &target_route,
+        &source_retain,
+        &target_retain,
+    )
+    .await;
+    assert_upgrade_state(&target_session, &target_route, &target_retain).await;
+}
+
+#[tokio::test]
+async fn rocksdb_to_redis_switch_preserves_session_route_retain_state() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let source_session = RocksSessionStore::open(source_dir.path().join("sessions")).unwrap();
+    let source_route = RocksRouteStore::open(source_dir.path().join("routes")).unwrap();
+    let source_retain = RocksRetainStore::open(source_dir.path().join("retain")).unwrap();
+    seed_upgrade_state(&source_session, &source_route, &source_retain).await;
+
+    let server = RedisTestServer::start();
+    let target_session = RedisSessionStore::open(&server.url).unwrap();
+    let target_route = RedisRouteStore::open(&server.url).unwrap();
+    let target_retain = RedisRetainStore::open(&server.url).unwrap();
+
+    migrate_upgrade_state(
+        &source_session,
+        &target_session,
+        &source_route,
+        &target_route,
+        &source_retain,
+        &target_retain,
+    )
+    .await;
+    assert_upgrade_state(&target_session, &target_route, &target_retain).await;
+}
+
+#[tokio::test]
+async fn redis_to_sled_switch_preserves_session_route_retain_state() {
+    let server = RedisTestServer::start();
+    let source_session = RedisSessionStore::open(&server.url).unwrap();
+    let source_route = RedisRouteStore::open(&server.url).unwrap();
+    let source_retain = RedisRetainStore::open(&server.url).unwrap();
+    seed_upgrade_state(&source_session, &source_route, &source_retain).await;
+
+    let target_dir = tempfile::tempdir().unwrap();
+    let target_session = SledSessionStore::open(target_dir.path().join("sessions")).unwrap();
+    let target_route = SledRouteStore::open(target_dir.path().join("routes")).unwrap();
+    let target_retain = SledRetainStore::open(target_dir.path().join("retain")).unwrap();
+
+    migrate_upgrade_state(
+        &source_session,
+        &target_session,
+        &source_route,
+        &target_route,
+        &source_retain,
+        &target_retain,
+    )
+    .await;
+    assert_upgrade_state(&target_session, &target_route, &target_retain).await;
 }
 
 async fn assert_store_roundtrip<S, U, I, F, R>(
@@ -589,6 +736,179 @@ async fn assert_store_roundtrip<S, U, I, F, R>(
         .unwrap()
         .is_none());
     assert_eq!(retain_store.count_retained().await.unwrap(), 1);
+}
+
+async fn seed_upgrade_state<S, R, T>(session_store: &S, route_store: &R, retain_store: &T)
+where
+    S: SessionStore,
+    R: RouteStore,
+    T: RetainStore,
+{
+    for session in [
+        SessionRecord {
+            session_id: "s1".into(),
+            node_id: 1,
+            kind: SessionKind::Persistent,
+            identity: ClientIdentity {
+                tenant_id: "t1".into(),
+                user_id: "u1".into(),
+                client_id: "c1".into(),
+            },
+            session_expiry_interval_secs: Some(60),
+            expires_at_ms: Some(1_700_000_001),
+        },
+        SessionRecord {
+            session_id: "s2".into(),
+            node_id: 2,
+            kind: SessionKind::Persistent,
+            identity: ClientIdentity {
+                tenant_id: "t2".into(),
+                user_id: "u2".into(),
+                client_id: "c2".into(),
+            },
+            session_expiry_interval_secs: None,
+            expires_at_ms: None,
+        },
+    ] {
+        session_store.save_session(&session).await.unwrap();
+    }
+
+    for route in [
+        RouteRecord {
+            tenant_id: "t1".into(),
+            topic_filter: "devices/+/state".into(),
+            session_id: "s1".into(),
+            node_id: 1,
+            subscription_identifier: Some(7),
+            no_local: false,
+            retain_as_published: true,
+            shared_group: Some("workers".into()),
+            kind: SessionKind::Persistent,
+        },
+        RouteRecord {
+            tenant_id: "t2".into(),
+            topic_filter: "devices/b/status".into(),
+            session_id: "s2".into(),
+            node_id: 2,
+            subscription_identifier: None,
+            no_local: true,
+            retain_as_published: false,
+            shared_group: None,
+            kind: SessionKind::Persistent,
+        },
+    ] {
+        route_store.save_route(&route).await.unwrap();
+    }
+
+    for retained in [
+        RetainedMessage {
+            tenant_id: "t1".into(),
+            topic: "devices/a/state".into(),
+            payload: b"online".to_vec().into(),
+            qos: 1,
+        },
+        RetainedMessage {
+            tenant_id: "t2".into(),
+            topic: "devices/b/status".into(),
+            payload: b"healthy".to_vec().into(),
+            qos: 0,
+        },
+    ] {
+        retain_store.put_retain(&retained).await.unwrap();
+    }
+}
+
+async fn migrate_upgrade_state<SS, TS, SR, TR, ST, TT>(
+    source_session: &SS,
+    target_session: &TS,
+    source_route: &SR,
+    target_route: &TR,
+    source_retain: &ST,
+    target_retain: &TT,
+) where
+    SS: SessionStore,
+    TS: SessionStore,
+    SR: RouteStore,
+    TR: RouteStore,
+    ST: RetainStore,
+    TT: RetainStore,
+{
+    for session in source_session.list_sessions().await.unwrap() {
+        target_session.save_session(&session).await.unwrap();
+    }
+    for route in source_route.list_routes().await.unwrap() {
+        target_route.save_route(&route).await.unwrap();
+    }
+    for tenant_id in ["t1", "t2"] {
+        for retained in source_retain.list_tenant_retained(tenant_id).await.unwrap() {
+            target_retain.put_retain(&retained).await.unwrap();
+        }
+    }
+}
+
+async fn assert_upgrade_state<S, R, T>(session_store: &S, route_store: &R, retain_store: &T)
+where
+    S: SessionStore,
+    R: RouteStore,
+    T: RetainStore,
+{
+    assert_eq!(session_store.count_sessions().await.unwrap(), 2);
+    assert_eq!(
+        session_store
+            .load_session("t1", "c1")
+            .await
+            .unwrap()
+            .unwrap()
+            .session_id,
+        "s1"
+    );
+    assert_eq!(
+        session_store
+            .load_session("t2", "c2")
+            .await
+            .unwrap()
+            .unwrap()
+            .node_id,
+        2
+    );
+
+    assert_eq!(route_store.count_routes().await.unwrap(), 2);
+    assert_eq!(
+        route_store
+            .list_topic_filter_shared_routes("t1", "devices/+/state", Some("workers"))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        route_store
+            .list_exact_routes("t2", "devices/b/status")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    assert_eq!(retain_store.count_retained().await.unwrap(), 2);
+    assert_eq!(
+        retain_store
+            .load_retain("t1", "devices/a/state")
+            .await
+            .unwrap()
+            .unwrap()
+            .payload,
+        b"online".as_slice()
+    );
+    assert_eq!(
+        retain_store
+            .load_retain("t2", "devices/b/status")
+            .await
+            .unwrap()
+            .unwrap()
+            .payload,
+        b"healthy".as_slice()
+    );
 }
 
 async fn assert_route_store_roundtrip<R>(route_store: &R)
