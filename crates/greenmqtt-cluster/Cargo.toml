@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
-foca = { version = "0.18", features = ["std", "serde"] }
+foca = { version = "1.0.0", features = ["std", "serde"] }
 greenmqtt-core = { path = "../greenmqtt-core" }
 serde.workspace = true
 tokio.workspace = true

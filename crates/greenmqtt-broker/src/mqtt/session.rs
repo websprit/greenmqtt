@@ -198,7 +198,9 @@ where
                 remaining -= step;
             }
         }
-        self.stream.send(Message::Binary(payload.to_vec())).await?;
+        self.stream
+            .send(Message::Binary(payload.to_vec().into()))
+            .await?;
         Ok(())
     }
 

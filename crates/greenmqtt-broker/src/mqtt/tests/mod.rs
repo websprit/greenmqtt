@@ -416,11 +416,16 @@ pub(super) async fn persistent_test_broker(data_dir: &TempDir) -> Arc<DefaultBro
 }
 
 pub(super) fn write_self_signed_tls_material(
-) -> (tempfile::TempDir, PathBuf, PathBuf, rcgen::CertifiedKey) {
+) -> (
+    tempfile::TempDir,
+    PathBuf,
+    PathBuf,
+    rcgen::CertifiedKey<rcgen::KeyPair>,
+) {
     ensure_rustls_provider_installed();
     let cert = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let cert_pem = cert.cert.pem();
-    let key_pem = cert.key_pair.serialize_pem();
+    let key_pem = cert.signing_key.serialize_pem();
     let tempdir = tempfile::tempdir().unwrap();
     let cert_path = tempdir.path().join("server.crt");
     let key_path = tempdir.path().join("server.key");

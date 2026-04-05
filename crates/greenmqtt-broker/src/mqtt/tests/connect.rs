@@ -1483,7 +1483,7 @@ async fn mqtt_pingreq_before_connect_closes_websocket() {
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(pingreq_packet()))
+        .send(Message::Binary((pingreq_packet()).into()))
         .await
         .unwrap();
     assert_ws_connection_closed(&mut client).await;
@@ -1500,7 +1500,7 @@ async fn mqtt_puback_before_connect_closes_websocket() {
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(puback_client_packet(1)))
+        .send(Message::Binary((puback_client_packet(1)).into()))
         .await
         .unwrap();
     assert_ws_connection_closed(&mut client).await;
@@ -1517,7 +1517,7 @@ async fn mqtt_pubrec_before_connect_closes_websocket() {
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(pubrec_client_packet(1)))
+        .send(Message::Binary((pubrec_client_packet(1)).into()))
         .await
         .unwrap();
     assert_ws_connection_closed(&mut client).await;
@@ -1534,7 +1534,7 @@ async fn mqtt_pubrel_before_connect_closes_websocket() {
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(pubrel_packet(1)))
+        .send(Message::Binary((pubrel_packet(1)).into()))
         .await
         .unwrap();
     assert_ws_connection_closed(&mut client).await;
@@ -1551,7 +1551,7 @@ async fn mqtt_pubcomp_before_connect_closes_websocket() {
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(pubcomp_client_packet(1)))
+        .send(Message::Binary((pubcomp_client_packet(1)).into()))
         .await
         .unwrap();
     assert_ws_connection_closed(&mut client).await;
@@ -1568,7 +1568,7 @@ async fn mqtt_disconnect_before_connect_closes_websocket() {
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(disconnect_packet()))
+        .send(Message::Binary((disconnect_packet()).into()))
         .await
         .unwrap();
     assert_ws_connection_closed(&mut client).await;
@@ -2914,11 +2914,11 @@ async fn mqtt_v5_ws_zero_length_client_id_receives_assigned_client_identifier_an
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5_with_properties(
+        .send(Message::Binary((connect_packet_v5_with_properties(
             "",
             true,
             &request_response_information_property(true),
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();

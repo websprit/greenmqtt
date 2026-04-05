@@ -8,8 +8,9 @@ license.workspace = true
 greenmqtt-core = { path = "../greenmqtt-core" }
 bytes.workspace = true
 tonic.workspace = true
-prost = "0.13"
+prost = "0.14.3"
+tonic-prost = "0.14.5"
 
 [build-dependencies]
-protoc-bin-vendored = "3"
-tonic-build = "0.12"
+protoc-bin-vendored = "3.2.0"
+tonic-prost-build = "0.14.5"

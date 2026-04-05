@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
-axum = { version = "0.7", features = ["macros"] }
+axum = { version = "0.8.8", features = ["macros"] }
 greenmqtt-broker = { path = "../greenmqtt-broker" }
 greenmqtt-core = { path = "../greenmqtt-core" }
 greenmqtt-dist = { path = "../greenmqtt-dist" }
@@ -23,5 +23,5 @@ tokio.workspace = true
 
 [dev-dependencies]
 greenmqtt-storage = { path = "../greenmqtt-storage" }
-serde_json = "1"
-tower = { version = "0.5", features = ["util"] }
+serde_json = "1.0.149"
+tower = { version = "0.5.3", features = ["util"] }

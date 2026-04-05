@@ -112,54 +112,54 @@ where
             .route("/metrics", get(super::query::metrics))
             .route("/v1/shards", get(super::query::list_shards))
             .route(
-                "/v1/shards/:kind/:tenant_id/:scope",
+                "/v1/shards/{kind}/{tenant_id}/{scope}",
                 get(super::query::get_shard),
             )
             .route(
-                "/v1/shards/:kind/:tenant_id/:scope/drain",
+                "/v1/shards/{kind}/{tenant_id}/{scope}/drain",
                 post(super::shard::drain_shard),
             )
             .route(
-                "/v1/shards/:kind/:tenant_id/:scope/move",
+                "/v1/shards/{kind}/{tenant_id}/{scope}/move",
                 post(super::shard::move_shard),
             )
             .route(
-                "/v1/shards/:kind/:tenant_id/:scope/catch-up",
+                "/v1/shards/{kind}/{tenant_id}/{scope}/catch-up",
                 post(super::shard::catch_up_shard),
             )
             .route(
-                "/v1/shards/:kind/:tenant_id/:scope/repair",
+                "/v1/shards/{kind}/{tenant_id}/{scope}/repair",
                 post(super::shard::repair_shard),
             )
             .route(
-                "/v1/shards/:kind/:tenant_id/:scope/failover",
+                "/v1/shards/{kind}/{tenant_id}/{scope}/failover",
                 post(super::shard::failover_shard),
             )
             .route("/v1/audit", get(super::admin::list_admin_audit))
             .route(
-                "/v1/tenants/:tenant_id/quota",
+                "/v1/tenants/{tenant_id}/quota",
                 get(super::admin::get_tenant_quota).put(super::admin::put_tenant_quota),
             )
             .route("/v1/peers", get(super::cluster::list_peers))
             .route(
-                "/v1/peers/:node_id",
+                "/v1/peers/{node_id}",
                 put(super::cluster::upsert_peer).delete(super::cluster::delete_peer),
             )
             .route("/v1/sessions", get(super::session::list_sessions))
             .route(
-                "/v1/sessions/:session_id",
+                "/v1/sessions/{session_id}",
                 delete(super::session::disconnect_session),
             )
             .route(
-                "/v1/sessions/:session_id/offline",
+                "/v1/sessions/{session_id}/offline",
                 get(super::session::list_offline_messages),
             )
             .route(
-                "/v1/sessions/:session_id/inflight",
+                "/v1/sessions/{session_id}/inflight",
                 get(super::session::list_inflight_messages),
             )
             .route(
-                "/v1/sessions/:session_id/subscriptions",
+                "/v1/sessions/{session_id}/subscriptions",
                 get(super::session::list_session_subscriptions),
             )
             .route(
@@ -182,7 +182,7 @@ where
                 get(super::session::lookup_session_by_identity),
             )
             .route(
-                "/v1/sessiondict/:session_id",
+                "/v1/sessiondict/{session_id}",
                 get(super::session::lookup_session_by_id)
                     .put(super::session::reassign_sessiondict_record)
                     .delete(super::session::delete_sessiondict_record),
@@ -203,7 +203,7 @@ where
             .route("/v1/publish", post(super::publish::publish))
             .route("/v1/stats", get(super::query::stats))
             .route(
-                "/v1/sessions/:session_id/deliveries",
+                "/v1/sessions/{session_id}/deliveries",
                 get(super::session::drain_deliveries),
             )
             .layer(Extension(peers))

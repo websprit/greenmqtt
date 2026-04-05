@@ -14,7 +14,7 @@ async fn mqtt_ws_connection_limit_rejects_second_client() {
     let ws_url = format!("ws://{}", bind);
     let mut first = connect_ws_with_retry(&ws_url).await.unwrap();
     first
-        .send(Message::Binary(connect_packet("first")))
+        .send(Message::Binary((connect_packet("first")).into()))
         .await
         .unwrap();
     let connack = first.next().await.unwrap().unwrap().into_data();
@@ -70,13 +70,13 @@ async fn mqtt_v5_enhanced_auth_challenge_flow_over_websocket() {
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5_with_auth(
+        .send(Message::Binary((connect_packet_v5_with_auth(
             "ws-enhanced-auth",
             true,
             "custom",
             None,
             &[],
-        )))
+        )).into()))
         .await
         .unwrap();
     let auth = client.next().await.unwrap().unwrap().into_data();
@@ -88,10 +88,10 @@ async fn mqtt_v5_enhanced_auth_challenge_flow_over_websocket() {
     assert_eq!(auth.auth_data.as_deref(), Some(&b"server-challenge"[..]));
 
     client
-        .send(Message::Binary(auth_packet_v5(
+        .send(Message::Binary((auth_packet_v5(
             Some("custom"),
             Some(b"client-response"),
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
@@ -138,13 +138,13 @@ async fn mqtt_v5_reauth_challenge_flow_over_websocket() {
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5_with_auth(
+        .send(Message::Binary((connect_packet_v5_with_auth(
             "ws-reauth-flow",
             true,
             "custom",
             Some(b"client-hello"),
             &[],
-        )))
+        )).into()))
         .await
         .unwrap();
     let auth = client.next().await.unwrap().unwrap().into_data();
@@ -155,10 +155,10 @@ async fn mqtt_v5_reauth_challenge_flow_over_websocket() {
     assert_eq!(auth.reason_code, 0x18);
 
     client
-        .send(Message::Binary(auth_packet_v5(
+        .send(Message::Binary((auth_packet_v5(
             Some("custom"),
             Some(b"client-response"),
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
@@ -169,10 +169,10 @@ async fn mqtt_v5_reauth_challenge_flow_over_websocket() {
     assert_eq!(connack.reason_code, 0x00);
 
     client
-        .send(Message::Binary(auth_packet_v5(
+        .send(Message::Binary((auth_packet_v5(
             Some("custom"),
             Some(b"client-hello"),
-        )))
+        )).into()))
         .await
         .unwrap();
     let auth = client.next().await.unwrap().unwrap().into_data();
@@ -185,11 +185,11 @@ async fn mqtt_v5_reauth_challenge_flow_over_websocket() {
     assert_eq!(auth.auth_data.as_deref(), Some(&b"server-challenge"[..]));
 
     client
-        .send(Message::Binary(auth_packet_v5_with_reason(
+        .send(Message::Binary((auth_packet_v5_with_reason(
             0x00,
             Some("custom"),
             Some(b"client-response"),
-        )))
+        )).into()))
         .await
         .unwrap();
     let auth = client.next().await.unwrap().unwrap().into_data();
@@ -238,17 +238,17 @@ async fn mqtt_v5_reauth_can_start_after_plain_connect_over_websocket() {
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5("ws-plain-reauth")))
+        .send(Message::Binary((connect_packet_v5("ws-plain-reauth")).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(auth_packet_v5(
+        .send(Message::Binary((auth_packet_v5(
             Some("custom"),
             Some(b"client-hello"),
-        )))
+        )).into()))
         .await
         .unwrap();
     let auth = client.next().await.unwrap().unwrap().into_data();
@@ -261,11 +261,11 @@ async fn mqtt_v5_reauth_can_start_after_plain_connect_over_websocket() {
     assert_eq!(auth.auth_data.as_deref(), Some(&b"server-challenge"[..]));
 
     client
-        .send(Message::Binary(auth_packet_v5_with_reason(
+        .send(Message::Binary((auth_packet_v5_with_reason(
             0x00,
             Some("custom"),
             Some(b"client-response"),
-        )))
+        )).into()))
         .await
         .unwrap();
     let auth = client.next().await.unwrap().unwrap().into_data();
@@ -314,20 +314,20 @@ async fn mqtt_v5_auth_success_code_cannot_start_reauth_over_websocket() {
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-invalid-reauth-start",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(auth_packet_v5_with_reason(
+        .send(Message::Binary((auth_packet_v5_with_reason(
             0x00,
             Some("custom"),
             Some(b"client-hello"),
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -378,29 +378,29 @@ async fn mqtt_v5_reauth_bad_method_disconnects_over_websocket() {
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5_with_auth(
+        .send(Message::Binary((connect_packet_v5_with_auth(
             "ws-reauth-bad-method",
             true,
             "custom",
             Some(b"client-hello"),
             &[],
-        )))
+        )).into()))
         .await
         .unwrap();
     let auth = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(auth[0] >> 4, PACKET_TYPE_AUTH);
     client
-        .send(Message::Binary(auth_packet_v5(
+        .send(Message::Binary((auth_packet_v5(
             Some("custom"),
             Some(b"client-response"),
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(auth_packet_v5(Some("other"), None)))
+        .send(Message::Binary((auth_packet_v5(Some("other"), None)).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -439,18 +439,18 @@ async fn mqtt_v5_invalid_auth_reason_code_disconnects_protocol_error_over_websoc
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5("ws-invalid-auth-reason")))
+        .send(Message::Binary((connect_packet_v5("ws-invalid-auth-reason")).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(auth_packet_v5_with_reason(
+        .send(Message::Binary((auth_packet_v5_with_reason(
             0x17,
             Some("custom"),
             Some(b"client-hello"),
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -489,19 +489,19 @@ async fn mqtt_v5_invalid_auth_property_disconnects_protocol_error_over_websocket
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-invalid-auth-property",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(auth_packet_v5_with_properties(
+        .send(Message::Binary((auth_packet_v5_with_properties(
             0x18,
             &receive_maximum_property(10),
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -543,14 +543,14 @@ async fn mqtt_v5_second_connect_disconnects_protocol_error_over_websocket() {
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5("ws-duplicate-connect")))
+        .send(Message::Binary((connect_packet_v5("ws-duplicate-connect")).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(connect_packet_v5("ws-duplicate-connect")))
+        .send(Message::Binary((connect_packet_v5("ws-duplicate-connect")).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -592,16 +592,16 @@ async fn mqtt_v5_malformed_remaining_length_disconnects_protocol_error_over_webs
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-bad-remaining-length",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(malformed_remaining_length_packet()))
+        .send(Message::Binary((malformed_remaining_length_packet()).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -643,14 +643,14 @@ async fn mqtt_v5_invalid_pingreq_flags_disconnects_protocol_error_over_websocket
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5("ws-bad-pingreq-flags")))
+        .send(Message::Binary((connect_packet_v5("ws-bad-pingreq-flags")).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(pingreq_packet_with_flags(0x01)))
+        .send(Message::Binary((pingreq_packet_with_flags(0x01)).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -692,16 +692,16 @@ async fn mqtt_v5_invalid_disconnect_flags_disconnects_protocol_error_over_websoc
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-bad-disconnect-flags",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(disconnect_packet_v5_with_flags(0x01)))
+        .send(Message::Binary((disconnect_packet_v5_with_flags(0x01)).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -743,14 +743,14 @@ async fn mqtt_v5_unexpected_pubrec_disconnects_protocol_error_over_websocket() {
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5("ws-unexpected-pubrec")))
+        .send(Message::Binary((connect_packet_v5("ws-unexpected-pubrec")).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(pubrec_client_packet(7)))
+        .send(Message::Binary((pubrec_client_packet(7)).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -792,14 +792,14 @@ async fn mqtt_v5_unexpected_pubrel_disconnects_protocol_error_over_websocket() {
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5("ws-unexpected-pubrel")))
+        .send(Message::Binary((connect_packet_v5("ws-unexpected-pubrel")).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(pubrel_packet(7)))
+        .send(Message::Binary((pubrel_packet(7)).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -841,14 +841,14 @@ async fn mqtt_v5_unexpected_pubcomp_disconnects_protocol_error_over_websocket() 
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5("ws-unexpected-pubcomp")))
+        .send(Message::Binary((connect_packet_v5("ws-unexpected-pubcomp")).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(pubcomp_client_packet(7)))
+        .send(Message::Binary((pubcomp_client_packet(7)).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -887,9 +887,9 @@ async fn mqtt_v5_duplicate_auth_method_disconnects_protocol_error_over_websocket
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-duplicate-auth-method",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
@@ -898,10 +898,10 @@ async fn mqtt_v5_duplicate_auth_method_disconnects_protocol_error_over_websocket
     let mut properties = auth_method_property("custom");
     properties.extend_from_slice(&auth_method_property("custom"));
     client
-        .send(Message::Binary(auth_packet_v5_with_properties(
+        .send(Message::Binary((auth_packet_v5_with_properties(
             0x18,
             &properties,
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -940,7 +940,7 @@ async fn mqtt_v5_duplicate_auth_data_disconnects_protocol_error_over_websocket()
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5("ws-duplicate-auth-data")))
+        .send(Message::Binary((connect_packet_v5("ws-duplicate-auth-data")).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
@@ -950,10 +950,10 @@ async fn mqtt_v5_duplicate_auth_data_disconnects_protocol_error_over_websocket()
     properties.extend_from_slice(&auth_data_property(b"hello"));
     properties.extend_from_slice(&auth_data_property(b"again"));
     client
-        .send(Message::Binary(auth_packet_v5_with_properties(
+        .send(Message::Binary((auth_packet_v5_with_properties(
             0x18,
             &properties,
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -992,9 +992,9 @@ async fn mqtt_v5_duplicate_auth_reason_string_disconnects_protocol_error_over_we
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-duplicate-auth-reason-string",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
@@ -1004,10 +1004,10 @@ async fn mqtt_v5_duplicate_auth_reason_string_disconnects_protocol_error_over_we
     properties.extend_from_slice(&reason_string_property("first"));
     properties.extend_from_slice(&reason_string_property("second"));
     client
-        .send(Message::Binary(auth_packet_v5_with_properties(
+        .send(Message::Binary((auth_packet_v5_with_properties(
             0x18,
             &properties,
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -1046,20 +1046,20 @@ async fn mqtt_v5_auth_data_without_method_disconnects_protocol_error_over_websoc
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-auth-data-without-method",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(auth_packet_v5_with_reason(
+        .send(Message::Binary((auth_packet_v5_with_reason(
             0x18,
             None,
             Some(b"client-hello"),
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -1098,7 +1098,7 @@ async fn mqtt_v5_invalid_auth_flags_disconnects_protocol_error_over_websocket() 
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5("ws-invalid-auth-flags")))
+        .send(Message::Binary((connect_packet_v5("ws-invalid-auth-flags")).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
@@ -1106,7 +1106,7 @@ async fn mqtt_v5_invalid_auth_flags_disconnects_protocol_error_over_websocket() 
 
     let mut auth = auth_packet_v5(Some("custom"), Some(b"client-hello"));
     auth[0] = (PACKET_TYPE_AUTH << 4) | 0x01;
-    client.send(Message::Binary(auth)).await.unwrap();
+    client.send(Message::Binary((auth).into())).await.unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(disconnect[0] >> 4, PACKET_TYPE_DISCONNECT);
     let mut cursor = 1usize;
@@ -1143,20 +1143,20 @@ async fn mqtt_v5_invalid_subscription_identifier_disconnects_protocol_error_over
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-invalid-subscription-id",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(subscribe_packet_v5_with_properties(
+        .send(Message::Binary((subscribe_packet_v5_with_properties(
             1,
             "devices/+/state",
             &subscription_identifier_property(0),
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -1195,9 +1195,9 @@ async fn mqtt_v5_duplicate_subscription_identifier_disconnects_protocol_error_ov
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-duplicate-subscription-id",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
@@ -1206,11 +1206,11 @@ async fn mqtt_v5_duplicate_subscription_identifier_disconnects_protocol_error_ov
     let mut properties = subscription_identifier_property(7);
     properties.extend_from_slice(&subscription_identifier_property(9));
     client
-        .send(Message::Binary(subscribe_packet_v5_with_properties(
+        .send(Message::Binary((subscribe_packet_v5_with_properties(
             1,
             "devices/+/state",
             &properties,
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -1249,19 +1249,19 @@ async fn mqtt_v5_shared_subscription_with_no_local_disconnects_protocol_error_ov
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5("ws-shared-no-local")))
+        .send(Message::Binary((connect_packet_v5("ws-shared-no-local")).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(subscribe_packet_v5_with_options(
+        .send(Message::Binary((subscribe_packet_v5_with_options(
             1,
             "$share/g1/devices/+/state",
             0b0000_0101,
             &[],
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -1300,21 +1300,21 @@ async fn mqtt_v5_invalid_payload_format_indicator_disconnects_protocol_error_ove
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-invalid-payload-format-indicator",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(publish_packet_v5_qos1_with_properties(
+        .send(Message::Binary((publish_packet_v5_qos1_with_properties(
             1,
             "devices/d1/state",
             b"bad",
             &publish_properties(Some(2), None, None, None, None, &[]),
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -1353,9 +1353,9 @@ async fn mqtt_v5_duplicate_payload_format_indicator_disconnects_protocol_error_o
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-duplicate-payload-format-indicator",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
@@ -1364,12 +1364,12 @@ async fn mqtt_v5_duplicate_payload_format_indicator_disconnects_protocol_error_o
     let mut properties = publish_properties(Some(1), None, None, None, None, &[]);
     properties.extend_from_slice(&publish_properties(Some(1), None, None, None, None, &[]));
     client
-        .send(Message::Binary(publish_packet_v5_qos1_with_properties(
+        .send(Message::Binary((publish_packet_v5_qos1_with_properties(
             1,
             "devices/d1/state",
             b"bad",
             &properties,
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -1408,9 +1408,9 @@ async fn mqtt_v5_duplicate_content_type_disconnects_protocol_error_over_websocke
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-duplicate-content-type",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
@@ -1426,12 +1426,12 @@ async fn mqtt_v5_duplicate_content_type_disconnects_protocol_error_over_websocke
         &[],
     ));
     client
-        .send(Message::Binary(publish_packet_v5_qos1_with_properties(
+        .send(Message::Binary((publish_packet_v5_qos1_with_properties(
             1,
             "devices/d1/state",
             b"bad",
             &properties,
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -1470,9 +1470,9 @@ async fn mqtt_v5_duplicate_message_expiry_interval_disconnects_protocol_error_ov
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-duplicate-message-expiry-interval",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
@@ -1481,12 +1481,12 @@ async fn mqtt_v5_duplicate_message_expiry_interval_disconnects_protocol_error_ov
     let mut properties = publish_properties(None, None, Some(10), None, None, &[]);
     properties.extend_from_slice(&publish_properties(None, None, Some(20), None, None, &[]));
     client
-        .send(Message::Binary(publish_packet_v5_qos1_with_properties(
+        .send(Message::Binary((publish_packet_v5_qos1_with_properties(
             1,
             "devices/d1/state",
             b"bad",
             &properties,
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -1525,9 +1525,9 @@ async fn mqtt_v5_duplicate_response_topic_disconnects_protocol_error_over_websoc
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-duplicate-response-topic",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
@@ -1543,12 +1543,12 @@ async fn mqtt_v5_duplicate_response_topic_disconnects_protocol_error_over_websoc
         &[],
     ));
     client
-        .send(Message::Binary(publish_packet_v5_qos1_with_properties(
+        .send(Message::Binary((publish_packet_v5_qos1_with_properties(
             1,
             "devices/d1/state",
             b"bad",
             &properties,
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -1587,9 +1587,9 @@ async fn mqtt_v5_duplicate_correlation_data_disconnects_protocol_error_over_webs
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-duplicate-correlation-data",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
@@ -1605,12 +1605,12 @@ async fn mqtt_v5_duplicate_correlation_data_disconnects_protocol_error_over_webs
         &[],
     ));
     client
-        .send(Message::Binary(publish_packet_v5_qos1_with_properties(
+        .send(Message::Binary((publish_packet_v5_qos1_with_properties(
             1,
             "devices/d1/state",
             b"bad",
             &properties,
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -1649,18 +1649,18 @@ async fn mqtt_v5_invalid_disconnect_property_disconnects_protocol_error_over_web
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-invalid-disconnect-property",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(disconnect_packet_v5_with_properties(
+        .send(Message::Binary((disconnect_packet_v5_with_properties(
             &receive_maximum_property(10),
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -1699,9 +1699,9 @@ async fn mqtt_v5_invalid_disconnect_reason_code_disconnects_protocol_error_over_
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-invalid-disconnect-reason-code",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
@@ -1709,7 +1709,7 @@ async fn mqtt_v5_invalid_disconnect_reason_code_disconnects_protocol_error_over_
 
     client
         .send(Message::Binary(
-            disconnect_packet_v5_with_reason_and_properties(0x03, &[]),
+            disconnect_packet_v5_with_reason_and_properties(0x03, &[]).into(),
         ))
         .await
         .unwrap();
@@ -1749,9 +1749,9 @@ async fn mqtt_v5_duplicate_disconnect_reason_string_disconnects_protocol_error_o
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-duplicate-disconnect-reason-string",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
@@ -1760,9 +1760,9 @@ async fn mqtt_v5_duplicate_disconnect_reason_string_disconnects_protocol_error_o
     let mut properties = reason_string_property("first");
     properties.extend_from_slice(&reason_string_property("second"));
     client
-        .send(Message::Binary(disconnect_packet_v5_with_properties(
+        .send(Message::Binary((disconnect_packet_v5_with_properties(
             &properties,
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -1801,9 +1801,9 @@ async fn mqtt_v5_invalid_pubrel_flags_disconnects_protocol_error_over_websocket(
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-invalid-pubrel-flags",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
@@ -1811,7 +1811,7 @@ async fn mqtt_v5_invalid_pubrel_flags_disconnects_protocol_error_over_websocket(
 
     let mut packet = pubrel_packet(7);
     packet[0] = 0x60;
-    client.send(Message::Binary(packet)).await.unwrap();
+    client.send(Message::Binary((packet).into())).await.unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(disconnect[0] >> 4, PACKET_TYPE_DISCONNECT);
     let mut cursor = 1usize;
@@ -1848,19 +1848,19 @@ async fn mqtt_v5_invalid_pubrel_property_disconnects_protocol_error_over_websock
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-invalid-pubrel-property",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(pubrel_packet_v5_with_properties(
+        .send(Message::Binary((pubrel_packet_v5_with_properties(
             7,
             &subscription_identifier_property(1),
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -1899,9 +1899,9 @@ async fn mqtt_v5_duplicate_pubrel_property_disconnects_protocol_error_over_webso
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-duplicate-pubrel-property",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
@@ -1910,10 +1910,10 @@ async fn mqtt_v5_duplicate_pubrel_property_disconnects_protocol_error_over_webso
     let mut properties = reason_string_property("first");
     properties.extend_from_slice(&reason_string_property("second"));
     client
-        .send(Message::Binary(pubrel_packet_v5_with_properties(
+        .send(Message::Binary((pubrel_packet_v5_with_properties(
             7,
             &properties,
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -1952,16 +1952,16 @@ async fn mqtt_v5_invalid_puback_flags_disconnects_protocol_error_over_websocket(
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-invalid-puback-flags",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(vec![0x41, 0x02, 0x00, 0x01]))
+        .send(Message::Binary((vec![0x41, 0x02, 0x00, 0x01]).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -2000,16 +2000,16 @@ async fn mqtt_v5_invalid_pubrec_flags_disconnects_protocol_error_over_websocket(
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-invalid-pubrec-flags",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(vec![0x51, 0x02, 0x00, 0x01]))
+        .send(Message::Binary((vec![0x51, 0x02, 0x00, 0x01]).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -2048,16 +2048,16 @@ async fn mqtt_v5_invalid_pubcomp_flags_disconnects_protocol_error_over_websocket
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-invalid-pubcomp-flags",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(vec![0x71, 0x02, 0x00, 0x01]))
+        .send(Message::Binary((vec![0x71, 0x02, 0x00, 0x01]).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -2096,18 +2096,18 @@ async fn mqtt_v5_invalid_puback_reason_code_disconnects_protocol_error_over_webs
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-invalid-puback-reason-code",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(puback_client_packet_v5_with_reason_code(
+        .send(Message::Binary((puback_client_packet_v5_with_reason_code(
             7, 0x02,
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -2146,9 +2146,9 @@ async fn mqtt_v5_puback_properties_without_reason_code_disconnects_protocol_erro
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-puback-properties-without-reason-code",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
@@ -2160,7 +2160,7 @@ async fn mqtt_v5_puback_properties_without_reason_code_disconnects_protocol_erro
     encode_remaining_length(&mut body, properties.len());
     body.extend_from_slice(&properties);
     let packet = crate::mqtt::codec::build_packet(PACKET_TYPE_PUBACK << 4, &body);
-    client.send(Message::Binary(packet)).await.unwrap();
+    client.send(Message::Binary((packet).into())).await.unwrap();
 
     let disconnect = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(disconnect[0] >> 4, PACKET_TYPE_DISCONNECT);
@@ -2198,18 +2198,18 @@ async fn mqtt_v5_invalid_pubrec_reason_code_disconnects_protocol_error_over_webs
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-invalid-pubrec-reason-code",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(pubrec_client_packet_v5_with_reason_code(
+        .send(Message::Binary((pubrec_client_packet_v5_with_reason_code(
             7, 0x02,
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -2248,9 +2248,9 @@ async fn mqtt_v5_pubrec_properties_without_reason_code_disconnects_protocol_erro
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-pubrec-properties-without-reason-code",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
@@ -2262,7 +2262,7 @@ async fn mqtt_v5_pubrec_properties_without_reason_code_disconnects_protocol_erro
     encode_remaining_length(&mut body, properties.len());
     body.extend_from_slice(&properties);
     let packet = crate::mqtt::codec::build_packet(PACKET_TYPE_PUBREC << 4, &body);
-    client.send(Message::Binary(packet)).await.unwrap();
+    client.send(Message::Binary((packet).into())).await.unwrap();
 
     let disconnect = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(disconnect[0] >> 4, PACKET_TYPE_DISCONNECT);
@@ -2300,19 +2300,19 @@ async fn mqtt_v5_invalid_pubrec_property_disconnects_protocol_error_over_websock
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-invalid-pubrec-property",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(pubrec_client_packet_v5_with_properties(
+        .send(Message::Binary((pubrec_client_packet_v5_with_properties(
             7,
             &subscription_identifier_property(1),
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -2351,9 +2351,9 @@ async fn mqtt_v5_duplicate_pubrec_property_disconnects_protocol_error_over_webso
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-duplicate-pubrec-property",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
@@ -2362,10 +2362,10 @@ async fn mqtt_v5_duplicate_pubrec_property_disconnects_protocol_error_over_webso
     let mut properties = reason_string_property("first");
     properties.extend_from_slice(&reason_string_property("second"));
     client
-        .send(Message::Binary(pubrec_client_packet_v5_with_properties(
+        .send(Message::Binary((pubrec_client_packet_v5_with_properties(
             7,
             &properties,
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -2404,16 +2404,16 @@ async fn mqtt_v5_invalid_pubrel_reason_code_disconnects_protocol_error_over_webs
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-invalid-pubrel-reason-code",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(pubrel_packet_v5_with_reason_code(7, 0x10)))
+        .send(Message::Binary((pubrel_packet_v5_with_reason_code(7, 0x10)).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -2452,9 +2452,9 @@ async fn mqtt_v5_pubrel_properties_without_reason_code_disconnects_protocol_erro
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-pubrel-properties-without-reason-code",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
@@ -2466,7 +2466,7 @@ async fn mqtt_v5_pubrel_properties_without_reason_code_disconnects_protocol_erro
     encode_remaining_length(&mut body, properties.len());
     body.extend_from_slice(&properties);
     let packet = crate::mqtt::codec::build_packet((PACKET_TYPE_PUBREL << 4) | 0b0010, &body);
-    client.send(Message::Binary(packet)).await.unwrap();
+    client.send(Message::Binary((packet).into())).await.unwrap();
 
     let disconnect = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(disconnect[0] >> 4, PACKET_TYPE_DISCONNECT);
@@ -2504,18 +2504,18 @@ async fn mqtt_v5_invalid_pubcomp_reason_code_disconnects_protocol_error_over_web
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-invalid-pubcomp-reason-code",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(pubcomp_client_packet_v5_with_reason_code(
+        .send(Message::Binary((pubcomp_client_packet_v5_with_reason_code(
             7, 0x10,
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -2554,19 +2554,19 @@ async fn mqtt_v5_invalid_puback_property_disconnects_protocol_error_over_websock
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-invalid-puback-property",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(puback_client_packet_v5_with_properties(
+        .send(Message::Binary((puback_client_packet_v5_with_properties(
             7,
             &subscription_identifier_property(1),
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -2605,9 +2605,9 @@ async fn mqtt_v5_duplicate_puback_property_disconnects_protocol_error_over_webso
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-duplicate-puback-property",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
@@ -2616,10 +2616,10 @@ async fn mqtt_v5_duplicate_puback_property_disconnects_protocol_error_over_webso
     let mut properties = reason_string_property("first");
     properties.extend_from_slice(&reason_string_property("second"));
     client
-        .send(Message::Binary(puback_client_packet_v5_with_properties(
+        .send(Message::Binary((puback_client_packet_v5_with_properties(
             7,
             &properties,
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -2658,19 +2658,19 @@ async fn mqtt_v5_invalid_pubcomp_property_disconnects_protocol_error_over_websoc
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-invalid-pubcomp-property",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(pubcomp_client_packet_v5_with_properties(
+        .send(Message::Binary((pubcomp_client_packet_v5_with_properties(
             7,
             &subscription_identifier_property(1),
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -2709,9 +2709,9 @@ async fn mqtt_v5_duplicate_pubcomp_property_disconnects_protocol_error_over_webs
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-duplicate-pubcomp-property",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
@@ -2720,10 +2720,10 @@ async fn mqtt_v5_duplicate_pubcomp_property_disconnects_protocol_error_over_webs
     let mut properties = reason_string_property("first");
     properties.extend_from_slice(&reason_string_property("second"));
     client
-        .send(Message::Binary(pubcomp_client_packet_v5_with_properties(
+        .send(Message::Binary((pubcomp_client_packet_v5_with_properties(
             7,
             &properties,
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -2763,9 +2763,9 @@ async fn mqtt_v5_duplicate_disconnect_session_expiry_interval_disconnects_protoc
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-duplicate-disconnect-session-expiry",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
@@ -2774,9 +2774,9 @@ async fn mqtt_v5_duplicate_disconnect_session_expiry_interval_disconnects_protoc
     let mut properties = session_expiry_interval_property(30);
     properties.extend_from_slice(&session_expiry_interval_property(60));
     client
-        .send(Message::Binary(disconnect_packet_v5_with_properties(
+        .send(Message::Binary((disconnect_packet_v5_with_properties(
             &properties,
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -2815,20 +2815,20 @@ async fn mqtt_v5_invalid_subscribe_property_disconnects_protocol_error_over_webs
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-invalid-subscribe-property",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(subscribe_packet_v5_with_properties(
+        .send(Message::Binary((subscribe_packet_v5_with_properties(
             1,
             "devices/+/state",
             &reason_string_property("bad"),
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -2867,16 +2867,16 @@ async fn mqtt_v5_invalid_subscribe_topic_filter_disconnects_protocol_error_over_
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-invalid-subscribe-topic-filter",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(subscribe_packet_v5(1, "devices/#/state")))
+        .send(Message::Binary((subscribe_packet_v5(1, "devices/#/state")).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -2915,16 +2915,16 @@ async fn mqtt_v5_empty_subscribe_payload_disconnects_protocol_error_over_websock
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-empty-subscribe-payload",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(empty_subscribe_packet_v5(1)))
+        .send(Message::Binary((empty_subscribe_packet_v5(1)).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -2963,16 +2963,16 @@ async fn mqtt_v5_empty_unsubscribe_payload_disconnects_protocol_error_over_webso
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-empty-unsubscribe-payload",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(empty_unsubscribe_packet_v5(1)))
+        .send(Message::Binary((empty_unsubscribe_packet_v5(1)).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -3011,21 +3011,21 @@ async fn mqtt_v5_invalid_subscribe_reserved_bits_disconnects_protocol_error_over
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-invalid-subscribe-reserved-bits",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(subscribe_packet_v5_with_options(
+        .send(Message::Binary((subscribe_packet_v5_with_options(
             1,
             "devices/+/state",
             0b1100_0001,
             &[],
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -3064,9 +3064,9 @@ async fn mqtt_v5_invalid_unsubscribe_flags_disconnects_protocol_error_over_webso
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-invalid-unsubscribe-flags",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
@@ -3074,7 +3074,7 @@ async fn mqtt_v5_invalid_unsubscribe_flags_disconnects_protocol_error_over_webso
 
     let mut packet = unsubscribe_packet(1, "devices/+/state");
     packet[0] = 0xA3;
-    client.send(Message::Binary(packet)).await.unwrap();
+    client.send(Message::Binary((packet).into())).await.unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(disconnect[0] >> 4, PACKET_TYPE_DISCONNECT);
     let mut cursor = 1usize;
@@ -3111,20 +3111,20 @@ async fn mqtt_v5_invalid_unsubscribe_property_disconnects_protocol_error_over_we
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-invalid-unsubscribe-property",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(unsubscribe_packet_v5_with_properties(
+        .send(Message::Binary((unsubscribe_packet_v5_with_properties(
             1,
             "devices/+/state",
             &subscription_identifier_property(7),
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -3163,20 +3163,20 @@ async fn mqtt_v5_invalid_unsubscribe_topic_filter_disconnects_protocol_error_ove
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-invalid-unsubscribe-topic-filter",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(unsubscribe_packet_v5_with_properties(
+        .send(Message::Binary((unsubscribe_packet_v5_with_properties(
             1,
             "$share//devices/+/state",
             &[],
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -3215,19 +3215,19 @@ async fn mqtt_v5_topic_alias_zero_disconnects_protocol_error_over_websocket() {
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5("ws-alias-zero")))
+        .send(Message::Binary((connect_packet_v5("ws-alias-zero")).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(publish_packet_v5_qos1_with_properties(
+        .send(Message::Binary((publish_packet_v5_qos1_with_properties(
             1,
             "devices/d1/state",
             b"bad-alias-zero",
             &topic_alias_property(0),
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -3266,19 +3266,19 @@ async fn mqtt_v5_unknown_topic_alias_disconnects_protocol_error_over_websocket()
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5("ws-alias-unknown")))
+        .send(Message::Binary((connect_packet_v5("ws-alias-unknown")).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(publish_packet_v5_qos1_with_properties(
+        .send(Message::Binary((publish_packet_v5_qos1_with_properties(
             1,
             "",
             b"bad-alias-unknown",
             &topic_alias_property(11),
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -3317,21 +3317,21 @@ async fn mqtt_v5_invalid_retain_handling_disconnects_protocol_error_over_websock
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-invalid-retain-handling",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(subscribe_packet_v5_with_options(
+        .send(Message::Binary((subscribe_packet_v5_with_options(
             1,
             "devices/+/state",
             0b0011_0001,
             &[],
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -3370,21 +3370,21 @@ async fn mqtt_v5_invalid_subscription_qos_disconnects_protocol_error_over_websoc
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-invalid-subscription-qos",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(subscribe_packet_v5_with_options(
+        .send(Message::Binary((subscribe_packet_v5_with_options(
             1,
             "devices/+/state",
             0b0000_0011,
             &[],
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -3423,18 +3423,18 @@ async fn mqtt_v5_invalid_publish_qos_disconnects_protocol_error_over_websocket()
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5("ws-invalid-publish-qos")))
+        .send(Message::Binary((connect_packet_v5("ws-invalid-publish-qos")).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(publish_packet_with_flags(
+        .send(Message::Binary((publish_packet_with_flags(
             0b0110,
             "devices/d1/state",
             b"bad",
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -3473,20 +3473,20 @@ async fn mqtt_v5_invalid_publish_dup_qos0_disconnects_protocol_error_over_websoc
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-invalid-publish-flags",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(publish_packet_with_flags(
+        .send(Message::Binary((publish_packet_with_flags(
             0b1000,
             "devices/d1/state",
             b"bad",
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -3525,9 +3525,9 @@ async fn mqtt_v5_duplicate_publish_topic_alias_disconnects_protocol_error_over_w
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-duplicate-publish-topic-alias",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
@@ -3536,12 +3536,12 @@ async fn mqtt_v5_duplicate_publish_topic_alias_disconnects_protocol_error_over_w
     let mut properties = topic_alias_property(1);
     properties.extend_from_slice(&topic_alias_property(2));
     client
-        .send(Message::Binary(publish_packet_v5_qos1_with_properties(
+        .send(Message::Binary((publish_packet_v5_qos1_with_properties(
             1,
             "devices/d1/state",
             b"bad",
             &properties,
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -3580,21 +3580,21 @@ async fn mqtt_v5_publish_subscription_identifier_disconnects_protocol_error_over
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(connect_packet_v5(
+        .send(Message::Binary((connect_packet_v5(
             "ws-publish-subscription-identifier",
-        )))
+        )).into()))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary(publish_packet_v5_qos1_with_properties(
+        .send(Message::Binary((publish_packet_v5_qos1_with_properties(
             1,
             "devices/d1/state",
             b"bad",
             &subscription_identifier_property(7),
-        )))
+        )).into()))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();

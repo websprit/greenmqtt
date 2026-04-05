@@ -246,7 +246,7 @@ async fn mqtt_subscribe_before_connect_closes_websocket() {
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(subscribe_packet(1, "devices/+/state")))
+        .send(Message::Binary((subscribe_packet(1, "devices/+/state")).into()))
         .await
         .unwrap();
     assert_ws_connection_closed(&mut client).await;
@@ -263,7 +263,7 @@ async fn mqtt_unsubscribe_before_connect_closes_websocket() {
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary(unsubscribe_packet(1, "devices/+/state")))
+        .send(Message::Binary((unsubscribe_packet(1, "devices/+/state")).into()))
         .await
         .unwrap();
     assert_ws_connection_closed(&mut client).await;

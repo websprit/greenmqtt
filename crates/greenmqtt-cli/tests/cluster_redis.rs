@@ -4,6 +4,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -12,6 +13,11 @@ struct PeerSummary {
     node_id: u64,
     rpc_addr: Option<String>,
     connected: bool,
+}
+
+fn cluster_test_guard() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
 }
 
 #[derive(Debug)]
@@ -36,6 +42,7 @@ fn assert_cluster_bench_timings(report: &ClusterBenchReport) {
 
 #[test]
 fn cluster_redis_cross_node_online_delivery() {
+    let _guard = cluster_test_guard();
     let redis = RedisServer::start();
     let ports = reserve_unique_addrs(6);
     let node1 = BrokerNode::start(1, &redis.url, None, ports[0], ports[1], ports[2]);
@@ -75,6 +82,7 @@ fn cluster_redis_cross_node_online_delivery() {
 
 #[test]
 fn cluster_redis_dynamic_peer_upsert_enables_cross_node_delivery() {
+    let _guard = cluster_test_guard();
     let redis = RedisServer::start();
     let ports = reserve_unique_addrs(6);
     let node1 = BrokerNode::start(1, &redis.url, None, ports[0], ports[1], ports[2]);
@@ -167,6 +175,7 @@ fn cluster_redis_dynamic_peer_upsert_enables_cross_node_delivery() {
 
 #[test]
 fn cluster_redis_dynamic_peer_delete_falls_back_to_offline_replay() {
+    let _guard = cluster_test_guard();
     let redis = RedisServer::start();
     let ports = reserve_unique_addrs(8);
     let node1 = BrokerNode::start(1, &redis.url, None, ports[0], ports[1], ports[2]);
@@ -242,6 +251,7 @@ fn cluster_redis_dynamic_peer_delete_falls_back_to_offline_replay() {
 
 #[test]
 fn cluster_redis_dynamic_peer_reupsert_restores_live_forwarding() {
+    let _guard = cluster_test_guard();
     let redis = RedisServer::start();
     let ports = reserve_unique_addrs(8);
     let node1 = BrokerNode::start(1, &redis.url, None, ports[0], ports[1], ports[2]);
@@ -323,6 +333,7 @@ fn cluster_redis_dynamic_peer_reupsert_restores_live_forwarding() {
 
 #[test]
 fn cluster_redis_dynamic_peer_restores_after_restart_from_audit_log() {
+    let _guard = cluster_test_guard();
     let redis = RedisServer::start();
     let ports = reserve_unique_addrs(8);
     let data_dir = temp_data_dir("cluster-peer-restore");
@@ -407,6 +418,7 @@ fn cluster_redis_dynamic_peer_restores_after_restart_from_audit_log() {
 
 #[test]
 fn cluster_redis_sessiondict_reassign_moves_offline_replay_to_new_node() {
+    let _guard = cluster_test_guard();
     let redis = RedisServer::start();
     let ports = reserve_unique_addrs(6);
     let node1 = BrokerNode::start(1, &redis.url, None, ports[0], ports[1], ports[2]);
@@ -489,6 +501,7 @@ fn cluster_redis_sessiondict_reassign_moves_offline_replay_to_new_node() {
 #[test]
 #[ignore = "flaky cross-node soak timing on local redis-backed cluster runs"]
 fn cluster_redis_soak_leaves_no_residual_state() {
+    let _guard = cluster_test_guard();
     let redis = RedisServer::start();
     let ports = reserve_unique_addrs(6);
     let node1 = BrokerNode::start(1, &redis.url, None, ports[0], ports[1], ports[2]);
@@ -560,6 +573,7 @@ fn cluster_redis_soak_leaves_no_residual_state() {
 
 #[test]
 fn cluster_redis_cross_node_bench_meets_delivery_thresholds() {
+    let _guard = cluster_test_guard();
     let subscribers = env_usize("GREENMQTT_CLUSTER_BENCH_SUBSCRIBERS", 10);
     let messages = env_usize("GREENMQTT_CLUSTER_BENCH_MESSAGES", 20);
     let qos = env_u8("GREENMQTT_CLUSTER_BENCH_QOS", 0);
@@ -583,6 +597,7 @@ fn cluster_redis_cross_node_bench_meets_delivery_thresholds() {
 
 #[test]
 fn cluster_redis_cross_node_shared_bench_meets_delivery_thresholds() {
+    let _guard = cluster_test_guard();
     let report = run_cluster_bench(10, 20, 1, "shared_live", 10.0, 134_217_728);
     assert_eq!(report.scenario, "shared_live");
     assert_eq!(report.deliveries, 20);
@@ -591,6 +606,7 @@ fn cluster_redis_cross_node_shared_bench_meets_delivery_thresholds() {
 
 #[test]
 fn cluster_redis_cross_node_offline_replay_bench_meets_delivery_thresholds() {
+    let _guard = cluster_test_guard();
     let report = run_cluster_bench(10, 20, 1, "offline_replay", 50.0, 134_217_728);
     assert_eq!(report.scenario, "offline_replay");
     assert_eq!(report.deliveries, 200);
@@ -855,6 +871,7 @@ fn acknowledge_publish(stream: &mut TcpStream, publish: &PublishFrame, context: 
 
 #[test]
 fn cluster_redis_cross_node_qos1_delivery_and_puback_flow() {
+    let _guard = cluster_test_guard();
     let redis = RedisServer::start();
     let ports = reserve_unique_addrs(6);
     let node1 = BrokerNode::start(1, &redis.url, None, ports[0], ports[1], ports[2]);
@@ -910,6 +927,7 @@ fn cluster_redis_cross_node_qos1_delivery_and_puback_flow() {
 
 #[test]
 fn cluster_redis_cross_node_qos2_delivery_and_pubrel_flow() {
+    let _guard = cluster_test_guard();
     let redis = RedisServer::start();
     let ports = reserve_unique_addrs(6);
     let node1 = BrokerNode::start(1, &redis.url, None, ports[0], ports[1], ports[2]);
@@ -979,6 +997,7 @@ fn cluster_redis_cross_node_qos2_delivery_and_pubrel_flow() {
 
 #[test]
 fn cluster_redis_failover_falls_back_to_offline_and_recovers_on_reconnect() {
+    let _guard = cluster_test_guard();
     let redis = RedisServer::start();
     let ports = reserve_unique_addrs(6);
     let mut node1 = BrokerNode::start(1, &redis.url, None, ports[0], ports[1], ports[2]);
@@ -1026,6 +1045,7 @@ fn cluster_redis_failover_falls_back_to_offline_and_recovers_on_reconnect() {
 
 #[test]
 fn cluster_redis_repeated_failover_replays_without_offline_leak() {
+    let _guard = cluster_test_guard();
     let redis = RedisServer::start();
     let ports = reserve_unique_addrs(6);
     let iterations = env_usize("GREENMQTT_CLUSTER_FAILOVER_SOAK_ITERATIONS", 3);
