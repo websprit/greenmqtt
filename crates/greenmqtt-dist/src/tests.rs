@@ -1,13 +1,65 @@
 use crate::dist::{
     dist_route_shard, dist_tenant_shard, insert_tenant_route, DistHandle, DistRouter,
-    PersistentDistHandle, TenantRoutes,
+    PersistentDistHandle, ReplicatedDistHandle, TenantRoutes,
 };
 use crate::trie::select_routes;
 use async_trait::async_trait;
-use greenmqtt_core::{RouteRecord, ServiceShardKey, SessionKind};
+use bytes::Bytes;
+use greenmqtt_core::{
+    RangeBoundary, RangeReplica, ReplicaRole, ReplicaSyncState, ReplicatedRangeDescriptor,
+    RouteRecord, ServiceShardKey, ServiceShardLifecycle, SessionKind,
+};
+use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter, MemoryKvRangeRouter};
+use greenmqtt_kv_engine::{
+    KvEngine, KvMutation, KvRangeBootstrap, KvRangeCheckpoint, KvRangeSnapshot, MemoryKvEngine,
+};
 use greenmqtt_storage::{MemoryRouteStore, RouteStore};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+
+#[derive(Clone)]
+struct LocalKvRangeExecutor {
+    engine: MemoryKvEngine,
+}
+
+#[async_trait]
+impl KvRangeExecutor for LocalKvRangeExecutor {
+    async fn get(&self, range_id: &str, key: &[u8]) -> anyhow::Result<Option<Bytes>> {
+        let range = self.engine.open_range(range_id).await?;
+        range.reader().get(key).await
+    }
+
+    async fn scan(
+        &self,
+        range_id: &str,
+        boundary: Option<RangeBoundary>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
+        let range = self.engine.open_range(range_id).await?;
+        range.reader()
+            .scan(&boundary.unwrap_or_else(RangeBoundary::full), limit)
+            .await
+    }
+
+    async fn apply(&self, range_id: &str, mutations: Vec<KvMutation>) -> anyhow::Result<()> {
+        let range = self.engine.open_range(range_id).await?;
+        range.writer().apply(mutations).await
+    }
+
+    async fn checkpoint(
+        &self,
+        range_id: &str,
+        checkpoint_id: &str,
+    ) -> anyhow::Result<KvRangeCheckpoint> {
+        let range = self.engine.open_range(range_id).await?;
+        range.checkpoint(checkpoint_id).await
+    }
+
+    async fn snapshot(&self, range_id: &str) -> anyhow::Result<KvRangeSnapshot> {
+        let range = self.engine.open_range(range_id).await?;
+        range.snapshot().await
+    }
+}
 
 #[tokio::test]
 async fn shared_subscription_selects_one_route() {
@@ -512,6 +564,111 @@ async fn dist_handle_topic_filter_shared_routes_use_direct_index() {
             .unwrap(),
         2
     );
+    assert_eq!(dist.route_count().await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn replicated_dist_routes_and_matches_topics_over_kv_ranges() {
+    let engine = MemoryKvEngine::default();
+    engine
+        .bootstrap(KvRangeBootstrap {
+            range_id: "dist-range-a".into(),
+            boundary: RangeBoundary::new(Some(b"a".to_vec()), Some(b"m".to_vec())),
+        })
+        .await
+        .unwrap();
+    engine
+        .bootstrap(KvRangeBootstrap {
+            range_id: "dist-range-b".into(),
+            boundary: RangeBoundary::new(Some(b"m".to_vec()), Some(b"z".to_vec())),
+        })
+        .await
+        .unwrap();
+
+    let router = Arc::new(MemoryKvRangeRouter::default());
+    let shard = dist_tenant_shard("t1");
+    router
+        .upsert(ReplicatedRangeDescriptor::new(
+            "dist-range-a",
+            shard.clone(),
+            RangeBoundary::new(Some(b"a".to_vec()), Some(b"m".to_vec())),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ))
+        .await
+        .unwrap();
+    router
+        .upsert(ReplicatedRangeDescriptor::new(
+            "dist-range-b",
+            shard,
+            RangeBoundary::new(Some(b"m".to_vec()), Some(b"z".to_vec())),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ))
+        .await
+        .unwrap();
+
+    let dist = ReplicatedDistHandle::new(
+        router,
+        Arc::new(LocalKvRangeExecutor {
+            engine: engine.clone(),
+        }),
+    );
+    dist.add_route(RouteRecord {
+        tenant_id: "t1".into(),
+        topic_filter: "alerts/door".into(),
+        session_id: "s1".into(),
+        node_id: 1,
+        subscription_identifier: None,
+        no_local: false,
+        retain_as_published: false,
+        shared_group: None,
+        kind: SessionKind::Persistent,
+    })
+    .await
+    .unwrap();
+    dist.add_route(RouteRecord {
+        tenant_id: "t1".into(),
+        topic_filter: "metrics/#".into(),
+        session_id: "s2".into(),
+        node_id: 2,
+        subscription_identifier: None,
+        no_local: false,
+        retain_as_published: false,
+        shared_group: None,
+        kind: SessionKind::Persistent,
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(dist.route_count().await.unwrap(), 2);
+    assert_eq!(dist.list_session_routes("s1").await.unwrap().len(), 1);
+    assert_eq!(
+        dist.match_topic("t1", &"metrics/cpu".into())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(dist.remove_session_routes("s1").await.unwrap(), 1);
     assert_eq!(dist.route_count().await.unwrap(), 1);
 }
 

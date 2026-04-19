@@ -12,6 +12,7 @@ greenmqtt-core = { path = "../greenmqtt-core" }
 greenmqtt-dist = { path = "../greenmqtt-dist" }
 greenmqtt-http-api = { path = "../greenmqtt-http-api" }
 greenmqtt-inbox = { path = "../greenmqtt-inbox" }
+greenmqtt-kv-client = { path = "../greenmqtt-kv-client" }
 greenmqtt-retain = { path = "../greenmqtt-retain" }
 greenmqtt-rpc = { path = "../greenmqtt-rpc" }
 greenmqtt-sessiondict = { path = "../greenmqtt-sessiondict" }

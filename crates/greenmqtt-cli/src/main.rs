@@ -12,6 +12,7 @@ use greenmqtt_core::{
 use greenmqtt_dist::{DistHandle, DistRouter, PersistentDistHandle};
 use greenmqtt_http_api::HttpApi;
 use greenmqtt_inbox::{InboxHandle, InboxService, PersistentInboxHandle};
+use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter};
 use greenmqtt_plugin_api::{
     current_listener_profile, AclAction, AclDecision, AclProvider, AclRule, AuthProvider,
     BridgeEventHook, BridgeRule, ConfiguredAcl, ConfiguredAuth, ConfiguredEventHook, EventHook,
@@ -19,10 +20,10 @@ use greenmqtt_plugin_api::{
     StaticAclProvider, StaticAuthProvider, StaticEnhancedAuthProvider, TopicRewriteEventHook,
     TopicRewriteRule, WebHookConfig, WebHookEventHook, BRIDGE_CLIENT_ID_PREFIX,
 };
-use greenmqtt_retain::{PersistentRetainHandle, RetainHandle, RetainService};
+use greenmqtt_retain::{PersistentRetainHandle, ReplicatedRetainHandle, RetainHandle, RetainService};
 use greenmqtt_rpc::{
-    DistGrpcClient, InboxGrpcClient, RetainGrpcClient, RpcRuntime, SessionDictGrpcClient,
-    StaticPeerForwarder, StaticServiceEndpointRegistry,
+    DistGrpcClient, InboxGrpcClient, KvRangeGrpcClient, MetadataGrpcClient, RetainGrpcClient,
+    RpcRuntime, SessionDictGrpcClient, StaticPeerForwarder, StaticServiceEndpointRegistry,
 };
 use greenmqtt_sessiondict::{PersistentSessionDictHandle, SessionDictHandle, SessionDirectory};
 use greenmqtt_storage::{
@@ -663,7 +664,7 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
     let output_mode = output_mode();
 
-    let (sessiondict, dist, inbox, retain): AppStateServices = match state_endpoint.as_deref() {
+    let (sessiondict, dist, inbox, default_retain): AppStateServices = match state_endpoint.as_deref() {
         Some(endpoint) => (
             Arc::new(SessionDictGrpcClient::connect(endpoint).await?),
             Arc::new(DistGrpcClient::connect(endpoint).await?),
@@ -686,6 +687,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     };
+    let retain = configured_retain_service(default_retain, state_endpoint.as_deref()).await?;
 
     let tcp_listeners = if mode == "serve" {
         listener_specs_from_env(
@@ -931,6 +933,7 @@ async fn main() -> anyhow::Result<()> {
             retain: broker.retain.clone(),
             peer_sink: broker.clone(),
             assignment_registry: Some(shard_registry),
+            range_host: None,
         };
         let mut tasks = JoinSet::new();
         tasks.spawn(async move { http.start().await });
@@ -2640,6 +2643,44 @@ async fn redis_services(
         )),
         Arc::new(PersistentRetainHandle::open(retain_store)),
     ))
+}
+
+async fn configured_retain_service(
+    default_retain: Arc<dyn RetainService>,
+    state_endpoint: Option<&str>,
+) -> anyhow::Result<Arc<dyn RetainService>> {
+    let mode = std::env::var("GREENMQTT_RETAIN_MODE")
+        .unwrap_or_else(|_| "legacy".to_string())
+        .to_lowercase();
+    match mode.as_str() {
+        "legacy" => Ok(default_retain),
+        "replicated" => {
+            let metadata_endpoint = std::env::var("GREENMQTT_METADATA_ENDPOINT")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| state_endpoint.map(ToString::to_string))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "replicated retain mode requires GREENMQTT_METADATA_ENDPOINT or GREENMQTT_STATE_ENDPOINT"
+                    )
+                })?;
+            let range_endpoint = std::env::var("GREENMQTT_RANGE_ENDPOINT")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| state_endpoint.map(ToString::to_string))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "replicated retain mode requires GREENMQTT_RANGE_ENDPOINT or GREENMQTT_STATE_ENDPOINT"
+                    )
+                })?;
+            let router: Arc<dyn KvRangeRouter> =
+                Arc::new(MetadataGrpcClient::connect(metadata_endpoint).await?);
+            let executor: Arc<dyn KvRangeExecutor> =
+                Arc::new(KvRangeGrpcClient::connect(range_endpoint).await?);
+            Ok(Arc::new(ReplicatedRetainHandle::new(router, executor)))
+        }
+        other => anyhow::bail!("unsupported GREENMQTT_RETAIN_MODE: {other}"),
+    }
 }
 
 fn compare_data_dir(backend: &str) -> PathBuf {

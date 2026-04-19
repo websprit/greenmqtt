@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub type TenantId = String;
@@ -10,6 +10,7 @@ pub type TopicFilter = String;
 pub type TopicName = String;
 pub type SessionId = String;
 pub type NodeId = u64;
+pub type RangeId = String;
 pub type SharedPayload = Bytes;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -182,6 +183,228 @@ impl ServiceShardAssignment {
             && self.epoch == other.epoch
             && self.fencing_token == other.fencing_token
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RangeBoundary {
+    #[serde(default)]
+    pub start_key: Option<Vec<u8>>,
+    #[serde(default)]
+    pub end_key: Option<Vec<u8>>,
+}
+
+impl RangeBoundary {
+    pub fn full() -> Self {
+        Self {
+            start_key: None,
+            end_key: None,
+        }
+    }
+
+    pub fn new(start_key: Option<Vec<u8>>, end_key: Option<Vec<u8>>) -> Self {
+        Self { start_key, end_key }
+    }
+
+    pub fn contains(&self, key: &[u8]) -> bool {
+        let lower_ok = self
+            .start_key
+            .as_deref()
+            .is_none_or(|start_key| key >= start_key);
+        let upper_ok = self
+            .end_key
+            .as_deref()
+            .is_none_or(|end_key| key < end_key);
+        lower_ok && upper_ok
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ReplicaRole {
+    Voter,
+    Learner,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ReplicaSyncState {
+    Probing,
+    Snapshotting,
+    Replicating,
+    Offline,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RangeReplica {
+    pub node_id: NodeId,
+    pub role: ReplicaRole,
+    pub sync_state: ReplicaSyncState,
+}
+
+impl RangeReplica {
+    pub fn new(node_id: NodeId, role: ReplicaRole, sync_state: ReplicaSyncState) -> Self {
+        Self {
+            node_id,
+            role,
+            sync_state,
+        }
+    }
+
+    pub fn is_query_ready(&self) -> bool {
+        self.sync_state == ReplicaSyncState::Replicating
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplicatedRangeDescriptor {
+    pub id: RangeId,
+    pub shard: ServiceShardKey,
+    pub boundary: RangeBoundary,
+    pub epoch: u64,
+    pub config_version: u64,
+    pub leader_node_id: Option<NodeId>,
+    pub replicas: Vec<RangeReplica>,
+    pub commit_index: u64,
+    pub applied_index: u64,
+    pub lifecycle: ServiceShardLifecycle,
+}
+
+impl ReplicatedRangeDescriptor {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: impl Into<RangeId>,
+        shard: ServiceShardKey,
+        boundary: RangeBoundary,
+        epoch: u64,
+        config_version: u64,
+        leader_node_id: Option<NodeId>,
+        replicas: Vec<RangeReplica>,
+        commit_index: u64,
+        applied_index: u64,
+        lifecycle: ServiceShardLifecycle,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            shard,
+            boundary,
+            epoch,
+            config_version,
+            leader_node_id,
+            replicas,
+            commit_index,
+            applied_index,
+            lifecycle,
+        }
+    }
+
+    pub fn leader_replica(&self) -> Option<&RangeReplica> {
+        let leader_node_id = self.leader_node_id?;
+        self.replicas
+            .iter()
+            .find(|replica| replica.node_id == leader_node_id)
+    }
+
+    pub fn voters(&self) -> Vec<&RangeReplica> {
+        self.replicas
+            .iter()
+            .filter(|replica| replica.role == ReplicaRole::Voter)
+            .collect()
+    }
+
+    pub fn learners(&self) -> Vec<&RangeReplica> {
+        self.replicas
+            .iter()
+            .filter(|replica| replica.role == ReplicaRole::Learner)
+            .collect()
+    }
+
+    pub fn contains_key(&self, key: &[u8]) -> bool {
+        self.boundary.contains(key)
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BalancerState {
+    #[serde(default)]
+    pub disabled: bool,
+    #[serde(default)]
+    pub load_rules: BTreeMap<String, String>,
+}
+
+#[async_trait]
+pub trait ReplicatedRangeRegistry: Send + Sync {
+    async fn upsert_range(
+        &self,
+        descriptor: ReplicatedRangeDescriptor,
+    ) -> anyhow::Result<Option<ReplicatedRangeDescriptor>>;
+
+    async fn resolve_range(
+        &self,
+        range_id: &str,
+    ) -> anyhow::Result<Option<ReplicatedRangeDescriptor>>;
+
+    async fn remove_range(
+        &self,
+        range_id: &str,
+    ) -> anyhow::Result<Option<ReplicatedRangeDescriptor>>;
+
+    async fn list_ranges(
+        &self,
+        shard_kind: Option<ServiceShardKind>,
+    ) -> anyhow::Result<Vec<ReplicatedRangeDescriptor>>;
+
+    async fn list_shard_ranges(
+        &self,
+        shard: &ServiceShardKey,
+    ) -> anyhow::Result<Vec<ReplicatedRangeDescriptor>> {
+        Ok(self
+            .list_ranges(Some(shard.kind.clone()))
+            .await?
+            .into_iter()
+            .filter(|descriptor| descriptor.shard == *shard)
+            .collect())
+    }
+
+    async fn route_range_for_key(
+        &self,
+        shard: &ServiceShardKey,
+        key: &[u8],
+    ) -> anyhow::Result<Option<ReplicatedRangeDescriptor>> {
+        Ok(self
+            .list_shard_ranges(shard)
+            .await?
+            .into_iter()
+            .find(|descriptor| descriptor.contains_key(key)))
+    }
+}
+
+#[async_trait]
+pub trait BalancerStateRegistry: Send + Sync {
+    async fn upsert_balancer_state(
+        &self,
+        balancer_name: &str,
+        state: BalancerState,
+    ) -> anyhow::Result<Option<BalancerState>>;
+
+    async fn resolve_balancer_state(
+        &self,
+        balancer_name: &str,
+    ) -> anyhow::Result<Option<BalancerState>>;
+
+    async fn remove_balancer_state(
+        &self,
+        balancer_name: &str,
+    ) -> anyhow::Result<Option<BalancerState>>;
+
+    async fn list_balancer_states(&self) -> anyhow::Result<BTreeMap<String, BalancerState>>;
+}
+
+pub trait MetadataRegistry:
+    ServiceEndpointRegistry + ReplicatedRangeRegistry + BalancerStateRegistry
+{
+}
+
+impl<T> MetadataRegistry for T where
+    T: ServiceEndpointRegistry + ReplicatedRangeRegistry + BalancerStateRegistry
+{
 }
 
 #[async_trait]
@@ -625,7 +848,8 @@ pub fn dedupe_sessions(routes: &[RouteRecord]) -> BTreeSet<SessionId> {
 mod tests {
     use super::{
         topic_matches, ClientIdentity, CompiledTopicFilter, Delivery, InflightMessage,
-        InflightPhase, OfflineMessage, PublishProperties, PublishRequest, RetainedMessage,
+        InflightPhase, OfflineMessage, PublishProperties, PublishRequest, RangeBoundary,
+        RangeReplica, ReplicaRole, ReplicaSyncState, ReplicatedRangeDescriptor, RetainedMessage,
         ServiceEndpoint, ServiceKind, ServiceShardAssignment, ServiceShardLifecycle, SessionKind,
         SharedPayload,
     };
@@ -843,6 +1067,56 @@ mod tests {
         assert_eq!(failover.kind, crate::ServiceShardTransitionKind::Failover);
         assert_eq!(failover.target_assignment.epoch, 12);
         assert_eq!(failover.target_assignment.fencing_token, 21);
+    }
+
+    #[test]
+    fn range_boundary_contains_keys_with_half_open_semantics() {
+        let boundary = RangeBoundary::new(Some(b"b".to_vec()), Some(b"m".to_vec()));
+        assert!(!boundary.contains(b"a"));
+        assert!(boundary.contains(b"b"));
+        assert!(boundary.contains(b"cat"));
+        assert!(!boundary.contains(b"m"));
+
+        let full = RangeBoundary::full();
+        assert!(full.contains(b""));
+        assert!(full.contains(b"tenant/device"));
+    }
+
+    #[test]
+    fn replicated_range_descriptor_exposes_leader_and_replica_roles() {
+        let shard = crate::ServiceShardKey::retain("tenant-a");
+        let descriptor = ReplicatedRangeDescriptor::new(
+            "retain-range-1",
+            shard,
+            RangeBoundary::new(Some(b"tenant-a/".to_vec()), Some(b"tenant-b/".to_vec())),
+            7,
+            3,
+            Some(2),
+            vec![
+                RangeReplica::new(1, ReplicaRole::Voter, ReplicaSyncState::Replicating),
+                RangeReplica::new(2, ReplicaRole::Voter, ReplicaSyncState::Replicating),
+                RangeReplica::new(3, ReplicaRole::Learner, ReplicaSyncState::Snapshotting),
+            ],
+            42,
+            39,
+            ServiceShardLifecycle::Serving,
+        );
+
+        assert_eq!(descriptor.id, "retain-range-1");
+        assert_eq!(descriptor.epoch, 7);
+        assert_eq!(descriptor.config_version, 3);
+        assert_eq!(descriptor.commit_index, 42);
+        assert_eq!(descriptor.applied_index, 39);
+        assert_eq!(
+            descriptor.leader_replica().map(|replica| replica.node_id),
+            Some(2)
+        );
+        assert_eq!(descriptor.voters().len(), 2);
+        assert_eq!(descriptor.learners().len(), 1);
+        assert!(descriptor.contains_key(b"tenant-a/devices/a"));
+        assert!(!descriptor.contains_key(b"tenant-b/devices/a"));
+        assert!(descriptor.replicas[0].is_query_ready());
+        assert!(!descriptor.replicas[2].is_query_ready());
     }
 
     #[test]

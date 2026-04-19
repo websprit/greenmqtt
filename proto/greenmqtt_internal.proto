@@ -321,6 +321,151 @@ message ShardSnapshotChunk {
   bool done = 4;
 }
 
+message RangeBoundaryRecord {
+  bytes start_key = 1;
+  bytes end_key = 2;
+  bool has_start_key = 3;
+  bool has_end_key = 4;
+}
+
+message RangeReplicaRecord {
+  uint64 node_id = 1;
+  string role = 2;
+  string sync_state = 3;
+}
+
+message ReplicatedRangeRecord {
+  string id = 1;
+  string shard_kind = 2;
+  string tenant_id = 3;
+  string scope = 4;
+  RangeBoundaryRecord boundary = 5;
+  uint64 epoch = 6;
+  uint64 config_version = 7;
+  uint64 leader_node_id = 8;
+  repeated RangeReplicaRecord replicas = 9;
+  uint64 commit_index = 10;
+  uint64 applied_index = 11;
+  string lifecycle = 12;
+}
+
+message RangeUpsertRequest {
+  ReplicatedRangeRecord descriptor = 1;
+}
+
+message RangeRecordReply {
+  ReplicatedRangeRecord descriptor = 1;
+}
+
+message RangeLookupRequest {
+  string range_id = 1;
+}
+
+message RangeListRequest {
+  string shard_kind = 1;
+  string tenant_id = 2;
+  string scope = 3;
+}
+
+message RangeListReply {
+  repeated ReplicatedRangeRecord descriptors = 1;
+}
+
+message RouteRangeRequest {
+  string shard_kind = 1;
+  string tenant_id = 2;
+  string scope = 3;
+  bytes key = 4;
+}
+
+message BalancerStateRecord {
+  bool disabled = 1;
+  map<string, string> load_rules = 2;
+}
+
+message NamedBalancerStateRecord {
+  string name = 1;
+  BalancerStateRecord state = 2;
+}
+
+message BalancerStateUpsertRequest {
+  string name = 1;
+  BalancerStateRecord state = 2;
+}
+
+message BalancerStateUpsertReply {
+  BalancerStateRecord previous = 1;
+}
+
+message BalancerStateRequest {
+  string name = 1;
+}
+
+message BalancerStateReply {
+  BalancerStateRecord state = 1;
+}
+
+message BalancerStateListReply {
+  repeated NamedBalancerStateRecord entries = 1;
+}
+
+message KvEntryRecord {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+message KvMutationRecord {
+  bytes key = 1;
+  bytes value = 2;
+  bool has_value = 3;
+}
+
+message KvRangeGetRequest {
+  string range_id = 1;
+  bytes key = 2;
+}
+
+message KvRangeGetReply {
+  bytes value = 1;
+  bool found = 2;
+}
+
+message KvRangeScanRequest {
+  string range_id = 1;
+  RangeBoundaryRecord boundary = 2;
+  uint32 limit = 3;
+}
+
+message KvRangeScanReply {
+  repeated KvEntryRecord entries = 1;
+}
+
+message KvRangeApplyRequest {
+  string range_id = 1;
+  repeated KvMutationRecord mutations = 2;
+}
+
+message KvRangeCheckpointRequest {
+  string range_id = 1;
+  string checkpoint_id = 2;
+}
+
+message KvRangeCheckpointReply {
+  string range_id = 1;
+  string checkpoint_id = 2;
+  string path = 3;
+}
+
+message KvRangeSnapshotRequest {
+  string range_id = 1;
+}
+
+message KvRangeSnapshotReply {
+  string range_id = 1;
+  RangeBoundaryRecord boundary = 2;
+  string data_path = 3;
+}
+
 service SessionDictService {
   rpc RegisterSession(RegisterSessionRequest) returns (RegisterSessionReply);
   rpc UnregisterSession(UnregisterSessionRequest) returns (RegisterSessionReply);
@@ -372,4 +517,25 @@ service RetainService {
 service BrokerPeerService {
   rpc PushDelivery(PushDeliveryRequest) returns (PushDeliveryReply);
   rpc PushDeliveries(PushDeliveriesRequest) returns (PushDeliveriesReply);
+}
+
+service MetadataService {
+  rpc UpsertRange(RangeUpsertRequest) returns (RangeRecordReply);
+  rpc LookupRange(RangeLookupRequest) returns (RangeRecordReply);
+  rpc RemoveRange(RangeLookupRequest) returns (RangeRecordReply);
+  rpc ListRanges(RangeListRequest) returns (RangeListReply);
+  rpc RouteRange(RouteRangeRequest) returns (RangeRecordReply);
+
+  rpc UpsertBalancerState(BalancerStateUpsertRequest) returns (BalancerStateUpsertReply);
+  rpc LookupBalancerState(BalancerStateRequest) returns (BalancerStateReply);
+  rpc RemoveBalancerState(BalancerStateRequest) returns (BalancerStateReply);
+  rpc ListBalancerStates(.google.protobuf.Empty) returns (BalancerStateListReply);
+}
+
+service KvRangeService {
+  rpc Get(KvRangeGetRequest) returns (KvRangeGetReply);
+  rpc Scan(KvRangeScanRequest) returns (KvRangeScanReply);
+  rpc Apply(KvRangeApplyRequest) returns (.google.protobuf.Empty);
+  rpc Checkpoint(KvRangeCheckpointRequest) returns (KvRangeCheckpointReply);
+  rpc Snapshot(KvRangeSnapshotRequest) returns (KvRangeSnapshotReply);
 }

@@ -4,10 +4,12 @@ pub mod internal {
 
 use bytes::Bytes;
 use greenmqtt_core::{
-    ClientIdentity, Delivery, InflightMessage, InflightPhase, OfflineMessage, PublishProperties,
-    RetainedMessage, RouteRecord, SessionKind, SessionRecord, SharedPayload, Subscription,
-    UserProperty,
+    BalancerState, ClientIdentity, Delivery, InflightMessage, InflightPhase, OfflineMessage,
+    PublishProperties, RangeBoundary, RangeReplica, ReplicaRole, ReplicaSyncState,
+    ReplicatedRangeDescriptor, RetainedMessage, RouteRecord, ServiceShardKey, ServiceShardKind,
+    ServiceShardLifecycle, SessionKind, SessionRecord, SharedPayload, Subscription, UserProperty,
 };
+use greenmqtt_kv_engine::{KvMutation, KvRangeCheckpoint, KvRangeSnapshot};
 use internal as proto;
 
 pub fn to_proto_client_identity(identity: &ClientIdentity) -> proto::ClientIdentity {
@@ -103,6 +105,240 @@ pub fn from_proto_route(route: proto::RouteRecord) -> RouteRecord {
             Some(route.shared_group)
         },
         kind: from_proto_session_kind(&route.kind),
+    }
+}
+
+pub fn to_proto_shard_kind(kind: &ServiceShardKind) -> String {
+    match kind {
+        ServiceShardKind::SessionDict => "sessiondict".to_string(),
+        ServiceShardKind::Inbox => "inbox".to_string(),
+        ServiceShardKind::Inflight => "inflight".to_string(),
+        ServiceShardKind::Dist => "dist".to_string(),
+        ServiceShardKind::Retain => "retain".to_string(),
+    }
+}
+
+pub fn from_proto_shard_kind(kind: &str) -> ServiceShardKind {
+    match kind {
+        "sessiondict" => ServiceShardKind::SessionDict,
+        "inbox" => ServiceShardKind::Inbox,
+        "inflight" => ServiceShardKind::Inflight,
+        "retain" => ServiceShardKind::Retain,
+        _ => ServiceShardKind::Dist,
+    }
+}
+
+pub fn to_proto_shard_lifecycle(lifecycle: &ServiceShardLifecycle) -> String {
+    match lifecycle {
+        ServiceShardLifecycle::Bootstrapping => "bootstrapping".to_string(),
+        ServiceShardLifecycle::Serving => "serving".to_string(),
+        ServiceShardLifecycle::Draining => "draining".to_string(),
+        ServiceShardLifecycle::Recovering => "recovering".to_string(),
+        ServiceShardLifecycle::Offline => "offline".to_string(),
+    }
+}
+
+pub fn from_proto_shard_lifecycle(lifecycle: &str) -> ServiceShardLifecycle {
+    match lifecycle {
+        "bootstrapping" => ServiceShardLifecycle::Bootstrapping,
+        "draining" => ServiceShardLifecycle::Draining,
+        "recovering" => ServiceShardLifecycle::Recovering,
+        "offline" => ServiceShardLifecycle::Offline,
+        _ => ServiceShardLifecycle::Serving,
+    }
+}
+
+pub fn to_proto_replica_role(role: &ReplicaRole) -> String {
+    match role {
+        ReplicaRole::Voter => "voter".to_string(),
+        ReplicaRole::Learner => "learner".to_string(),
+    }
+}
+
+pub fn from_proto_replica_role(role: &str) -> ReplicaRole {
+    match role {
+        "learner" => ReplicaRole::Learner,
+        _ => ReplicaRole::Voter,
+    }
+}
+
+pub fn to_proto_replica_sync_state(state: &ReplicaSyncState) -> String {
+    match state {
+        ReplicaSyncState::Probing => "probing".to_string(),
+        ReplicaSyncState::Snapshotting => "snapshotting".to_string(),
+        ReplicaSyncState::Replicating => "replicating".to_string(),
+        ReplicaSyncState::Offline => "offline".to_string(),
+    }
+}
+
+pub fn from_proto_replica_sync_state(state: &str) -> ReplicaSyncState {
+    match state {
+        "snapshotting" => ReplicaSyncState::Snapshotting,
+        "replicating" => ReplicaSyncState::Replicating,
+        "offline" => ReplicaSyncState::Offline,
+        _ => ReplicaSyncState::Probing,
+    }
+}
+
+pub fn to_proto_range_boundary(boundary: &RangeBoundary) -> proto::RangeBoundaryRecord {
+    proto::RangeBoundaryRecord {
+        start_key: boundary.start_key.clone().unwrap_or_default(),
+        end_key: boundary.end_key.clone().unwrap_or_default(),
+        has_start_key: boundary.start_key.is_some(),
+        has_end_key: boundary.end_key.is_some(),
+    }
+}
+
+pub fn from_proto_range_boundary(boundary: proto::RangeBoundaryRecord) -> RangeBoundary {
+    RangeBoundary::new(
+        boundary.has_start_key.then_some(boundary.start_key),
+        boundary.has_end_key.then_some(boundary.end_key),
+    )
+}
+
+pub fn to_proto_range_replica(replica: &RangeReplica) -> proto::RangeReplicaRecord {
+    proto::RangeReplicaRecord {
+        node_id: replica.node_id,
+        role: to_proto_replica_role(&replica.role),
+        sync_state: to_proto_replica_sync_state(&replica.sync_state),
+    }
+}
+
+pub fn from_proto_range_replica(replica: proto::RangeReplicaRecord) -> RangeReplica {
+    RangeReplica {
+        node_id: replica.node_id,
+        role: from_proto_replica_role(&replica.role),
+        sync_state: from_proto_replica_sync_state(&replica.sync_state),
+    }
+}
+
+pub fn to_proto_replicated_range(
+    descriptor: &ReplicatedRangeDescriptor,
+) -> proto::ReplicatedRangeRecord {
+    proto::ReplicatedRangeRecord {
+        id: descriptor.id.clone(),
+        shard_kind: to_proto_shard_kind(&descriptor.shard.kind),
+        tenant_id: descriptor.shard.tenant_id.clone(),
+        scope: descriptor.shard.scope.clone(),
+        boundary: Some(to_proto_range_boundary(&descriptor.boundary)),
+        epoch: descriptor.epoch,
+        config_version: descriptor.config_version,
+        leader_node_id: descriptor.leader_node_id.unwrap_or_default(),
+        replicas: descriptor.replicas.iter().map(to_proto_range_replica).collect(),
+        commit_index: descriptor.commit_index,
+        applied_index: descriptor.applied_index,
+        lifecycle: to_proto_shard_lifecycle(&descriptor.lifecycle),
+    }
+}
+
+pub fn from_proto_replicated_range(
+    descriptor: proto::ReplicatedRangeRecord,
+) -> ReplicatedRangeDescriptor {
+    ReplicatedRangeDescriptor {
+        id: descriptor.id,
+        shard: ServiceShardKey {
+            kind: from_proto_shard_kind(&descriptor.shard_kind),
+            tenant_id: descriptor.tenant_id,
+            scope: descriptor.scope,
+        },
+        boundary: descriptor
+            .boundary
+            .map(from_proto_range_boundary)
+            .unwrap_or_else(RangeBoundary::full),
+        epoch: descriptor.epoch,
+        config_version: descriptor.config_version,
+        leader_node_id: if descriptor.leader_node_id == 0 {
+            None
+        } else {
+            Some(descriptor.leader_node_id)
+        },
+        replicas: descriptor
+            .replicas
+            .into_iter()
+            .map(from_proto_range_replica)
+            .collect(),
+        commit_index: descriptor.commit_index,
+        applied_index: descriptor.applied_index,
+        lifecycle: from_proto_shard_lifecycle(&descriptor.lifecycle),
+    }
+}
+
+pub fn to_proto_balancer_state(state: &BalancerState) -> proto::BalancerStateRecord {
+    proto::BalancerStateRecord {
+        disabled: state.disabled,
+        load_rules: state.load_rules.clone().into_iter().collect(),
+    }
+}
+
+pub fn from_proto_balancer_state(state: proto::BalancerStateRecord) -> BalancerState {
+    BalancerState {
+        disabled: state.disabled,
+        load_rules: state.load_rules.into_iter().collect(),
+    }
+}
+
+pub fn to_proto_kv_entry(entry: &(Bytes, Bytes)) -> proto::KvEntryRecord {
+    proto::KvEntryRecord {
+        key: entry.0.to_vec(),
+        value: entry.1.to_vec(),
+    }
+}
+
+pub fn from_proto_kv_entry(entry: proto::KvEntryRecord) -> (Bytes, Bytes) {
+    (Bytes::from(entry.key), Bytes::from(entry.value))
+}
+
+pub fn to_proto_kv_mutation(mutation: &KvMutation) -> proto::KvMutationRecord {
+    proto::KvMutationRecord {
+        key: mutation.key.to_vec(),
+        value: mutation.value.clone().unwrap_or_default().to_vec(),
+        has_value: mutation.value.is_some(),
+    }
+}
+
+pub fn from_proto_kv_mutation(mutation: proto::KvMutationRecord) -> KvMutation {
+    KvMutation {
+        key: Bytes::from(mutation.key),
+        value: mutation.has_value.then_some(Bytes::from(mutation.value)),
+    }
+}
+
+pub fn to_proto_kv_range_checkpoint(
+    checkpoint: &KvRangeCheckpoint,
+) -> proto::KvRangeCheckpointReply {
+    proto::KvRangeCheckpointReply {
+        range_id: checkpoint.range_id.clone(),
+        checkpoint_id: checkpoint.checkpoint_id.clone(),
+        path: checkpoint.path.clone(),
+    }
+}
+
+pub fn from_proto_kv_range_checkpoint(
+    checkpoint: proto::KvRangeCheckpointReply,
+) -> KvRangeCheckpoint {
+    KvRangeCheckpoint {
+        range_id: checkpoint.range_id,
+        checkpoint_id: checkpoint.checkpoint_id,
+        path: checkpoint.path,
+    }
+}
+
+pub fn to_proto_kv_range_snapshot(snapshot: &KvRangeSnapshot) -> proto::KvRangeSnapshotReply {
+    proto::KvRangeSnapshotReply {
+        range_id: snapshot.range_id.clone(),
+        boundary: Some(to_proto_range_boundary(&snapshot.boundary)),
+        data_path: snapshot.data_path.clone(),
+    }
+}
+
+pub fn from_proto_kv_range_snapshot(snapshot: proto::KvRangeSnapshotReply) -> KvRangeSnapshot {
+    KvRangeSnapshot {
+        range_id: snapshot.range_id,
+        boundary: snapshot
+            .boundary
+            .map(from_proto_range_boundary)
+            .unwrap_or_else(RangeBoundary::full),
+        data_path: snapshot.data_path,
     }
 }
 

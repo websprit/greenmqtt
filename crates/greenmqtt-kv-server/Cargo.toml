@@ -1,17 +1,16 @@
 [package]
-name = "greenmqtt-proto"
+name = "greenmqtt-kv-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
 greenmqtt-core = { path = "../greenmqtt-core" }
 greenmqtt-kv-engine = { path = "../greenmqtt-kv-engine" }
-bytes.workspace = true
-tonic.workspace = true
-prost = "0.14.3"
-tonic-prost = "0.14.5"
+greenmqtt-kv-raft = { path = "../greenmqtt-kv-raft" }
+serde.workspace = true
 
-[build-dependencies]
-protoc-bin-vendored = "3.2.0"
-tonic-prost-build = "0.14.5"
+[dev-dependencies]
+tokio.workspace = true

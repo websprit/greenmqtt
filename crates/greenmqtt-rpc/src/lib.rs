@@ -2,15 +2,20 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use greenmqtt_broker::{DeliverySink, PeerForwarder, PeerRegistry};
 use greenmqtt_core::{
-    ClientIdentity, ClusterMembershipRegistry, ClusterNodeMembership, Delivery, InflightMessage,
-    NodeId, OfflineMessage, RetainedMessage, RouteRecord, ServiceEndpoint, ServiceEndpointRegistry,
-    ServiceKind, ServiceShardAssignment, ServiceShardKey, ServiceShardKind, ServiceShardLifecycle,
-    ServiceShardRecoveryControl, ServiceShardTransition, ServiceShardTransitionKind, Subscription,
+    BalancerState, BalancerStateRegistry, ClientIdentity, ClusterMembershipRegistry,
+    ClusterNodeMembership, Delivery, InflightMessage, MetadataRegistry, NodeId,
+    OfflineMessage, ReplicatedRangeDescriptor, ReplicatedRangeRegistry, RetainedMessage,
+    RouteRecord, ServiceEndpoint, ServiceEndpointRegistry, ServiceKind, ServiceShardAssignment,
+    ServiceShardKey, ServiceShardKind, ServiceShardLifecycle, ServiceShardRecoveryControl,
+    ServiceShardTransition, ServiceShardTransitionKind, Subscription,
 };
 use greenmqtt_dist::{dist_tenant_shard, DistRouter};
 use greenmqtt_inbox::{
     inbox_session_shard, inbox_tenant_scan_shard, inflight_tenant_scan_shard, InboxService,
 };
+use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter, RangeRoute};
+use greenmqtt_kv_engine::{KvMutation, KvRangeCheckpoint, KvRangeSnapshot};
+use greenmqtt_kv_server::KvRangeHost;
 use greenmqtt_proto::internal::{
     broker_peer_service_client::BrokerPeerServiceClient,
     broker_peer_service_server::{BrokerPeerService, BrokerPeerServiceServer},
@@ -22,6 +27,10 @@ use greenmqtt_proto::internal::{
     retain_service_server::{RetainService, RetainServiceServer},
     session_dict_service_client::SessionDictServiceClient,
     session_dict_service_server::{SessionDictService, SessionDictServiceServer},
+    metadata_service_client::MetadataServiceClient,
+    metadata_service_server::{MetadataService, MetadataServiceServer},
+    kv_range_service_client::KvRangeServiceClient,
+    kv_range_service_server::{KvRangeService, KvRangeServiceServer},
     AddRouteRequest, CountReply, InboxAckInflightRequest, InboxAttachRequest, InboxDetachRequest,
     InboxEnqueueRequest, InboxFetchInflightReply, InboxFetchInflightRequest, InboxFetchReply,
     InboxFetchRequest, InboxListAllSubscriptionsRequest, InboxListMessagesRequest,
@@ -34,13 +43,23 @@ use greenmqtt_proto::internal::{
     PushDeliveriesRequest, PushDeliveryReply, PushDeliveryRequest, RegisterSessionReply,
     RegisterSessionRequest, RemoveRouteRequest, RemoveSessionRoutesReply,
     RemoveSessionRoutesRequest, RetainMatchReply, RetainMatchRequest, RetainWriteRequest,
-    ShardSnapshotChunk, ShardSnapshotRequest, UnregisterSessionRequest,
+    ShardSnapshotChunk, ShardSnapshotRequest, UnregisterSessionRequest, RangeListReply,
+    RangeListRequest, RangeLookupRequest, RangeRecordReply, RangeUpsertRequest,
+    RouteRangeRequest, BalancerStateListReply, BalancerStateReply, BalancerStateRequest,
+    BalancerStateUpsertReply, BalancerStateUpsertRequest, NamedBalancerStateRecord,
+    KvRangeApplyRequest, KvRangeCheckpointRequest, KvRangeGetReply, KvRangeGetRequest,
+    KvRangeScanReply, KvRangeScanRequest, KvRangeSnapshotRequest, KvRangeCheckpointReply,
+    KvRangeSnapshotReply,
 };
 use greenmqtt_proto::{
-    from_proto_client_identity, from_proto_delivery, from_proto_inflight, from_proto_offline,
-    from_proto_retain, from_proto_route, from_proto_session, from_proto_subscription,
-    to_proto_delivery, to_proto_inflight, to_proto_offline, to_proto_retain, to_proto_route,
-    to_proto_session, to_proto_subscription,
+    from_proto_balancer_state, from_proto_client_identity, from_proto_delivery,
+    from_proto_inflight, from_proto_offline, from_proto_replicated_range, from_proto_retain,
+    from_proto_route, from_proto_session, from_proto_shard_kind, from_proto_subscription,
+    from_proto_kv_mutation, from_proto_kv_range_checkpoint, from_proto_kv_range_snapshot,
+    to_proto_balancer_state, to_proto_delivery, to_proto_inflight, to_proto_offline,
+    to_proto_replicated_range, to_proto_retain, to_proto_route, to_proto_session,
+    to_proto_shard_kind, to_proto_subscription, to_proto_kv_entry, to_proto_kv_range_checkpoint,
+    to_proto_kv_range_snapshot,
 };
 use greenmqtt_retain::{retain_tenant_shard, RetainService as RetainStoreService};
 use greenmqtt_sessiondict::{session_identity_shard, SessionDirectory};
@@ -64,7 +83,8 @@ pub struct RpcRuntime {
     pub inbox: Arc<dyn InboxService>,
     pub retain: Arc<dyn RetainStoreService>,
     pub peer_sink: Arc<dyn DeliverySink>,
-    pub assignment_registry: Option<Arc<dyn ServiceEndpointRegistry>>,
+    pub assignment_registry: Option<Arc<dyn MetadataRegistry>>,
+    pub range_host: Option<Arc<dyn KvRangeHost>>,
 }
 
 #[derive(Clone)]
@@ -85,6 +105,16 @@ pub struct InboxGrpcClient {
 #[derive(Clone)]
 pub struct RetainGrpcClient {
     inner: Arc<Mutex<RetainServiceClient<Channel>>>,
+}
+
+#[derive(Clone)]
+pub struct MetadataGrpcClient {
+    inner: Arc<Mutex<MetadataServiceClient<Channel>>>,
+}
+
+#[derive(Clone)]
+pub struct KvRangeGrpcClient {
+    inner: Arc<Mutex<KvRangeServiceClient<Channel>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -115,6 +145,8 @@ pub struct StaticPeerForwarder {
 pub struct DynamicServiceEndpointRegistry {
     assignments: Arc<RwLock<BTreeMap<ServiceShardKey, ServiceShardAssignment>>>,
     members: Arc<RwLock<BTreeMap<NodeId, ClusterNodeMembership>>>,
+    ranges: Arc<RwLock<BTreeMap<String, ReplicatedRangeDescriptor>>>,
+    balancer_states: Arc<RwLock<BTreeMap<String, BalancerState>>>,
 }
 
 #[derive(Clone)]
@@ -137,19 +169,19 @@ pub struct NoopDeliverySink;
 #[derive(Clone)]
 struct SessionDictRpc {
     inner: Arc<dyn SessionDirectory>,
-    assignment_registry: Option<Arc<dyn ServiceEndpointRegistry>>,
+    assignment_registry: Option<Arc<dyn MetadataRegistry>>,
 }
 
 #[derive(Clone)]
 struct DistRpc {
     inner: Arc<dyn DistRouter>,
-    assignment_registry: Option<Arc<dyn ServiceEndpointRegistry>>,
+    assignment_registry: Option<Arc<dyn MetadataRegistry>>,
 }
 
 #[derive(Clone)]
 struct InboxRpc {
     inner: Arc<dyn InboxService>,
-    assignment_registry: Option<Arc<dyn ServiceEndpointRegistry>>,
+    assignment_registry: Option<Arc<dyn MetadataRegistry>>,
 }
 
 #[derive(Clone)]
@@ -160,6 +192,16 @@ struct RetainRpc {
 #[derive(Clone)]
 struct BrokerPeerRpc {
     inner: Arc<dyn DeliverySink>,
+}
+
+#[derive(Clone)]
+struct MetadataRpc {
+    inner: Option<Arc<dyn MetadataRegistry>>,
+}
+
+#[derive(Clone)]
+struct KvRangeRpc {
+    inner: Option<Arc<dyn KvRangeHost>>,
 }
 
 impl SessionDictShardSnapshot {
@@ -324,7 +366,7 @@ fn same_route_identity(left: &RouteRecord, right: &RouteRecord) -> bool {
 }
 
 async fn validate_snapshot_assignment(
-    registry: &Option<Arc<dyn ServiceEndpointRegistry>>,
+    registry: &Option<Arc<dyn MetadataRegistry>>,
     expected: Option<ServiceShardAssignment>,
 ) -> Result<(), Status> {
     let (Some(registry), Some(expected)) = (registry.as_ref(), expected) else {
@@ -902,6 +944,110 @@ impl ServiceEndpointRegistry for DynamicServiceEndpointRegistry {
             .collect();
         assignments.sort_by(|left, right| left.shard.cmp(&right.shard));
         Ok(assignments)
+    }
+}
+
+#[async_trait]
+impl ReplicatedRangeRegistry for DynamicServiceEndpointRegistry {
+    async fn upsert_range(
+        &self,
+        descriptor: ReplicatedRangeDescriptor,
+    ) -> anyhow::Result<Option<ReplicatedRangeDescriptor>> {
+        Ok(self
+            .ranges
+            .write()
+            .expect("service registry poisoned")
+            .insert(descriptor.id.clone(), descriptor))
+    }
+
+    async fn resolve_range(
+        &self,
+        range_id: &str,
+    ) -> anyhow::Result<Option<ReplicatedRangeDescriptor>> {
+        Ok(self
+            .ranges
+            .read()
+            .expect("service registry poisoned")
+            .get(range_id)
+            .cloned())
+    }
+
+    async fn remove_range(
+        &self,
+        range_id: &str,
+    ) -> anyhow::Result<Option<ReplicatedRangeDescriptor>> {
+        Ok(self
+            .ranges
+            .write()
+            .expect("service registry poisoned")
+            .remove(range_id))
+    }
+
+    async fn list_ranges(
+        &self,
+        shard_kind: Option<ServiceShardKind>,
+    ) -> anyhow::Result<Vec<ReplicatedRangeDescriptor>> {
+        let mut ranges: Vec<_> = self
+            .ranges
+            .read()
+            .expect("service registry poisoned")
+            .values()
+            .filter(|descriptor| {
+                shard_kind
+                    .as_ref()
+                    .map(|kind| descriptor.shard.kind == *kind)
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+        ranges.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(ranges)
+    }
+}
+
+#[async_trait]
+impl BalancerStateRegistry for DynamicServiceEndpointRegistry {
+    async fn upsert_balancer_state(
+        &self,
+        balancer_name: &str,
+        state: BalancerState,
+    ) -> anyhow::Result<Option<BalancerState>> {
+        Ok(self
+            .balancer_states
+            .write()
+            .expect("service registry poisoned")
+            .insert(balancer_name.to_string(), state))
+    }
+
+    async fn resolve_balancer_state(
+        &self,
+        balancer_name: &str,
+    ) -> anyhow::Result<Option<BalancerState>> {
+        Ok(self
+            .balancer_states
+            .read()
+            .expect("service registry poisoned")
+            .get(balancer_name)
+            .cloned())
+    }
+
+    async fn remove_balancer_state(
+        &self,
+        balancer_name: &str,
+    ) -> anyhow::Result<Option<BalancerState>> {
+        Ok(self
+            .balancer_states
+            .write()
+            .expect("service registry poisoned")
+            .remove(balancer_name))
+    }
+
+    async fn list_balancer_states(&self) -> anyhow::Result<BTreeMap<String, BalancerState>> {
+        Ok(self
+            .balancer_states
+            .read()
+            .expect("service registry poisoned")
+            .clone())
     }
 }
 
@@ -1737,6 +1883,306 @@ impl RetainGrpcClient {
     }
 }
 
+impl MetadataGrpcClient {
+    pub async fn connect(endpoint: impl Into<String>) -> anyhow::Result<Self> {
+        Ok(Self {
+            inner: Arc::new(Mutex::new(
+                MetadataServiceClient::connect(endpoint.into()).await?,
+            )),
+        })
+    }
+
+    pub async fn upsert_range(
+        &self,
+        descriptor: ReplicatedRangeDescriptor,
+    ) -> anyhow::Result<Option<ReplicatedRangeDescriptor>> {
+        let mut client = self.inner.lock().await;
+        let reply = client
+            .upsert_range(RangeUpsertRequest {
+                descriptor: Some(to_proto_replicated_range(&descriptor)),
+            })
+            .await?
+            .into_inner();
+        Ok(reply.descriptor.map(from_proto_replicated_range))
+    }
+
+    pub async fn lookup_range(
+        &self,
+        range_id: &str,
+    ) -> anyhow::Result<Option<ReplicatedRangeDescriptor>> {
+        let mut client = self.inner.lock().await;
+        let reply = client
+            .lookup_range(RangeLookupRequest {
+                range_id: range_id.to_string(),
+            })
+            .await?
+            .into_inner();
+        Ok(reply.descriptor.map(from_proto_replicated_range))
+    }
+
+    pub async fn remove_range(
+        &self,
+        range_id: &str,
+    ) -> anyhow::Result<Option<ReplicatedRangeDescriptor>> {
+        let mut client = self.inner.lock().await;
+        let reply = client
+            .remove_range(RangeLookupRequest {
+                range_id: range_id.to_string(),
+            })
+            .await?
+            .into_inner();
+        Ok(reply.descriptor.map(from_proto_replicated_range))
+    }
+
+    pub async fn list_ranges(
+        &self,
+        shard_kind: Option<ServiceShardKind>,
+        tenant_id: Option<&str>,
+        scope: Option<&str>,
+    ) -> anyhow::Result<Vec<ReplicatedRangeDescriptor>> {
+        let mut client = self.inner.lock().await;
+        let reply = client
+            .list_ranges(RangeListRequest {
+                shard_kind: shard_kind
+                    .as_ref()
+                    .map(to_proto_shard_kind)
+                    .unwrap_or_default(),
+                tenant_id: tenant_id.unwrap_or_default().to_string(),
+                scope: scope.unwrap_or_default().to_string(),
+            })
+            .await?
+            .into_inner();
+        Ok(reply
+            .descriptors
+            .into_iter()
+            .map(from_proto_replicated_range)
+            .collect())
+    }
+
+    pub async fn route_range(
+        &self,
+        shard: &ServiceShardKey,
+        key: &[u8],
+    ) -> anyhow::Result<Option<ReplicatedRangeDescriptor>> {
+        let mut client = self.inner.lock().await;
+        let reply = client
+            .route_range(RouteRangeRequest {
+                shard_kind: to_proto_shard_kind(&shard.kind),
+                tenant_id: shard.tenant_id.clone(),
+                scope: shard.scope.clone(),
+                key: key.to_vec(),
+            })
+            .await?
+            .into_inner();
+        Ok(reply.descriptor.map(from_proto_replicated_range))
+    }
+
+    pub async fn upsert_balancer_state(
+        &self,
+        name: &str,
+        state: BalancerState,
+    ) -> anyhow::Result<Option<BalancerState>> {
+        let mut client = self.inner.lock().await;
+        let reply = client
+            .upsert_balancer_state(BalancerStateUpsertRequest {
+                name: name.to_string(),
+                state: Some(to_proto_balancer_state(&state)),
+            })
+            .await?
+            .into_inner();
+        Ok(reply.previous.map(from_proto_balancer_state))
+    }
+
+    pub async fn lookup_balancer_state(&self, name: &str) -> anyhow::Result<Option<BalancerState>> {
+        let mut client = self.inner.lock().await;
+        let reply = client
+            .lookup_balancer_state(BalancerStateRequest {
+                name: name.to_string(),
+            })
+            .await?
+            .into_inner();
+        Ok(reply.state.map(from_proto_balancer_state))
+    }
+
+    pub async fn remove_balancer_state(&self, name: &str) -> anyhow::Result<Option<BalancerState>> {
+        let mut client = self.inner.lock().await;
+        let reply = client
+            .remove_balancer_state(BalancerStateRequest {
+                name: name.to_string(),
+            })
+            .await?
+            .into_inner();
+        Ok(reply.state.map(from_proto_balancer_state))
+    }
+
+    pub async fn list_balancer_states(&self) -> anyhow::Result<BTreeMap<String, BalancerState>> {
+        let mut client = self.inner.lock().await;
+        let reply = client
+            .list_balancer_states(())
+            .await?
+            .into_inner();
+        Ok(reply
+            .entries
+            .into_iter()
+            .filter_map(|entry| entry.state.map(|state| (entry.name, from_proto_balancer_state(state))))
+            .collect())
+    }
+}
+
+impl KvRangeGrpcClient {
+    pub async fn connect(endpoint: impl Into<String>) -> anyhow::Result<Self> {
+        Ok(Self {
+            inner: Arc::new(Mutex::new(KvRangeServiceClient::connect(endpoint.into()).await?)),
+        })
+    }
+
+    pub async fn get(&self, range_id: &str, key: &[u8]) -> anyhow::Result<Option<Bytes>> {
+        let mut client = self.inner.lock().await;
+        let reply = client
+            .get(KvRangeGetRequest {
+                range_id: range_id.to_string(),
+                key: key.to_vec(),
+            })
+            .await?
+            .into_inner();
+        Ok(reply.found.then_some(Bytes::from(reply.value)))
+    }
+
+    pub async fn scan(
+        &self,
+        range_id: &str,
+        boundary: Option<greenmqtt_core::RangeBoundary>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
+        let mut client = self.inner.lock().await;
+        let reply = client
+            .scan(KvRangeScanRequest {
+                range_id: range_id.to_string(),
+                boundary: boundary
+                    .as_ref()
+                    .map(greenmqtt_proto::to_proto_range_boundary),
+                limit: limit as u32,
+            })
+            .await?
+            .into_inner();
+        Ok(reply
+            .entries
+            .into_iter()
+            .map(greenmqtt_proto::from_proto_kv_entry)
+            .collect())
+    }
+
+    pub async fn apply(&self, range_id: &str, mutations: Vec<KvMutation>) -> anyhow::Result<()> {
+        let mut client = self.inner.lock().await;
+        client
+            .apply(KvRangeApplyRequest {
+                range_id: range_id.to_string(),
+                mutations: mutations
+                    .iter()
+                    .map(greenmqtt_proto::to_proto_kv_mutation)
+                    .collect(),
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn checkpoint(
+        &self,
+        range_id: &str,
+        checkpoint_id: &str,
+    ) -> anyhow::Result<KvRangeCheckpoint> {
+        let mut client = self.inner.lock().await;
+        let reply = client
+            .checkpoint(KvRangeCheckpointRequest {
+                range_id: range_id.to_string(),
+                checkpoint_id: checkpoint_id.to_string(),
+            })
+            .await?
+            .into_inner();
+        Ok(from_proto_kv_range_checkpoint(reply))
+    }
+
+    pub async fn snapshot(&self, range_id: &str) -> anyhow::Result<KvRangeSnapshot> {
+        let mut client = self.inner.lock().await;
+        let reply = client
+            .snapshot(KvRangeSnapshotRequest {
+                range_id: range_id.to_string(),
+            })
+            .await?
+            .into_inner();
+        Ok(from_proto_kv_range_snapshot(reply))
+    }
+}
+
+#[async_trait]
+impl KvRangeExecutor for KvRangeGrpcClient {
+    async fn get(&self, range_id: &str, key: &[u8]) -> anyhow::Result<Option<Bytes>> {
+        Self::get(self, range_id, key).await
+    }
+
+    async fn scan(
+        &self,
+        range_id: &str,
+        boundary: Option<greenmqtt_core::RangeBoundary>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
+        Self::scan(self, range_id, boundary, limit).await
+    }
+
+    async fn apply(&self, range_id: &str, mutations: Vec<KvMutation>) -> anyhow::Result<()> {
+        Self::apply(self, range_id, mutations).await
+    }
+
+    async fn checkpoint(
+        &self,
+        range_id: &str,
+        checkpoint_id: &str,
+    ) -> anyhow::Result<KvRangeCheckpoint> {
+        Self::checkpoint(self, range_id, checkpoint_id).await
+    }
+
+    async fn snapshot(&self, range_id: &str) -> anyhow::Result<KvRangeSnapshot> {
+        Self::snapshot(self, range_id).await
+    }
+}
+
+#[async_trait]
+impl KvRangeRouter for MetadataGrpcClient {
+    async fn upsert(&self, descriptor: ReplicatedRangeDescriptor) -> anyhow::Result<()> {
+        let _ = self.upsert_range(descriptor).await?;
+        Ok(())
+    }
+
+    async fn remove(&self, range_id: &str) -> anyhow::Result<Option<ReplicatedRangeDescriptor>> {
+        self.remove_range(range_id).await
+    }
+
+    async fn list(&self) -> anyhow::Result<Vec<ReplicatedRangeDescriptor>> {
+        self.list_ranges(None, None, None).await
+    }
+
+    async fn by_id(&self, range_id: &str) -> anyhow::Result<Option<RangeRoute>> {
+        Ok(self.lookup_range(range_id).await?.map(RangeRoute::from_descriptor))
+    }
+
+    async fn route_key(
+        &self,
+        shard: &ServiceShardKey,
+        key: &[u8],
+    ) -> anyhow::Result<Option<RangeRoute>> {
+        Ok(self.route_range(shard, key).await?.map(RangeRoute::from_descriptor))
+    }
+
+    async fn route_shard(&self, shard: &ServiceShardKey) -> anyhow::Result<Vec<RangeRoute>> {
+        Ok(self
+            .list_ranges(Some(shard.kind.clone()), Some(&shard.tenant_id), Some(&shard.scope))
+            .await?
+            .into_iter()
+            .map(RangeRoute::from_descriptor)
+            .collect())
+    }
+}
+
 impl StaticPeerForwarder {
     pub async fn connect_node(
         &self,
@@ -1818,6 +2264,12 @@ impl RpcRuntime {
             .add_service(RetainServiceServer::new(RetainRpc { inner: self.retain }))
             .add_service(BrokerPeerServiceServer::new(BrokerPeerRpc {
                 inner: self.peer_sink,
+            }))
+            .add_service(MetadataServiceServer::new(MetadataRpc {
+                inner: self.assignment_registry.clone(),
+            }))
+            .add_service(KvRangeServiceServer::new(KvRangeRpc {
+                inner: self.range_host.clone(),
             }))
             .serve(bind)
             .await?;
@@ -3024,6 +3476,319 @@ impl BrokerPeerService for BrokerPeerRpc {
         Ok(Response::new(PushDeliveriesReply {
             undelivered_indices,
         }))
+    }
+}
+
+#[tonic::async_trait]
+impl MetadataService for MetadataRpc {
+    async fn upsert_range(
+        &self,
+        request: Request<RangeUpsertRequest>,
+    ) -> Result<Response<RangeRecordReply>, Status> {
+        let registry = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("metadata registry unavailable"))?;
+        let descriptor = request
+            .into_inner()
+            .descriptor
+            .ok_or_else(|| Status::invalid_argument("missing replicated range descriptor"))?;
+        let previous = registry
+            .upsert_range(from_proto_replicated_range(descriptor))
+            .await
+            .map_err(internal_status)?;
+        Ok(Response::new(RangeRecordReply {
+            descriptor: previous.as_ref().map(to_proto_replicated_range),
+        }))
+    }
+
+    async fn lookup_range(
+        &self,
+        request: Request<RangeLookupRequest>,
+    ) -> Result<Response<RangeRecordReply>, Status> {
+        let registry = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("metadata registry unavailable"))?;
+        let descriptor = registry
+            .resolve_range(&request.into_inner().range_id)
+            .await
+            .map_err(internal_status)?;
+        Ok(Response::new(RangeRecordReply {
+            descriptor: descriptor.as_ref().map(to_proto_replicated_range),
+        }))
+    }
+
+    async fn remove_range(
+        &self,
+        request: Request<RangeLookupRequest>,
+    ) -> Result<Response<RangeRecordReply>, Status> {
+        let registry = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("metadata registry unavailable"))?;
+        let descriptor = registry
+            .remove_range(&request.into_inner().range_id)
+            .await
+            .map_err(internal_status)?;
+        Ok(Response::new(RangeRecordReply {
+            descriptor: descriptor.as_ref().map(to_proto_replicated_range),
+        }))
+    }
+
+    async fn list_ranges(
+        &self,
+        request: Request<RangeListRequest>,
+    ) -> Result<Response<RangeListReply>, Status> {
+        let registry = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("metadata registry unavailable"))?;
+        let request = request.into_inner();
+        let shard_kind = if request.shard_kind.is_empty() {
+            None
+        } else {
+            Some(from_proto_shard_kind(&request.shard_kind))
+        };
+        let mut descriptors = registry
+            .list_ranges(shard_kind)
+            .await
+            .map_err(internal_status)?;
+        if !request.tenant_id.is_empty() {
+            descriptors.retain(|descriptor| descriptor.shard.tenant_id == request.tenant_id);
+        }
+        if !request.scope.is_empty() {
+            descriptors.retain(|descriptor| descriptor.shard.scope == request.scope);
+        }
+        Ok(Response::new(RangeListReply {
+            descriptors: descriptors.iter().map(to_proto_replicated_range).collect(),
+        }))
+    }
+
+    async fn route_range(
+        &self,
+        request: Request<RouteRangeRequest>,
+    ) -> Result<Response<RangeRecordReply>, Status> {
+        let registry = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("metadata registry unavailable"))?;
+        let request = request.into_inner();
+        let descriptor = registry
+            .route_range_for_key(
+                &ServiceShardKey {
+                    kind: from_proto_shard_kind(&request.shard_kind),
+                    tenant_id: request.tenant_id,
+                    scope: request.scope,
+                },
+                &request.key,
+            )
+            .await
+            .map_err(internal_status)?;
+        Ok(Response::new(RangeRecordReply {
+            descriptor: descriptor.as_ref().map(to_proto_replicated_range),
+        }))
+    }
+
+    async fn upsert_balancer_state(
+        &self,
+        request: Request<BalancerStateUpsertRequest>,
+    ) -> Result<Response<BalancerStateUpsertReply>, Status> {
+        let registry = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("metadata registry unavailable"))?;
+        let request = request.into_inner();
+        let state = request
+            .state
+            .ok_or_else(|| Status::invalid_argument("missing balancer state"))?;
+        let previous = registry
+            .upsert_balancer_state(&request.name, from_proto_balancer_state(state))
+            .await
+            .map_err(internal_status)?;
+        Ok(Response::new(BalancerStateUpsertReply {
+            previous: previous.as_ref().map(to_proto_balancer_state),
+        }))
+    }
+
+    async fn lookup_balancer_state(
+        &self,
+        request: Request<BalancerStateRequest>,
+    ) -> Result<Response<BalancerStateReply>, Status> {
+        let registry = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("metadata registry unavailable"))?;
+        let state = registry
+            .resolve_balancer_state(&request.into_inner().name)
+            .await
+            .map_err(internal_status)?;
+        Ok(Response::new(BalancerStateReply {
+            state: state.as_ref().map(to_proto_balancer_state),
+        }))
+    }
+
+    async fn remove_balancer_state(
+        &self,
+        request: Request<BalancerStateRequest>,
+    ) -> Result<Response<BalancerStateReply>, Status> {
+        let registry = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("metadata registry unavailable"))?;
+        let state = registry
+            .remove_balancer_state(&request.into_inner().name)
+            .await
+            .map_err(internal_status)?;
+        Ok(Response::new(BalancerStateReply {
+            state: state.as_ref().map(to_proto_balancer_state),
+        }))
+    }
+
+    async fn list_balancer_states(
+        &self,
+        _request: Request<()>,
+    ) -> Result<Response<BalancerStateListReply>, Status> {
+        let registry = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("metadata registry unavailable"))?;
+        let states = registry
+            .list_balancer_states()
+            .await
+            .map_err(internal_status)?;
+        Ok(Response::new(BalancerStateListReply {
+            entries: states
+                .into_iter()
+                .map(|(name, state)| NamedBalancerStateRecord {
+                    name,
+                    state: Some(to_proto_balancer_state(&state)),
+                })
+                .collect(),
+        }))
+    }
+}
+
+#[tonic::async_trait]
+impl KvRangeService for KvRangeRpc {
+    async fn get(
+        &self,
+        request: Request<KvRangeGetRequest>,
+    ) -> Result<Response<KvRangeGetReply>, Status> {
+        let host = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("kv range host unavailable"))?;
+        let request = request.into_inner();
+        let hosted = host
+            .open_range(&request.range_id)
+            .await
+            .map_err(internal_status)?
+            .ok_or_else(|| Status::not_found("range not found"))?;
+        let value = hosted
+            .space
+            .reader()
+            .get(&request.key)
+            .await
+            .map_err(internal_status)?;
+        Ok(Response::new(KvRangeGetReply {
+            value: value.clone().unwrap_or_default().to_vec(),
+            found: value.is_some(),
+        }))
+    }
+
+    async fn scan(
+        &self,
+        request: Request<KvRangeScanRequest>,
+    ) -> Result<Response<KvRangeScanReply>, Status> {
+        let host = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("kv range host unavailable"))?;
+        let request = request.into_inner();
+        let hosted = host
+            .open_range(&request.range_id)
+            .await
+            .map_err(internal_status)?
+            .ok_or_else(|| Status::not_found("range not found"))?;
+        let boundary = request
+            .boundary
+            .map(greenmqtt_proto::from_proto_range_boundary)
+            .unwrap_or_else(greenmqtt_core::RangeBoundary::full);
+        let entries = hosted
+            .space
+            .reader()
+            .scan(&boundary, request.limit as usize)
+            .await
+            .map_err(internal_status)?;
+        Ok(Response::new(KvRangeScanReply {
+            entries: entries.iter().map(to_proto_kv_entry).collect(),
+        }))
+    }
+
+    async fn apply(&self, request: Request<KvRangeApplyRequest>) -> Result<Response<()>, Status> {
+        let host = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("kv range host unavailable"))?;
+        let request = request.into_inner();
+        let hosted = host
+            .open_range(&request.range_id)
+            .await
+            .map_err(internal_status)?
+            .ok_or_else(|| Status::not_found("range not found"))?;
+        let mutations = request
+            .mutations
+            .into_iter()
+            .map(from_proto_kv_mutation)
+            .collect();
+        hosted
+            .space
+            .writer()
+            .apply(mutations)
+            .await
+            .map_err(internal_status)?;
+        Ok(Response::new(()))
+    }
+
+    async fn checkpoint(
+        &self,
+        request: Request<KvRangeCheckpointRequest>,
+    ) -> Result<Response<KvRangeCheckpointReply>, Status> {
+        let host = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("kv range host unavailable"))?;
+        let request = request.into_inner();
+        let hosted = host
+            .open_range(&request.range_id)
+            .await
+            .map_err(internal_status)?
+            .ok_or_else(|| Status::not_found("range not found"))?;
+        let checkpoint = hosted
+            .space
+            .checkpoint(&request.checkpoint_id)
+            .await
+            .map_err(internal_status)?;
+        Ok(Response::new(to_proto_kv_range_checkpoint(&checkpoint)))
+    }
+
+    async fn snapshot(
+        &self,
+        request: Request<KvRangeSnapshotRequest>,
+    ) -> Result<Response<KvRangeSnapshotReply>, Status> {
+        let host = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("kv range host unavailable"))?;
+        let request = request.into_inner();
+        let hosted = host
+            .open_range(&request.range_id)
+            .await
+            .map_err(internal_status)?
+            .ok_or_else(|| Status::not_found("range not found"))?;
+        let snapshot = hosted.space.snapshot().await.map_err(internal_status)?;
+        Ok(Response::new(to_proto_kv_range_snapshot(&snapshot)))
     }
 }
 

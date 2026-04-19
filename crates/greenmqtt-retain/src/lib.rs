@@ -1,5 +1,8 @@
 use async_trait::async_trait;
+use bytes::Bytes;
 use greenmqtt_core::{CompiledTopicFilter, Lifecycle, RetainedMessage, ServiceShardKey};
+use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter};
+use greenmqtt_kv_engine::KvMutation;
 use greenmqtt_storage::RetainStore;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -36,6 +39,12 @@ struct RetainState {
 pub struct PersistentRetainHandle {
     store: Arc<dyn RetainStore>,
     inner: Arc<RwLock<PersistentRetainState>>,
+}
+
+#[derive(Clone)]
+pub struct ReplicatedRetainHandle {
+    router: Arc<dyn KvRangeRouter>,
+    executor: Arc<dyn KvRangeExecutor>,
 }
 
 pub fn retain_tenant_shard(tenant_id: &str) -> ServiceShardKey {
@@ -141,8 +150,26 @@ impl PersistentRetainHandle {
     }
 }
 
+impl ReplicatedRetainHandle {
+    pub fn new(router: Arc<dyn KvRangeRouter>, executor: Arc<dyn KvRangeExecutor>) -> Self {
+        Self { router, executor }
+    }
+}
+
 fn topic_filter_is_exact(topic_filter: &str) -> bool {
     !topic_filter.contains('#') && !topic_filter.contains('+')
+}
+
+fn retained_message_key(topic: &str) -> Bytes {
+    Bytes::copy_from_slice(topic.as_bytes())
+}
+
+fn encode_retained_message(message: &RetainedMessage) -> anyhow::Result<Bytes> {
+    Ok(Bytes::from(bincode::serialize(message)?))
+}
+
+fn decode_retained_message(value: &[u8]) -> anyhow::Result<RetainedMessage> {
+    Ok(bincode::deserialize(value)?)
 }
 
 #[async_trait]
@@ -379,6 +406,100 @@ impl RetainService for PersistentRetainHandle {
 }
 
 #[async_trait]
+impl RetainService for ReplicatedRetainHandle {
+    async fn retain(&self, message: RetainedMessage) -> anyhow::Result<()> {
+        let shard = retain_tenant_shard(&message.tenant_id);
+        let route = self
+            .router
+            .route_key(&shard, message.topic.as_bytes())
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no retain range available for tenant {}", message.tenant_id))?;
+        self.executor
+            .apply(
+                &route.descriptor.id,
+                vec![KvMutation {
+                    key: retained_message_key(&message.topic),
+                    value: if message.payload.is_empty() {
+                        None
+                    } else {
+                        Some(encode_retained_message(&message)?)
+                    },
+                }],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn list_tenant_retained(&self, tenant_id: &str) -> anyhow::Result<Vec<RetainedMessage>> {
+        let shard = retain_tenant_shard(tenant_id);
+        let routes = self.router.route_shard(&shard).await?;
+        let mut retained = Vec::new();
+        for route in routes {
+            for (_, value) in self
+                .executor
+                .scan(&route.descriptor.id, None, usize::MAX)
+                .await?
+            {
+                retained.push(decode_retained_message(&value)?);
+            }
+        }
+        retained.sort_by(|left, right| left.topic.cmp(&right.topic));
+        Ok(retained)
+    }
+
+    async fn lookup_topic(
+        &self,
+        tenant_id: &str,
+        topic: &str,
+    ) -> anyhow::Result<Option<RetainedMessage>> {
+        let shard = retain_tenant_shard(tenant_id);
+        let Some(route) = self.router.route_key(&shard, topic.as_bytes()).await? else {
+            return Ok(None);
+        };
+        self.executor
+            .get(&route.descriptor.id, topic.as_bytes())
+            .await?
+            .map(|value| decode_retained_message(&value))
+            .transpose()
+    }
+
+    async fn match_topic(
+        &self,
+        tenant_id: &str,
+        topic_filter: &str,
+    ) -> anyhow::Result<Vec<RetainedMessage>> {
+        if topic_filter_is_exact(topic_filter) {
+            return Ok(self
+                .lookup_topic(tenant_id, topic_filter)
+                .await?
+                .into_iter()
+                .collect());
+        }
+        let compiled = CompiledTopicFilter::new(topic_filter);
+        Ok(self
+            .list_tenant_retained(tenant_id)
+            .await?
+            .into_iter()
+            .filter(|message| compiled.matches(&message.topic))
+            .collect())
+    }
+
+    async fn retained_count(&self) -> anyhow::Result<usize> {
+        let mut total = 0usize;
+        for descriptor in self.router.list().await? {
+            if descriptor.shard.kind == greenmqtt_core::ServiceShardKind::Retain {
+                total += self
+                    .executor
+                    .scan(&descriptor.id, None, usize::MAX)
+                    .await?
+                    .len();
+            }
+        }
+        Ok(total)
+    }
+}
+
+#[async_trait]
 impl Lifecycle for RetainHandle {
     async fn start(&self) -> anyhow::Result<()> {
         Ok(())
@@ -403,14 +524,66 @@ impl Lifecycle for PersistentRetainHandle {
 #[cfg(test)]
 mod tests {
     use super::{
-        retain_tenant_shard, retained_message_shard, PersistentRetainHandle, RetainHandle,
-        RetainService,
+        retain_tenant_shard, retained_message_shard, PersistentRetainHandle, ReplicatedRetainHandle,
+        RetainHandle, RetainService,
     };
     use async_trait::async_trait;
-    use greenmqtt_core::{RetainedMessage, ServiceShardKey};
+    use bytes::Bytes;
+    use greenmqtt_core::{
+        RangeBoundary, RangeReplica, ReplicaRole, ReplicaSyncState, ReplicatedRangeDescriptor,
+        RetainedMessage, ServiceShardKey, ServiceShardLifecycle,
+    };
+    use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter, MemoryKvRangeRouter};
+    use greenmqtt_kv_engine::{
+        KvEngine, KvMutation, KvRangeBootstrap, KvRangeCheckpoint, KvRangeSnapshot, MemoryKvEngine,
+    };
     use greenmqtt_storage::{MemoryRetainStore, RetainStore};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[derive(Clone)]
+    struct LocalKvRangeExecutor {
+        engine: MemoryKvEngine,
+    }
+
+    #[async_trait]
+    impl KvRangeExecutor for LocalKvRangeExecutor {
+        async fn get(&self, range_id: &str, key: &[u8]) -> anyhow::Result<Option<Bytes>> {
+            let range = self.engine.open_range(range_id).await?;
+            range.reader().get(key).await
+        }
+
+        async fn scan(
+            &self,
+            range_id: &str,
+            boundary: Option<RangeBoundary>,
+            limit: usize,
+        ) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
+            let range = self.engine.open_range(range_id).await?;
+            range.reader()
+                .scan(&boundary.unwrap_or_else(RangeBoundary::full), limit)
+                .await
+        }
+
+        async fn apply(&self, range_id: &str, mutations: Vec<KvMutation>) -> anyhow::Result<()> {
+            let range = self.engine.open_range(range_id).await?;
+            range.writer().apply(mutations).await
+        }
+
+        async fn checkpoint(
+            &self,
+            range_id: &str,
+            checkpoint_id: &str,
+        ) -> anyhow::Result<KvRangeCheckpoint> {
+            let range = self.engine.open_range(range_id).await?;
+            range.checkpoint(checkpoint_id).await
+        }
+
+        async fn snapshot(&self, range_id: &str) -> anyhow::Result<KvRangeSnapshot> {
+            let range = self.engine.open_range(range_id).await?;
+            range.snapshot().await
+        }
+    }
 
     #[tokio::test]
     async fn retain_match_is_tenant_scoped() {
@@ -951,5 +1124,102 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(retain.retained_count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn replicated_retain_routes_exact_and_wildcard_access_over_kv_ranges() {
+        let engine = MemoryKvEngine::default();
+        engine
+            .bootstrap(KvRangeBootstrap {
+                range_id: "retain-range-a".into(),
+                boundary: RangeBoundary::new(Some(b"a".to_vec()), Some(b"m".to_vec())),
+            })
+            .await
+            .unwrap();
+        engine
+            .bootstrap(KvRangeBootstrap {
+                range_id: "retain-range-b".into(),
+                boundary: RangeBoundary::new(Some(b"m".to_vec()), Some(b"z".to_vec())),
+            })
+            .await
+            .unwrap();
+
+        let router = Arc::new(MemoryKvRangeRouter::default());
+        let shard = retain_tenant_shard("t1");
+        router
+            .upsert(ReplicatedRangeDescriptor::new(
+                "retain-range-a",
+                shard.clone(),
+                RangeBoundary::new(Some(b"a".to_vec()), Some(b"m".to_vec())),
+                1,
+                1,
+                Some(1),
+                vec![RangeReplica::new(
+                    1,
+                    ReplicaRole::Voter,
+                    ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ))
+            .await
+            .unwrap();
+        router
+            .upsert(ReplicatedRangeDescriptor::new(
+                "retain-range-b",
+                shard,
+                RangeBoundary::new(Some(b"m".to_vec()), Some(b"z".to_vec())),
+                1,
+                1,
+                Some(1),
+                vec![RangeReplica::new(
+                    1,
+                    ReplicaRole::Voter,
+                    ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ))
+            .await
+            .unwrap();
+
+        let retain = ReplicatedRetainHandle::new(
+            router,
+            Arc::new(LocalKvRangeExecutor {
+                engine: engine.clone(),
+            }),
+        );
+        retain
+            .retain(RetainedMessage {
+                tenant_id: "t1".into(),
+                topic: "alerts/door".into(),
+                payload: b"open".to_vec().into(),
+                qos: 1,
+            })
+            .await
+            .unwrap();
+        retain
+            .retain(RetainedMessage {
+                tenant_id: "t1".into(),
+                topic: "metrics/cpu".into(),
+                payload: b"high".to_vec().into(),
+                qos: 0,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            retain
+                .lookup_topic("t1", "alerts/door")
+                .await
+                .unwrap()
+                .unwrap()
+                .payload,
+            b"open".as_slice()
+        );
+        assert_eq!(retain.match_topic("t1", "#").await.unwrap().len(), 2);
+        assert_eq!(retain.retained_count().await.unwrap(), 2);
     }
 }

@@ -773,6 +773,7 @@ dependencies = [
  "greenmqtt-dist",
  "greenmqtt-http-api",
  "greenmqtt-inbox",
+ "greenmqtt-kv-client",
  "greenmqtt-plugin-api",
  "greenmqtt-retain",
  "greenmqtt-rpc",
@@ -814,7 +815,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bincode",
+ "bytes",
  "greenmqtt-core",
+ "greenmqtt-kv-client",
+ "greenmqtt-kv-engine",
  "greenmqtt-storage",
  "tokio",
 ]
@@ -855,6 +860,59 @@ dependencies = [
 ]
 
 [[package]]
+name = "greenmqtt-kv-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "greenmqtt-core",
+ "greenmqtt-kv-engine",
+ "serde",
+ "tokio",
+]
+
+[[package]]
+name = "greenmqtt-kv-engine"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bincode",
+ "bytes",
+ "greenmqtt-core",
+ "rocksdb",
+ "serde",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "greenmqtt-kv-raft"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "greenmqtt-core",
+ "serde",
+ "tokio",
+]
+
+[[package]]
+name = "greenmqtt-kv-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "greenmqtt-core",
+ "greenmqtt-kv-engine",
+ "greenmqtt-kv-raft",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "greenmqtt-plugin-api"
 version = "0.1.0"
 dependencies = [
@@ -872,6 +930,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "greenmqtt-core",
+ "greenmqtt-kv-engine",
  "prost",
  "protoc-bin-vendored",
  "tonic",
@@ -885,7 +944,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bincode",
+ "bytes",
  "greenmqtt-core",
+ "greenmqtt-kv-client",
+ "greenmqtt-kv-engine",
  "greenmqtt-storage",
  "tokio",
 ]
@@ -901,6 +964,10 @@ dependencies = [
  "greenmqtt-core",
  "greenmqtt-dist",
  "greenmqtt-inbox",
+ "greenmqtt-kv-client",
+ "greenmqtt-kv-engine",
+ "greenmqtt-kv-raft",
+ "greenmqtt-kv-server",
  "greenmqtt-plugin-api",
  "greenmqtt-proto",
  "greenmqtt-retain",
@@ -909,6 +976,7 @@ dependencies = [
  "metrics",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tonic",
 ]
