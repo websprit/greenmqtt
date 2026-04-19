@@ -1,0 +1,65 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "greenmqtt.fullname" . }}
+  labels:
+    {{- include "greenmqtt.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "greenmqtt.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: mqtt
+      port: {{ .Values.service.mqtt.port }}
+      targetPort: mqtt
+      protocol: {{ .Values.service.mqtt.protocol }}
+      {{- if and (eq .Values.service.type "NodePort") .Values.service.mqtt.nodePort }}
+      nodePort: {{ .Values.service.mqtt.nodePort }}
+      {{- end }}
+    - name: http
+      port: {{ .Values.service.http.port }}
+      targetPort: http
+      protocol: {{ .Values.service.http.protocol }}
+      {{- if and (eq .Values.service.type "NodePort") .Values.service.http.nodePort }}
+      nodePort: {{ .Values.service.http.nodePort }}
+      {{- end }}
+    - name: rpc
+      port: {{ .Values.service.rpc.port }}
+      targetPort: rpc
+      protocol: {{ .Values.service.rpc.protocol }}
+      {{- if and (eq .Values.service.type "NodePort") .Values.service.rpc.nodePort }}
+      nodePort: {{ .Values.service.rpc.nodePort }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "greenmqtt.headlessServiceName" . }}
+  labels:
+    {{- include "greenmqtt.labels" . | nindent 4 }}
+  {{- with .Values.service.headlessAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "greenmqtt.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: mqtt
+      port: {{ .Values.service.mqtt.port }}
+      targetPort: mqtt
+      protocol: {{ .Values.service.mqtt.protocol }}
+    - name: http
+      port: {{ .Values.service.http.port }}
+      targetPort: http
+      protocol: {{ .Values.service.http.protocol }}
+    - name: rpc
+      port: {{ .Values.service.rpc.port }}
+      targetPort: rpc
+      protocol: {{ .Values.service.rpc.protocol }}

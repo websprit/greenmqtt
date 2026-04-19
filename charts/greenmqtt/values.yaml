@@ -1,0 +1,107 @@
+replicaCount: 1
+
+image:
+  repository: greenmqtt
+  pullPolicy: IfNotPresent
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+nodeIdBase: 1
+clusterDomain: cluster.local
+
+serviceAccount:
+  create: true
+  automount: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext: {}
+
+securityContext: {}
+
+service:
+  type: ClusterIP
+  annotations: {}
+  headlessAnnotations: {}
+  mqtt:
+    port: 1883
+    targetPort: 1883
+    protocol: TCP
+    nodePort: null
+  http:
+    port: 8080
+    targetPort: 8080
+    protocol: TCP
+    nodePort: null
+  rpc:
+    port: 50051
+    targetPort: 50051
+    protocol: TCP
+    nodePort: null
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: greenmqtt.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+persistence:
+  enabled: true
+  accessModes:
+    - ReadWriteOnce
+  size: 10Gi
+  storageClass: ""
+  mountPath: /var/lib/greenmqtt
+
+resources: {}
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 10
+  periodSeconds: 10
+
+readinessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+startupProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  failureThreshold: 30
+  periodSeconds: 5
+
+greenmqtt:
+  dataDir: /var/lib/greenmqtt/data
+  storageBackend: sled
+  mqttBind: 0.0.0.0:1883
+  httpBind: 0.0.0.0:8080
+  rpcBind: 0.0.0.0:50051
+  stateEndpoint: ""
+  redisUrl: ""
+  responseInformation: greenmqtt
+  serverReference: ""
+  serverKeepAliveSecs: null
+  maxPacketSize: null
+  extraEnv: {}
+  extraEnvFrom: []

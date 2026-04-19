@@ -136,10 +136,12 @@ impl FailureDetector {
     }
 
     pub fn snapshot(&self, node_id: NodeId) -> Option<FailureDetectorSnapshot> {
-        self.states.get(&node_id).map(|state| FailureDetectorSnapshot {
-            member: state.membership.clone(),
-            health_score: state.health_score,
-        })
+        self.states
+            .get(&node_id)
+            .map(|state| FailureDetectorSnapshot {
+                member: state.membership.clone(),
+                health_score: state.health_score,
+            })
     }
 
     pub fn snapshots(&self) -> Vec<FailureDetectorSnapshot> {
@@ -271,7 +273,10 @@ impl FailureDetector {
                 });
                 outputs
             }
-            TimeoutEvent::IndirectProbe { target, probe_id: _ } => {
+            TimeoutEvent::IndirectProbe {
+                target,
+                probe_id: _,
+            } => {
                 let incarnation = self
                     .states
                     .get(&target)
@@ -317,7 +322,9 @@ impl FailureDetector {
         let Some(state) = self.states.get_mut(&node_id) else {
             return Vec::new();
         };
-        let next_incarnation = incarnation.saturating_add(1).max(state.membership.epoch + 1);
+        let next_incarnation = incarnation
+            .saturating_add(1)
+            .max(state.membership.epoch + 1);
         state.membership.epoch = next_incarnation;
         state.membership.lifecycle = ClusterNodeLifecycle::Serving;
         state.status = NodeStatus::Alive;
@@ -393,7 +400,9 @@ mod tests {
         DetectorInput, DetectorOutput, FailureDetector, FailureDetectorConfig, HealthScore,
         ProbeMessage, TimeoutEvent,
     };
-    use greenmqtt_core::{ClusterNodeLifecycle, ClusterNodeMembership, ServiceEndpoint, ServiceKind};
+    use greenmqtt_core::{
+        ClusterNodeLifecycle, ClusterNodeMembership, ServiceEndpoint, ServiceKind,
+    };
     use std::time::Duration;
 
     fn member(node_id: u64, epoch: u64, lifecycle: ClusterNodeLifecycle) -> ClusterNodeMembership {
@@ -571,7 +580,10 @@ mod tests {
         assert!(outputs.iter().any(|output| matches!(
             output,
             DetectorOutput::ScheduleTimeout {
-                event: TimeoutEvent::Suspect { target: 13, incarnation: 2 },
+                event: TimeoutEvent::Suspect {
+                    target: 13,
+                    incarnation: 2
+                },
                 ..
             }
         )));
@@ -601,10 +613,7 @@ mod tests {
 
         assert!(detector.step(DetectorInput::TickRound).is_empty());
         let outputs = detector.step(DetectorInput::TickRound);
-        assert!(matches!(
-            &outputs[0],
-            DetectorOutput::MembershipRemoved(21)
-        ));
+        assert!(matches!(&outputs[0], DetectorOutput::MembershipRemoved(21)));
         assert!(detector.snapshot(21).is_none());
     }
 

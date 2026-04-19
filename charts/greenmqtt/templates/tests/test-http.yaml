@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ include "greenmqtt.fullname" . }}-test-http"
+  labels:
+    {{- include "greenmqtt.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+spec:
+  containers:
+    - name: wget
+      image: busybox:1.36
+      command:
+        - sh
+        - -ec
+        - wget -qO- http://{{ include "greenmqtt.fullname" . }}:{{ .Values.service.http.port }}/healthz | grep -qx ok
+  restartPolicy: Never

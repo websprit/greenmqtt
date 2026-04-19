@@ -33,7 +33,9 @@ impl MemberList {
 #[cfg(test)]
 mod tests {
     use super::MemberList;
-    use greenmqtt_core::{ClusterNodeLifecycle, ClusterNodeMembership, ServiceEndpoint, ServiceKind};
+    use greenmqtt_core::{
+        ClusterNodeLifecycle, ClusterNodeMembership, ServiceEndpoint, ServiceKind,
+    };
 
     fn member(node_id: u64, lifecycle: ClusterNodeLifecycle) -> ClusterNodeMembership {
         ClusterNodeMembership::new(
@@ -51,7 +53,9 @@ mod tests {
     #[test]
     fn member_list_upserts_marks_and_removes_members() {
         let mut members = MemberList::default();
-        assert!(members.upsert(member(7, ClusterNodeLifecycle::Joining)).is_none());
+        assert!(members
+            .upsert(member(7, ClusterNodeLifecycle::Joining))
+            .is_none());
         assert_eq!(members.list().len(), 1);
 
         let updated = members

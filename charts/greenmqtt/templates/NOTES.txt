@@ -1,0 +1,15 @@
+1. MQTT endpoint:
+  {{- if contains "LoadBalancer" .Values.service.type }}
+  export MQTT_HOST=$(kubectl get svc {{ include "greenmqtt.fullname" . }} -n {{ .Release.Namespace }} -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+  {{- else }}
+  kubectl port-forward svc/{{ include "greenmqtt.fullname" . }} -n {{ .Release.Namespace }} {{ .Values.service.mqtt.port }}:{{ .Values.service.mqtt.port }}
+  {{- end }}
+
+2. HTTP API:
+  kubectl port-forward svc/{{ include "greenmqtt.fullname" . }} -n {{ .Release.Namespace }} {{ .Values.service.http.port }}:{{ .Values.service.http.port }}
+  curl http://127.0.0.1:{{ .Values.service.http.port }}/healthz
+
+3. Important note:
+  This chart assigns `GREENMQTT_NODE_ID` from the StatefulSet ordinal. Running multiple replicas
+  is possible, but a production cluster still needs explicit peer/state topology planning through
+  `GREENMQTT_*` environment variables such as `GREENMQTT_PEERS` or `GREENMQTT_STATE_ENDPOINT`.

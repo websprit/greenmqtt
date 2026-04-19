@@ -2,11 +2,9 @@ mod failure_detector;
 mod membership;
 
 use async_trait::async_trait;
+pub use failure_detector::{FailureDetector, FailureDetectorConfig, FailureDetectorSnapshot};
 use foca::Config as FocaConfig;
 use greenmqtt_core::{ClusterNodeMembership, Lifecycle, NodeId};
-pub use failure_detector::{
-    FailureDetector, FailureDetectorConfig, FailureDetectorSnapshot,
-};
 pub use membership::MemberList;
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroU32;

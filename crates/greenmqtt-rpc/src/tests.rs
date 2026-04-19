@@ -3191,7 +3191,9 @@ async fn anti_entropy_dist_replica_converges_under_concurrent_write() {
 
     let routes = replica.list_routes(Some("t1")).await.unwrap();
     assert_eq!(routes.len(), 2);
-    assert!(routes.iter().any(|route| route.topic_filter == "devices/late/state"));
+    assert!(routes
+        .iter()
+        .any(|route| route.topic_filter == "devices/late/state"));
 
     server1.abort();
     server2.abort();
