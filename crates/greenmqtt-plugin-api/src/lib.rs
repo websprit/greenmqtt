@@ -19,8 +19,8 @@ use greenmqtt_core::PublishProperties;
 pub use greenmqtt_core::PublishRequest;
 pub use hook::{ConfiguredEventHook, HookTarget, NoopEventHook};
 pub use plugin_api::{
-    AclProvider, AuthProvider, EnhancedAuthResult, EventHook, BRIDGE_CLIENT_ID_PREFIX,
-    BRIDGE_HOP_COUNT_PROPERTY, BRIDGE_TRACE_ID_PROPERTY,
+    current_listener_profile, with_listener_profile, AclProvider, AuthProvider, EnhancedAuthResult,
+    EventHook, BRIDGE_CLIENT_ID_PREFIX, BRIDGE_HOP_COUNT_PROPERTY, BRIDGE_TRACE_ID_PROPERTY,
 };
 pub use rewrite::{TopicRewriteEventHook, TopicRewriteRule};
 use tokio::io::AsyncReadExt;

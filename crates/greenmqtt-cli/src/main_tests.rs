@@ -1,23 +1,26 @@
 use super::{
-    configured_acl, configured_auth, configured_hooks, configured_webhook, durable_services,
+    collect_listener_profiles, configured_acl, configured_acl_for_profile, configured_auth,
+    configured_auth_for_profile, configured_hooks, configured_hooks_for_profile,
+    configured_listener_profiles, configured_webhook, durable_services, listener_specs_from_env,
     parse_acl_rules, parse_bench_scenario, parse_bench_scenarios, parse_bridge_rules,
-    parse_compare_backends, parse_identity_matchers, parse_topic_rewrite_rules, redis_services,
-    render_shard_response_text, run_bench, run_compare_bench, run_compare_soak, run_profile_bench,
-    run_shard_command, run_soak, shard_command_request, validate_bench_report,
-    validate_soak_report, BenchConfig, BenchReport, BenchScenario, BenchThresholds, OutputMode,
-    SoakConfig, SoakReport, SoakThresholds,
+    parse_compare_backends, parse_identity_matchers, parse_listener_specs,
+    parse_topic_rewrite_rules, redis_services, render_shard_response_text, run_bench,
+    run_compare_bench, run_compare_soak, run_profile_bench, run_shard_command, run_soak,
+    shard_command_request, validate_bench_report, validate_soak_report, BenchConfig, BenchReport,
+    BenchScenario, BenchThresholds, ListenerSpec, OutputMode, SoakConfig, SoakReport,
+    SoakThresholds,
 };
 use greenmqtt_broker::{BrokerConfig, BrokerRuntime};
 use greenmqtt_core::{
     ClientIdentity, ClusterMembershipRegistry, ClusterNodeLifecycle, ClusterNodeMembership,
-    ServiceEndpoint, ServiceEndpointRegistry, ServiceKind, ServiceShardAssignment, ServiceShardKey,
-    ServiceShardLifecycle,
+    PublishProperties, PublishRequest, ServiceEndpoint, ServiceEndpointRegistry, ServiceKind,
+    ServiceShardAssignment, ServiceShardKey, ServiceShardLifecycle,
 };
 use greenmqtt_dist::DistHandle;
 use greenmqtt_inbox::InboxHandle;
 use greenmqtt_plugin_api::{
-    AclAction, AclDecision, AclProvider, AuthProvider, ConfiguredAcl, ConfiguredAuth,
-    ConfiguredEventHook,
+    with_listener_profile, AclAction, AclDecision, AclProvider, AuthProvider, ConfiguredAcl,
+    ConfiguredAuth, ConfiguredEventHook, EventHook,
 };
 use greenmqtt_retain::RetainHandle;
 use greenmqtt_rpc::StaticServiceEndpointRegistry;
@@ -32,6 +35,20 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static DURABLE_TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn with_env_var<T>(key: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
+    let previous = std::env::var(key).ok();
+    match value {
+        Some(value) => std::env::set_var(key, value),
+        None => std::env::remove_var(key),
+    }
+    let result = f();
+    match previous {
+        Some(value) => std::env::set_var(key, value),
+        None => std::env::remove_var(key),
+    }
+    result
+}
 
 fn install_metrics_recorder_once() {
     static METRICS_READY: OnceLock<()> = OnceLock::new();
@@ -1409,7 +1426,9 @@ fn configured_webhook_parses_selected_events() {
         "GREENMQTT_WEBHOOK_EVENTS",
         "connect,subscribe,publish,retain",
     );
-    let hook = configured_webhook().unwrap().expect("webhook should exist");
+    let hook = configured_webhook("default")
+        .unwrap()
+        .expect("webhook should exist");
     std::env::remove_var("GREENMQTT_WEBHOOK_URL");
     std::env::remove_var("GREENMQTT_WEBHOOK_EVENTS");
     assert!(hook.config().connect);
@@ -1502,6 +1521,64 @@ fn configured_auth_supports_static_deny_identities() {
 }
 
 #[test]
+fn parse_listener_specs_supports_profile_suffix() {
+    let specs = parse_listener_specs("127.0.0.1:1883,127.0.0.1:1884@guest").unwrap();
+    assert_eq!(
+        specs,
+        vec![
+            ListenerSpec {
+                bind: "127.0.0.1:1883".parse().unwrap(),
+                profile: "default".into(),
+            },
+            ListenerSpec {
+                bind: "127.0.0.1:1884".parse().unwrap(),
+                profile: "guest".into(),
+            },
+        ]
+    );
+}
+
+#[test]
+fn listener_specs_from_env_prefers_plural_env() {
+    with_env_var("GREENMQTT_MQTT_BIND", Some("127.0.0.1:1883"), || {
+        with_env_var(
+            "GREENMQTT_MQTT_BINDS",
+            Some("127.0.0.1:1884@guest,127.0.0.1:1885@admin"),
+            || {
+                let specs = listener_specs_from_env(
+                    "GREENMQTT_MQTT_BIND",
+                    "GREENMQTT_MQTT_BINDS",
+                    "127.0.0.1:1883",
+                )
+                .unwrap();
+                assert_eq!(specs.len(), 2);
+                assert_eq!(specs[0].profile, "guest");
+                assert_eq!(specs[1].profile, "admin");
+            },
+        )
+    });
+}
+
+#[test]
+fn configured_auth_for_profile_falls_back_to_default_env() {
+    with_env_var("GREENMQTT_AUTH_IDENTITIES", Some("tenant-a:*:*"), || {
+        let auth = configured_auth_for_profile("guest").unwrap();
+        let allowed = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async {
+                auth.authenticate(&ClientIdentity {
+                    tenant_id: "tenant-a".into(),
+                    user_id: "alice".into(),
+                    client_id: "c1".into(),
+                })
+                .await
+            })
+            .unwrap();
+        assert!(allowed);
+    });
+}
+
+#[test]
 fn configured_acl_prefers_http_provider_when_no_static_rules_exist() {
     std::env::remove_var("GREENMQTT_ACL_RULES");
     std::env::remove_var("GREENMQTT_ACL_DEFAULT_ALLOW");
@@ -1565,6 +1642,32 @@ fn configured_acl_supports_default_allow_for_static_rules() {
 }
 
 #[test]
+fn configured_acl_for_profile_uses_profile_specific_env() {
+    with_env_var(
+        "GREENMQTT_ACL_RULES__GUEST",
+        Some("allow-pub@tenant-a:alice:*=devices/+/state"),
+        || {
+            let acl = configured_acl_for_profile("guest").unwrap();
+            let allowed = tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(async {
+                    acl.can_publish(
+                        &ClientIdentity {
+                            tenant_id: "tenant-a".into(),
+                            user_id: "alice".into(),
+                            client_id: "c1".into(),
+                        },
+                        "devices/d1/state",
+                    )
+                    .await
+                })
+                .unwrap();
+            assert!(allowed);
+        },
+    );
+}
+
+#[test]
 fn configured_hooks_accepts_bridge_timeout_and_fail_open_env() {
     std::env::set_var(
         "GREENMQTT_TOPIC_REWRITE_RULES",
@@ -1585,6 +1688,120 @@ fn configured_hooks_accepts_bridge_timeout_and_fail_open_env() {
     std::env::remove_var("GREENMQTT_BRIDGE_RETRY_DELAY_MS");
     std::env::remove_var("GREENMQTT_BRIDGE_MAX_INFLIGHT");
     assert!(hooks.is_ok());
+}
+
+#[test]
+fn configured_hooks_for_profile_accepts_profile_specific_bridge_settings() {
+    with_env_var(
+        "GREENMQTT_BRIDGE_RULES__GUEST",
+        Some("devices/#=127.0.0.1:1883"),
+        || {
+            with_env_var("GREENMQTT_BRIDGE_TIMEOUT_MS__GUEST", Some("250"), || {
+                let hooks = configured_hooks_for_profile(7, "guest");
+                assert!(hooks.is_ok());
+            })
+        },
+    );
+}
+
+#[test]
+fn collect_listener_profiles_merges_unique_profile_names() {
+    let tcp = vec![
+        ListenerSpec {
+            bind: "127.0.0.1:1883".parse().unwrap(),
+            profile: "default".into(),
+        },
+        ListenerSpec {
+            bind: "127.0.0.1:1884".parse().unwrap(),
+            profile: "guest".into(),
+        },
+    ];
+    let ws = vec![ListenerSpec {
+        bind: "127.0.0.1:8083".parse().unwrap(),
+        profile: "admin".into(),
+    }];
+
+    let profiles = collect_listener_profiles(&[&tcp, &ws]);
+    assert_eq!(profiles, vec!["admin", "default", "guest"]);
+}
+
+#[test]
+fn configured_listener_profiles_apply_hook_per_listener_profile() {
+    with_env_var(
+        "GREENMQTT_TOPIC_REWRITE_RULES",
+        Some("tenant-a@devices/+/state=default/{1}"),
+        || {
+            with_env_var(
+                "GREENMQTT_TOPIC_REWRITE_RULES__GUEST",
+                Some("tenant-a@devices/+/state=guest/{1}"),
+                || {
+                    let profiles = vec!["default".to_string(), "guest".to_string()];
+                    let (_, _, hooks) = configured_listener_profiles(7, &profiles).unwrap();
+                    let identity = ClientIdentity {
+                        tenant_id: "tenant-a".into(),
+                        user_id: "alice".into(),
+                        client_id: "c1".into(),
+                    };
+                    let request = PublishRequest {
+                        topic: "devices/d1/state".into(),
+                        payload: b"hello".to_vec().into(),
+                        qos: 0,
+                        retain: false,
+                        properties: PublishProperties::default(),
+                    };
+                    let runtime = tokio::runtime::Runtime::new().unwrap();
+                    let default_topic = runtime
+                        .block_on(with_listener_profile(
+                            "default".to_string(),
+                            hooks.rewrite_publish(&identity, &request),
+                        ))
+                        .unwrap()
+                        .topic;
+                    let guest_topic = runtime
+                        .block_on(with_listener_profile(
+                            "guest".to_string(),
+                            hooks.rewrite_publish(&identity, &request),
+                        ))
+                        .unwrap()
+                        .topic;
+                    assert_eq!(default_topic, "default/d1");
+                    assert_eq!(guest_topic, "guest/d1");
+                },
+            )
+        },
+    );
+}
+
+#[test]
+fn configured_listener_profiles_apply_acl_per_listener_profile() {
+    let profiles = vec!["default".to_string(), "guest".to_string()];
+    let rules_default = "allow-pub@tenant-a:alice:*=devices/#";
+    let rules_guest = "allow-pub@tenant-a:alice:*=public/#";
+    with_env_var("GREENMQTT_ACL_RULES", Some(rules_default), || {
+        with_env_var("GREENMQTT_ACL_RULES__GUEST", Some(rules_guest), || {
+            let (_, acl, _) = configured_listener_profiles(7, &profiles).unwrap();
+            let identity = ClientIdentity {
+                tenant_id: "tenant-a".into(),
+                user_id: "alice".into(),
+                client_id: "c1".into(),
+            };
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let default_allowed = runtime
+                .block_on(with_listener_profile(
+                    "default".to_string(),
+                    acl.can_publish(&identity, "devices/d1/state"),
+                ))
+                .unwrap();
+            let guest_allowed = runtime
+                .block_on(with_listener_profile(
+                    "guest".to_string(),
+                    acl.can_publish(&identity, "devices/d1/state"),
+                ))
+                .unwrap();
+            assert!(default_allowed);
+            assert!(!guest_allowed);
+        })
+    });
 }
 
 #[test]

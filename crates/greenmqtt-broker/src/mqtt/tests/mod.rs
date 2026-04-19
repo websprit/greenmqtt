@@ -415,8 +415,7 @@ pub(super) async fn persistent_test_broker(data_dir: &TempDir) -> Arc<DefaultBro
     ))
 }
 
-pub(super) fn write_self_signed_tls_material(
-) -> (
+pub(super) fn write_self_signed_tls_material() -> (
     tempfile::TempDir,
     PathBuf,
     PathBuf,

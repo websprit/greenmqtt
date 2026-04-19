@@ -2914,11 +2914,14 @@ async fn mqtt_v5_ws_zero_length_client_id_receives_assigned_client_identifier_an
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary((connect_packet_v5_with_properties(
-            "",
-            true,
-            &request_response_information_property(true),
-        )).into()))
+        .send(Message::Binary(
+            (connect_packet_v5_with_properties(
+                "",
+                true,
+                &request_response_information_property(true),
+            ))
+            .into(),
+        ))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();

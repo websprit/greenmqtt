@@ -1243,7 +1243,9 @@ async fn mqtt_v5_ws_pending_inbound_qos2_limit_disconnects_quota_exceeded() {
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary((connect_packet_v5("qos2-budget-ws")).into()))
+        .send(Message::Binary(
+            (connect_packet_v5("qos2-budget-ws")).into(),
+        ))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
@@ -1251,11 +1253,9 @@ async fn mqtt_v5_ws_pending_inbound_qos2_limit_disconnects_quota_exceeded() {
 
     for packet_id in 1..=crate::mqtt::session::MAX_PENDING_INBOUND_QOS2 as u16 {
         client
-            .send(Message::Binary((publish_packet_v5_qos2(
-                packet_id,
-                "devices/d1/state",
-                b"budget-test",
-            )).into()))
+            .send(Message::Binary(
+                (publish_packet_v5_qos2(packet_id, "devices/d1/state", b"budget-test")).into(),
+            ))
             .await
             .unwrap();
         let pubrec = client.next().await.unwrap().unwrap().into_data();
@@ -1263,11 +1263,14 @@ async fn mqtt_v5_ws_pending_inbound_qos2_limit_disconnects_quota_exceeded() {
     }
 
     client
-        .send(Message::Binary((publish_packet_v5_qos2(
-            (crate::mqtt::session::MAX_PENDING_INBOUND_QOS2 + 1) as u16,
-            "devices/d1/state",
-            b"budget-overflow",
-        )).into()))
+        .send(Message::Binary(
+            (publish_packet_v5_qos2(
+                (crate::mqtt::session::MAX_PENDING_INBOUND_QOS2 + 1) as u16,
+                "devices/d1/state",
+                b"budget-overflow",
+            ))
+            .into(),
+        ))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();
@@ -1536,7 +1539,9 @@ async fn mqtt_ws_connect_subscribe_publish_flow() {
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     subscriber
-        .send(Message::Binary((subscribe_packet(1, "devices/+/state")).into()))
+        .send(Message::Binary(
+            (subscribe_packet(1, "devices/+/state")).into(),
+        ))
         .await
         .unwrap();
     let suback = subscriber.next().await.unwrap().unwrap().into_data();
@@ -1550,10 +1555,9 @@ async fn mqtt_ws_connect_subscribe_publish_flow() {
     let publisher_connack = publisher.next().await.unwrap().unwrap().into_data();
     assert_eq!(publisher_connack[0] >> 4, PACKET_TYPE_CONNACK);
     publisher
-        .send(Message::Binary((publish_packet(
-            "devices/d1/state",
-            b"ws-up",
-        )).into()))
+        .send(Message::Binary(
+            (publish_packet("devices/d1/state", b"ws-up")).into(),
+        ))
         .await
         .unwrap();
 
@@ -1593,7 +1597,9 @@ async fn mqtt_publish_before_connect_closes_websocket() {
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary((publish_packet("devices/d1/state", b"up")).into()))
+        .send(Message::Binary(
+            (publish_packet("devices/d1/state", b"up")).into(),
+        ))
         .await
         .unwrap();
     assert_ws_connection_closed(&mut client).await;
@@ -1883,21 +1889,18 @@ async fn mqtt_v5_ws_invalid_subscription_qos_disconnect_includes_server_referenc
     let ws_url = format!("ws://{}", bind);
     let mut client = connect_ws_with_retry(&ws_url).await.unwrap();
     client
-        .send(Message::Binary((connect_packet_v5(
-            "invalid-subscription-qos-ws-ref",
-        )).into()))
+        .send(Message::Binary(
+            (connect_packet_v5("invalid-subscription-qos-ws-ref")).into(),
+        ))
         .await
         .unwrap();
     let connack = client.next().await.unwrap().unwrap().into_data();
     assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
 
     client
-        .send(Message::Binary((subscribe_packet_v5_with_options(
-            1,
-            "devices/+/state",
-            0b0000_0011,
-            &[],
-        )).into()))
+        .send(Message::Binary(
+            (subscribe_packet_v5_with_options(1, "devices/+/state", 0b0000_0011, &[])).into(),
+        ))
         .await
         .unwrap();
     let disconnect = client.next().await.unwrap().unwrap().into_data();

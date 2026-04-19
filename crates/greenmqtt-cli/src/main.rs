@@ -1,4 +1,8 @@
-use greenmqtt_broker::mqtt::{serve_quic, serve_tcp, serve_tls, serve_ws, serve_wss};
+use async_trait::async_trait;
+use greenmqtt_broker::mqtt::{
+    serve_quic_with_profile, serve_tcp_with_profile, serve_tls_with_profile, serve_ws_with_profile,
+    serve_wss_with_profile,
+};
 use greenmqtt_broker::{BrokerConfig, BrokerRuntime};
 use greenmqtt_core::{
     ClientIdentity, ClusterMembershipRegistry, ClusterNodeLifecycle, ClusterNodeMembership,
@@ -9,11 +13,11 @@ use greenmqtt_dist::{DistHandle, DistRouter, PersistentDistHandle};
 use greenmqtt_http_api::HttpApi;
 use greenmqtt_inbox::{InboxHandle, InboxService, PersistentInboxHandle};
 use greenmqtt_plugin_api::{
-    AclAction, AclDecision, AclRule, BridgeEventHook, BridgeRule, ConfiguredAcl, ConfiguredAuth,
-    ConfiguredEventHook, HookTarget, HttpAclConfig, HttpAclProvider, HttpAuthConfig,
-    HttpAuthProvider, IdentityMatcher, StaticAclProvider, StaticAuthProvider,
-    StaticEnhancedAuthProvider, TopicRewriteEventHook, TopicRewriteRule, WebHookConfig,
-    WebHookEventHook, BRIDGE_CLIENT_ID_PREFIX,
+    current_listener_profile, AclAction, AclDecision, AclProvider, AclRule, AuthProvider,
+    BridgeEventHook, BridgeRule, ConfiguredAcl, ConfiguredAuth, ConfiguredEventHook, EventHook,
+    HookTarget, HttpAclConfig, HttpAclProvider, HttpAuthConfig, HttpAuthProvider, IdentityMatcher,
+    StaticAclProvider, StaticAuthProvider, StaticEnhancedAuthProvider, TopicRewriteEventHook,
+    TopicRewriteRule, WebHookConfig, WebHookEventHook, BRIDGE_CLIENT_ID_PREFIX,
 };
 use greenmqtt_retain::{PersistentRetainHandle, RetainHandle, RetainService};
 use greenmqtt_rpc::{
@@ -29,6 +33,7 @@ use greenmqtt_storage::{
 };
 use metrics_exporter_prometheus::PrometheusBuilder;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -37,8 +42,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 use sysinfo::{get_current_pid, System};
+use tokio::task::JoinSet;
 
-type AppBroker = Arc<BrokerRuntime<ConfiguredAuth, ConfiguredAcl, ConfiguredEventHook>>;
+type AppBroker = Arc<BrokerRuntime<PortMappedAuth, PortMappedAcl, PortMappedEventHook>>;
 type AppStateServices = (
     Arc<dyn SessionDirectory>,
     Arc<dyn DistRouter>,
@@ -52,6 +58,30 @@ type CompareStateServices = (
     Arc<dyn RetainService>,
     Option<PathBuf>,
 );
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListenerSpec {
+    bind: SocketAddr,
+    profile: String,
+}
+
+#[derive(Clone)]
+struct PortMappedAuth {
+    default_profile: String,
+    profiles: Arc<HashMap<String, ConfiguredAuth>>,
+}
+
+#[derive(Clone)]
+struct PortMappedAcl {
+    default_profile: String,
+    profiles: Arc<HashMap<String, ConfiguredAcl>>,
+}
+
+#[derive(Clone)]
+struct PortMappedEventHook {
+    default_profile: String,
+    profiles: Arc<HashMap<String, ConfiguredEventHook>>,
+}
 
 #[derive(Debug, Clone, Copy)]
 struct BenchConfig {
@@ -95,6 +125,162 @@ struct SoakThresholds {
 enum OutputMode {
     Text,
     Json,
+}
+
+impl PortMappedAuth {
+    fn new(default_profile: impl Into<String>, profiles: HashMap<String, ConfiguredAuth>) -> Self {
+        Self {
+            default_profile: default_profile.into(),
+            profiles: Arc::new(profiles),
+        }
+    }
+
+    fn profile(&self) -> &ConfiguredAuth {
+        let active = current_listener_profile().unwrap_or_else(|| self.default_profile.clone());
+        self.profiles
+            .get(&active)
+            .or_else(|| self.profiles.get(&self.default_profile))
+            .expect("listener auth profile missing")
+    }
+}
+
+impl PortMappedAcl {
+    fn new(default_profile: impl Into<String>, profiles: HashMap<String, ConfiguredAcl>) -> Self {
+        Self {
+            default_profile: default_profile.into(),
+            profiles: Arc::new(profiles),
+        }
+    }
+
+    fn profile(&self) -> &ConfiguredAcl {
+        let active = current_listener_profile().unwrap_or_else(|| self.default_profile.clone());
+        self.profiles
+            .get(&active)
+            .or_else(|| self.profiles.get(&self.default_profile))
+            .expect("listener acl profile missing")
+    }
+}
+
+impl PortMappedEventHook {
+    fn new(
+        default_profile: impl Into<String>,
+        profiles: HashMap<String, ConfiguredEventHook>,
+    ) -> Self {
+        Self {
+            default_profile: default_profile.into(),
+            profiles: Arc::new(profiles),
+        }
+    }
+
+    fn profile(&self) -> &ConfiguredEventHook {
+        let active = current_listener_profile().unwrap_or_else(|| self.default_profile.clone());
+        self.profiles
+            .get(&active)
+            .or_else(|| self.profiles.get(&self.default_profile))
+            .expect("listener hook profile missing")
+    }
+}
+
+#[async_trait]
+impl AuthProvider for PortMappedAuth {
+    async fn authenticate(&self, identity: &ClientIdentity) -> anyhow::Result<bool> {
+        self.profile().authenticate(identity).await
+    }
+
+    async fn begin_enhanced_auth(
+        &self,
+        identity: &ClientIdentity,
+        method: &str,
+        auth_data: Option<&[u8]>,
+    ) -> anyhow::Result<greenmqtt_plugin_api::EnhancedAuthResult> {
+        self.profile()
+            .begin_enhanced_auth(identity, method, auth_data)
+            .await
+    }
+
+    async fn continue_enhanced_auth(
+        &self,
+        identity: &ClientIdentity,
+        method: &str,
+        auth_data: Option<&[u8]>,
+    ) -> anyhow::Result<greenmqtt_plugin_api::EnhancedAuthResult> {
+        self.profile()
+            .continue_enhanced_auth(identity, method, auth_data)
+            .await
+    }
+}
+
+#[async_trait]
+impl AclProvider for PortMappedAcl {
+    async fn can_subscribe(
+        &self,
+        identity: &ClientIdentity,
+        subscription: &greenmqtt_core::Subscription,
+    ) -> anyhow::Result<bool> {
+        self.profile().can_subscribe(identity, subscription).await
+    }
+
+    async fn can_publish(&self, identity: &ClientIdentity, topic: &str) -> anyhow::Result<bool> {
+        self.profile().can_publish(identity, topic).await
+    }
+}
+
+#[async_trait]
+impl EventHook for PortMappedEventHook {
+    async fn rewrite_publish(
+        &self,
+        identity: &ClientIdentity,
+        request: &greenmqtt_core::PublishRequest,
+    ) -> anyhow::Result<greenmqtt_core::PublishRequest> {
+        self.profile().rewrite_publish(identity, request).await
+    }
+
+    async fn on_connect(&self, session: &greenmqtt_core::SessionRecord) -> anyhow::Result<()> {
+        self.profile().on_connect(session).await
+    }
+
+    async fn on_disconnect(&self, session: &greenmqtt_core::SessionRecord) -> anyhow::Result<()> {
+        self.profile().on_disconnect(session).await
+    }
+
+    async fn on_subscribe(
+        &self,
+        identity: &ClientIdentity,
+        subscription: &greenmqtt_core::Subscription,
+    ) -> anyhow::Result<()> {
+        self.profile().on_subscribe(identity, subscription).await
+    }
+
+    async fn on_unsubscribe(
+        &self,
+        identity: &ClientIdentity,
+        subscription: &greenmqtt_core::Subscription,
+    ) -> anyhow::Result<()> {
+        self.profile().on_unsubscribe(identity, subscription).await
+    }
+
+    async fn on_offline_enqueue(
+        &self,
+        message: &greenmqtt_core::OfflineMessage,
+    ) -> anyhow::Result<()> {
+        self.profile().on_offline_enqueue(message).await
+    }
+
+    async fn on_retain_write(
+        &self,
+        message: &greenmqtt_core::RetainedMessage,
+    ) -> anyhow::Result<()> {
+        self.profile().on_retain_write(message).await
+    }
+
+    async fn on_publish(
+        &self,
+        identity: &ClientIdentity,
+        request: &greenmqtt_core::PublishRequest,
+        outcome: &greenmqtt_core::PublishOutcome,
+    ) -> anyhow::Result<()> {
+        self.profile().on_publish(identity, request, outcome).await
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -475,9 +661,6 @@ async fn main() -> anyhow::Result<()> {
         .to_lowercase();
     let redis_url = std::env::var("GREENMQTT_REDIS_URL")
         .unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
-    let hooks = configured_hooks(node_id)?;
-    let auth = configured_auth()?;
-    let acl = configured_acl()?;
     let output_mode = output_mode();
 
     let (sessiondict, dist, inbox, retain): AppStateServices = match state_endpoint.as_deref() {
@@ -502,6 +685,82 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+    };
+
+    let tcp_listeners = if mode == "serve" {
+        listener_specs_from_env(
+            "GREENMQTT_MQTT_BIND",
+            "GREENMQTT_MQTT_BINDS",
+            "127.0.0.1:1883",
+        )?
+    } else {
+        Vec::new()
+    };
+    let tls_listeners = if mode == "serve" {
+        std::env::var("GREENMQTT_TLS_BINDS")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(|raw| parse_listener_specs(&raw))
+            .transpose()?
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let ws_listeners = if mode == "serve" {
+        std::env::var("GREENMQTT_WS_BINDS")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(|raw| parse_listener_specs(&raw))
+            .transpose()?
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let wss_listeners = if mode == "serve" {
+        std::env::var("GREENMQTT_WSS_BINDS")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(|raw| parse_listener_specs(&raw))
+            .transpose()?
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let quic_listeners = if mode == "serve" {
+        std::env::var("GREENMQTT_QUIC_BINDS")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(|raw| parse_listener_specs(&raw))
+            .transpose()?
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let (auth, acl, hooks) = if mode == "serve" {
+        let profiles = collect_listener_profiles(&[
+            &tcp_listeners,
+            &tls_listeners,
+            &ws_listeners,
+            &wss_listeners,
+            &quic_listeners,
+        ]);
+        configured_listener_profiles(node_id, &profiles)?
+    } else {
+        (
+            PortMappedAuth::new(
+                "default",
+                HashMap::from([(String::from("default"), configured_auth()?)]),
+            ),
+            PortMappedAcl::new(
+                "default",
+                HashMap::from([(String::from("default"), configured_acl()?)]),
+            ),
+            PortMappedEventHook::new(
+                "default",
+                HashMap::from([(String::from("default"), configured_hooks(node_id)?)]),
+            ),
+        )
     };
 
     let broker = Arc::new(BrokerRuntime::with_cluster(
@@ -546,31 +805,93 @@ async fn main() -> anyhow::Result<()> {
         let http_bind: SocketAddr = std::env::var("GREENMQTT_HTTP_BIND")
             .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
             .parse()?;
-        let mqtt_bind: SocketAddr = std::env::var("GREENMQTT_MQTT_BIND")
-            .unwrap_or_else(|_| "127.0.0.1:1883".to_string())
-            .parse()?;
-        let tls_bind = std::env::var("GREENMQTT_TLS_BIND").ok();
+        let tls_bind = std::env::var("GREENMQTT_TLS_BIND").ok().and_then(|bind| {
+            parse_listener_specs(&bind)
+                .ok()
+                .and_then(|mut specs| specs.drain(..).next())
+        });
         let tls_cert = std::env::var("GREENMQTT_TLS_CERT").ok();
         let tls_key = std::env::var("GREENMQTT_TLS_KEY").ok();
-        let ws_bind = std::env::var("GREENMQTT_WS_BIND").ok();
-        let wss_bind = std::env::var("GREENMQTT_WSS_BIND").ok();
-        let quic_bind = std::env::var("GREENMQTT_QUIC_BIND").ok();
+        let ws_bind = std::env::var("GREENMQTT_WS_BIND").ok().and_then(|bind| {
+            parse_listener_specs(&bind)
+                .ok()
+                .and_then(|mut specs| specs.drain(..).next())
+        });
+        let wss_bind = std::env::var("GREENMQTT_WSS_BIND").ok().and_then(|bind| {
+            parse_listener_specs(&bind)
+                .ok()
+                .and_then(|mut specs| specs.drain(..).next())
+        });
+        let quic_bind = std::env::var("GREENMQTT_QUIC_BIND").ok().and_then(|bind| {
+            parse_listener_specs(&bind)
+                .ok()
+                .and_then(|mut specs| specs.drain(..).next())
+        });
         let rpc_bind: SocketAddr = std::env::var("GREENMQTT_RPC_BIND")
             .unwrap_or_else(|_| "127.0.0.1:50051".to_string())
             .parse()?;
         println!("greenmqtt http api listening on {http_bind}");
-        println!("greenmqtt mqtt tcp listening on {mqtt_bind}");
-        if let Some(bind) = &tls_bind {
-            println!("greenmqtt mqtt tls listening on {bind}");
+        for listener in &tcp_listeners {
+            println!(
+                "greenmqtt mqtt tcp listening on {} (profile={})",
+                listener.bind, listener.profile
+            );
         }
-        if let Some(bind) = &ws_bind {
-            println!("greenmqtt mqtt ws listening on {bind}");
+        if let Some(listener) = &tls_bind {
+            println!(
+                "greenmqtt mqtt tls listening on {} (profile={})",
+                listener.bind, listener.profile
+            );
         }
-        if let Some(bind) = &wss_bind {
-            println!("greenmqtt mqtt wss listening on {bind}");
+        for listener in &tls_listeners {
+            if tls_bind.as_ref().map(|item| item.bind) != Some(listener.bind) {
+                println!(
+                    "greenmqtt mqtt tls listening on {} (profile={})",
+                    listener.bind, listener.profile
+                );
+            }
         }
-        if let Some(bind) = &quic_bind {
-            println!("greenmqtt mqtt quic listening on {bind}");
+        if let Some(listener) = &ws_bind {
+            println!(
+                "greenmqtt mqtt ws listening on {} (profile={})",
+                listener.bind, listener.profile
+            );
+        }
+        for listener in &ws_listeners {
+            if ws_bind.as_ref().map(|item| item.bind) != Some(listener.bind) {
+                println!(
+                    "greenmqtt mqtt ws listening on {} (profile={})",
+                    listener.bind, listener.profile
+                );
+            }
+        }
+        if let Some(listener) = &wss_bind {
+            println!(
+                "greenmqtt mqtt wss listening on {} (profile={})",
+                listener.bind, listener.profile
+            );
+        }
+        for listener in &wss_listeners {
+            if wss_bind.as_ref().map(|item| item.bind) != Some(listener.bind) {
+                println!(
+                    "greenmqtt mqtt wss listening on {} (profile={})",
+                    listener.bind, listener.profile
+                );
+            }
+        }
+        if let Some(listener) = &quic_bind {
+            println!(
+                "greenmqtt mqtt quic listening on {} (profile={})",
+                listener.bind, listener.profile
+            );
+        }
+        for listener in &quic_listeners {
+            if quic_bind.as_ref().map(|item| item.bind) != Some(listener.bind) {
+                println!(
+                    "greenmqtt mqtt quic listening on {} (profile={})",
+                    listener.bind, listener.profile
+                );
+            }
         }
         println!("greenmqtt internal grpc listening on {rpc_bind}");
         let shard_registry = Arc::new(StaticServiceEndpointRegistry::default());
@@ -603,45 +924,6 @@ async fn main() -> anyhow::Result<()> {
             metrics_handle,
             http_bind,
         );
-        let mqtt = serve_tcp(broker.clone(), mqtt_bind);
-        let tls_broker = broker.clone();
-        let ws_broker = broker.clone();
-        let wss_broker = broker.clone();
-        let quic_broker = broker.clone();
-        let wss_tls_cert = tls_cert.clone();
-        let wss_tls_key = tls_key.clone();
-        let quic_tls_cert = tls_cert.clone();
-        let quic_tls_key = tls_key.clone();
-        let tls = async move {
-            match (tls_bind, tls_cert, tls_key) {
-                (Some(bind), Some(cert), Some(key)) => {
-                    serve_tls(tls_broker.clone(), bind.parse()?, cert, key).await
-                }
-                _ => std::future::pending::<anyhow::Result<()>>().await,
-            }
-        };
-        let ws = async move {
-            match ws_bind {
-                Some(bind) => serve_ws(ws_broker.clone(), bind.parse()?).await,
-                None => std::future::pending::<anyhow::Result<()>>().await,
-            }
-        };
-        let wss = async move {
-            match (wss_bind, wss_tls_cert, wss_tls_key) {
-                (Some(bind), Some(cert), Some(key)) => {
-                    serve_wss(wss_broker.clone(), bind.parse()?, cert, key).await
-                }
-                _ => std::future::pending::<anyhow::Result<()>>().await,
-            }
-        };
-        let quic = async move {
-            match (quic_bind, quic_tls_cert, quic_tls_key) {
-                (Some(bind), Some(cert), Some(key)) => {
-                    serve_quic(quic_broker.clone(), bind.parse()?, cert, key).await
-                }
-                _ => std::future::pending::<anyhow::Result<()>>().await,
-            }
-        };
         let rpc = RpcRuntime {
             sessiondict: broker.sessiondict.clone(),
             dist: broker.dist.clone(),
@@ -650,17 +932,77 @@ async fn main() -> anyhow::Result<()> {
             peer_sink: broker.clone(),
             assignment_registry: Some(shard_registry),
         };
-        let http_task = async move { http.start().await };
-        let rpc_task = async move { rpc.serve(rpc_bind).await };
-        let (http_result, mqtt_result, tls_result, ws_result, wss_result, quic_result, rpc_result) =
-            tokio::join!(http_task, mqtt, tls, ws, wss, quic, rpc_task);
-        http_result?;
-        mqtt_result?;
-        tls_result?;
-        ws_result?;
-        wss_result?;
-        quic_result?;
-        rpc_result?;
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move { http.start().await });
+        tasks.spawn(async move { rpc.serve(rpc_bind).await });
+        for listener in tcp_listeners {
+            let broker = broker.clone();
+            tasks.spawn(async move {
+                serve_tcp_with_profile(broker, listener.bind, listener.profile).await
+            });
+        }
+        if let (Some(cert), Some(key)) = (tls_cert.clone(), tls_key.clone()) {
+            let listeners = if tls_listeners.is_empty() {
+                tls_bind.into_iter().collect::<Vec<_>>()
+            } else {
+                tls_listeners
+            };
+            for listener in listeners {
+                let broker = broker.clone();
+                let cert = cert.clone();
+                let key = key.clone();
+                tasks.spawn(async move {
+                    serve_tls_with_profile(broker, listener.bind, cert, key, listener.profile).await
+                });
+            }
+        }
+        {
+            let listeners = if ws_listeners.is_empty() {
+                ws_bind.into_iter().collect::<Vec<_>>()
+            } else {
+                ws_listeners
+            };
+            for listener in listeners {
+                let broker = broker.clone();
+                tasks.spawn(async move {
+                    serve_ws_with_profile(broker, listener.bind, listener.profile).await
+                });
+            }
+        }
+        if let (Some(cert), Some(key)) = (tls_cert.clone(), tls_key.clone()) {
+            let listeners = if wss_listeners.is_empty() {
+                wss_bind.into_iter().collect::<Vec<_>>()
+            } else {
+                wss_listeners
+            };
+            for listener in listeners {
+                let broker = broker.clone();
+                let cert = cert.clone();
+                let key = key.clone();
+                tasks.spawn(async move {
+                    serve_wss_with_profile(broker, listener.bind, cert, key, listener.profile).await
+                });
+            }
+        }
+        if let (Some(cert), Some(key)) = (tls_cert, tls_key) {
+            let listeners = if quic_listeners.is_empty() {
+                quic_bind.into_iter().collect::<Vec<_>>()
+            } else {
+                quic_listeners
+            };
+            for listener in listeners {
+                let broker = broker.clone();
+                let cert = cert.clone();
+                let key = key.clone();
+                tasks.spawn(async move {
+                    serve_quic_with_profile(broker, listener.bind, cert, key, listener.profile)
+                        .await
+                });
+            }
+        }
+        while let Some(result) = tasks.join_next().await {
+            result??;
+        }
         return Ok(());
     }
 
@@ -1769,22 +2111,24 @@ fn validate_soak_report(report: &SoakReport, thresholds: SoakThresholds) -> anyh
     Ok(())
 }
 
-fn configured_hooks(node_id: u64) -> anyhow::Result<ConfiguredEventHook> {
+fn configured_hooks_for_profile(
+    node_id: u64,
+    profile: &str,
+) -> anyhow::Result<ConfiguredEventHook> {
     let mut hooks = Vec::new();
-    let rewrite_rules = std::env::var("GREENMQTT_TOPIC_REWRITE_RULES").unwrap_or_default();
+    let rewrite_rules =
+        profile_env_var("GREENMQTT_TOPIC_REWRITE_RULES", profile).unwrap_or_default();
     if !rewrite_rules.trim().is_empty() {
         hooks.push(HookTarget::TopicRewrite(TopicRewriteEventHook::new(
             parse_topic_rewrite_rules(&rewrite_rules)?,
         )));
     }
-    let rules = std::env::var("GREENMQTT_BRIDGE_RULES").unwrap_or_default();
+    let rules = profile_env_var("GREENMQTT_BRIDGE_RULES", profile).unwrap_or_default();
     if !rules.trim().is_empty() {
-        let timeout_ms = std::env::var("GREENMQTT_BRIDGE_TIMEOUT_MS")
-            .ok()
+        let timeout_ms = profile_env_var("GREENMQTT_BRIDGE_TIMEOUT_MS", profile)
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(5_000);
-        let fail_open = std::env::var("GREENMQTT_BRIDGE_FAIL_OPEN")
-            .ok()
+        let fail_open = profile_env_var("GREENMQTT_BRIDGE_FAIL_OPEN", profile)
             .map(|value| {
                 !matches!(
                     value.trim().to_ascii_lowercase().as_str(),
@@ -1792,16 +2136,13 @@ fn configured_hooks(node_id: u64) -> anyhow::Result<ConfiguredEventHook> {
                 )
             })
             .unwrap_or(true);
-        let retries = std::env::var("GREENMQTT_BRIDGE_RETRIES")
-            .ok()
+        let retries = profile_env_var("GREENMQTT_BRIDGE_RETRIES", profile)
             .and_then(|value| value.parse::<u32>().ok())
             .unwrap_or(0);
-        let retry_delay_ms = std::env::var("GREENMQTT_BRIDGE_RETRY_DELAY_MS")
-            .ok()
+        let retry_delay_ms = profile_env_var("GREENMQTT_BRIDGE_RETRY_DELAY_MS", profile)
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(0);
-        let max_inflight = std::env::var("GREENMQTT_BRIDGE_MAX_INFLIGHT")
-            .ok()
+        let max_inflight = profile_env_var("GREENMQTT_BRIDGE_MAX_INFLIGHT", profile)
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(16);
         hooks.push(HookTarget::Bridge(BridgeEventHook::with_options(
@@ -1814,10 +2155,14 @@ fn configured_hooks(node_id: u64) -> anyhow::Result<ConfiguredEventHook> {
             max_inflight,
         )));
     }
-    if let Some(webhook) = configured_webhook()? {
+    if let Some(webhook) = configured_webhook(profile)? {
         hooks.push(HookTarget::WebHook(webhook));
     }
     Ok(ConfiguredEventHook::new(hooks))
+}
+
+fn configured_hooks(node_id: u64) -> anyhow::Result<ConfiguredEventHook> {
+    configured_hooks_for_profile(node_id, "default")
 }
 
 fn parse_topic_rewrite_rules(raw: &str) -> anyhow::Result<Vec<TopicRewriteRule>> {
@@ -1849,13 +2194,114 @@ fn parse_topic_rewrite_rules(raw: &str) -> anyhow::Result<Vec<TopicRewriteRule>>
         .collect()
 }
 
-fn configured_webhook() -> anyhow::Result<Option<WebHookEventHook>> {
-    let url = std::env::var("GREENMQTT_WEBHOOK_URL").unwrap_or_default();
+fn normalize_profile_name(profile: &str) -> String {
+    profile
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn profile_env_var(key: &str, profile: &str) -> Option<String> {
+    if profile == "default" {
+        std::env::var(key).ok()
+    } else {
+        std::env::var(format!("{key}__{}", normalize_profile_name(profile)))
+            .ok()
+            .or_else(|| std::env::var(key).ok())
+    }
+}
+
+fn parse_listener_specs(raw: &str) -> anyhow::Result<Vec<ListenerSpec>> {
+    raw.split(',')
+        .filter(|entry| !entry.trim().is_empty())
+        .map(|entry| {
+            let entry = entry.trim();
+            let (bind, profile) = match entry.rsplit_once('@') {
+                Some((bind, profile)) if !profile.trim().is_empty() => (bind, profile.trim()),
+                _ => (entry, "default"),
+            };
+            Ok(ListenerSpec {
+                bind: bind.parse()?,
+                profile: profile.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn listener_specs_from_env(
+    single_key: &str,
+    multi_key: &str,
+    default_bind: &str,
+) -> anyhow::Result<Vec<ListenerSpec>> {
+    if let Ok(raw) = std::env::var(multi_key) {
+        if !raw.trim().is_empty() {
+            return parse_listener_specs(&raw);
+        }
+    }
+    let bind = std::env::var(single_key).unwrap_or_else(|_| default_bind.to_string());
+    parse_listener_specs(&bind)
+}
+
+fn collect_listener_profiles(listener_groups: &[&[ListenerSpec]]) -> Vec<String> {
+    let mut profiles = HashSet::new();
+    profiles.insert("default".to_string());
+    for group in listener_groups {
+        for listener in *group {
+            profiles.insert(listener.profile.clone());
+        }
+    }
+    let mut profiles = profiles.into_iter().collect::<Vec<_>>();
+    profiles.sort();
+    profiles
+}
+
+fn configured_listener_profiles(
+    node_id: u64,
+    profiles: &[String],
+) -> anyhow::Result<(PortMappedAuth, PortMappedAcl, PortMappedEventHook)> {
+    let mut auth_profiles = HashMap::new();
+    let mut acl_profiles = HashMap::new();
+    let mut hook_profiles = HashMap::new();
+    for profile in profiles {
+        auth_profiles.insert(profile.clone(), configured_auth_for_profile(profile)?);
+        acl_profiles.insert(profile.clone(), configured_acl_for_profile(profile)?);
+        hook_profiles.insert(
+            profile.clone(),
+            configured_hooks_for_profile(node_id, profile)?,
+        );
+    }
+    Ok((
+        PortMappedAuth::new("default", auth_profiles),
+        PortMappedAcl::new("default", acl_profiles),
+        PortMappedEventHook::new("default", hook_profiles),
+    ))
+}
+
+fn default_listener_profiles(
+    auth: ConfiguredAuth,
+    acl: ConfiguredAcl,
+    hooks: ConfiguredEventHook,
+) -> (PortMappedAuth, PortMappedAcl, PortMappedEventHook) {
+    (
+        PortMappedAuth::new("default", HashMap::from([(String::from("default"), auth)])),
+        PortMappedAcl::new("default", HashMap::from([(String::from("default"), acl)])),
+        PortMappedEventHook::new("default", HashMap::from([(String::from("default"), hooks)])),
+    )
+}
+
+fn configured_webhook(profile: &str) -> anyhow::Result<Option<WebHookEventHook>> {
+    let url = profile_env_var("GREENMQTT_WEBHOOK_URL", profile).unwrap_or_default();
     if url.trim().is_empty() {
         return Ok(None);
     }
-    let events = std::env::var("GREENMQTT_WEBHOOK_EVENTS")
-        .unwrap_or_else(|_| "publish,offline,retain".to_string());
+    let events = profile_env_var("GREENMQTT_WEBHOOK_EVENTS", profile)
+        .unwrap_or_else(|| "publish,offline,retain".to_string());
     let mut connect = false;
     let mut disconnect = false;
     let mut subscribe = false;
@@ -1895,13 +2341,15 @@ fn configured_webhook() -> anyhow::Result<Option<WebHookEventHook>> {
     })))
 }
 
-fn configured_auth() -> anyhow::Result<ConfiguredAuth> {
+fn configured_auth_for_profile(profile: &str) -> anyhow::Result<ConfiguredAuth> {
     let denied_identities = parse_identity_matchers(
-        &std::env::var("GREENMQTT_AUTH_DENY_IDENTITIES").unwrap_or_default(),
+        &profile_env_var("GREENMQTT_AUTH_DENY_IDENTITIES", profile).unwrap_or_default(),
     )?;
-    let enhanced_auth_method = std::env::var("GREENMQTT_ENHANCED_AUTH_METHOD").unwrap_or_default();
+    let enhanced_auth_method =
+        profile_env_var("GREENMQTT_ENHANCED_AUTH_METHOD", profile).unwrap_or_default();
     if !enhanced_auth_method.trim().is_empty() {
-        let raw_identities = std::env::var("GREENMQTT_AUTH_IDENTITIES").unwrap_or_default();
+        let raw_identities =
+            profile_env_var("GREENMQTT_AUTH_IDENTITIES", profile).unwrap_or_default();
         let identities = if raw_identities.trim().is_empty() {
             vec![IdentityMatcher {
                 tenant_id: "*".to_string(),
@@ -1911,10 +2359,10 @@ fn configured_auth() -> anyhow::Result<ConfiguredAuth> {
         } else {
             parse_identity_matchers(&raw_identities)?
         };
-        let challenge = std::env::var("GREENMQTT_ENHANCED_AUTH_CHALLENGE")
-            .unwrap_or_else(|_| "challenge".to_string());
-        let response = std::env::var("GREENMQTT_ENHANCED_AUTH_RESPONSE")
-            .unwrap_or_else(|_| "response".to_string());
+        let challenge = profile_env_var("GREENMQTT_ENHANCED_AUTH_CHALLENGE", profile)
+            .unwrap_or_else(|| "challenge".to_string());
+        let response = profile_env_var("GREENMQTT_ENHANCED_AUTH_RESPONSE", profile)
+            .unwrap_or_else(|| "response".to_string());
         return Ok(ConfiguredAuth::EnhancedStatic(
             StaticEnhancedAuthProvider::with_denied(
                 identities,
@@ -1925,7 +2373,7 @@ fn configured_auth() -> anyhow::Result<ConfiguredAuth> {
             ),
         ));
     }
-    let raw = std::env::var("GREENMQTT_AUTH_IDENTITIES").unwrap_or_default();
+    let raw = profile_env_var("GREENMQTT_AUTH_IDENTITIES", profile).unwrap_or_default();
     if !raw.trim().is_empty() || !denied_identities.is_empty() {
         let allowed_identities = if raw.trim().is_empty() {
             vec![IdentityMatcher {
@@ -1941,7 +2389,7 @@ fn configured_auth() -> anyhow::Result<ConfiguredAuth> {
             denied_identities,
         )));
     }
-    let http_auth_url = std::env::var("GREENMQTT_HTTP_AUTH_URL").unwrap_or_default();
+    let http_auth_url = profile_env_var("GREENMQTT_HTTP_AUTH_URL", profile).unwrap_or_default();
     if !http_auth_url.trim().is_empty() {
         return Ok(ConfiguredAuth::Http(HttpAuthProvider::new(
             HttpAuthConfig {
@@ -1952,10 +2400,13 @@ fn configured_auth() -> anyhow::Result<ConfiguredAuth> {
     Ok(ConfiguredAuth::default())
 }
 
-fn configured_acl() -> anyhow::Result<ConfiguredAcl> {
-    let raw = std::env::var("GREENMQTT_ACL_RULES").unwrap_or_default();
-    let acl_default_allow = std::env::var("GREENMQTT_ACL_DEFAULT_ALLOW")
-        .ok()
+fn configured_auth() -> anyhow::Result<ConfiguredAuth> {
+    configured_auth_for_profile("default")
+}
+
+fn configured_acl_for_profile(profile: &str) -> anyhow::Result<ConfiguredAcl> {
+    let raw = profile_env_var("GREENMQTT_ACL_RULES", profile).unwrap_or_default();
+    let acl_default_allow = profile_env_var("GREENMQTT_ACL_DEFAULT_ALLOW", profile)
         .map(|value| {
             matches!(
                 value.trim().to_ascii_lowercase().as_str(),
@@ -1968,13 +2419,17 @@ fn configured_acl() -> anyhow::Result<ConfiguredAcl> {
             StaticAclProvider::with_default_decision(parse_acl_rules(&raw)?, acl_default_allow),
         ));
     }
-    let http_acl_url = std::env::var("GREENMQTT_HTTP_ACL_URL").unwrap_or_default();
+    let http_acl_url = profile_env_var("GREENMQTT_HTTP_ACL_URL", profile).unwrap_or_default();
     if !http_acl_url.trim().is_empty() {
         return Ok(ConfiguredAcl::Http(HttpAclProvider::new(HttpAclConfig {
             url: http_acl_url.trim().to_string(),
         })));
     }
     Ok(ConfiguredAcl::default())
+}
+
+fn configured_acl() -> anyhow::Result<ConfiguredAcl> {
+    configured_acl_for_profile("default")
 }
 
 fn parse_identity_matchers(raw: &str) -> anyhow::Result<Vec<IdentityMatcher>> {
@@ -2200,6 +2655,11 @@ async fn compare_bench_broker(
     backend: &str,
     redis_url: &str,
 ) -> anyhow::Result<(AppBroker, Option<PathBuf>)> {
+    let (default_auth, default_acl, default_hooks) = default_listener_profiles(
+        ConfiguredAuth::default(),
+        ConfiguredAcl::default(),
+        ConfiguredEventHook::default(),
+    );
     let (sessiondict, dist, inbox, retain, cleanup_dir): CompareStateServices = match backend {
         "memory" => (
             Arc::new(SessionDictHandle::default()),
@@ -2237,9 +2697,9 @@ async fn compare_bench_broker(
                     .as_ref()
                     .map(|path| path.join("admin-audit.jsonl")),
             },
-            ConfiguredAuth::default(),
-            ConfiguredAcl::default(),
-            ConfiguredEventHook::default(),
+            default_auth,
+            default_acl,
+            default_hooks,
             sessiondict,
             dist,
             inbox,

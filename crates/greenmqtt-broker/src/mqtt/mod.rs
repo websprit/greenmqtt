@@ -28,7 +28,10 @@ use parser::{
 };
 use publish::{build_pubrel_packet, parse_puback, parse_publish, parse_pubrel};
 use subscribe::{parse_subscribe, parse_unsubscribe};
-pub use transport::{serve_quic, serve_tcp, serve_tls, serve_ws, serve_wss};
+pub use transport::{
+    serve_quic, serve_quic_with_profile, serve_tcp, serve_tcp_with_profile, serve_tls,
+    serve_tls_with_profile, serve_ws, serve_ws_with_profile, serve_wss, serve_wss_with_profile,
+};
 use util::packet_exceeds_limit;
 
 fn parse_packet_parts(

@@ -1,4 +1,4 @@
-use greenmqtt_plugin_api::{AclProvider, AuthProvider, EventHook};
+use greenmqtt_plugin_api::{with_listener_profile, AclProvider, AuthProvider, EventHook};
 use quinn::{Endpoint, RecvStream, SendStream};
 use std::io;
 use std::net::SocketAddr;
@@ -64,10 +64,24 @@ where
     C: AclProvider + 'static,
     H: EventHook + 'static,
 {
+    serve_tcp_with_profile(broker, bind, "default".to_string()).await
+}
+
+pub async fn serve_tcp_with_profile<A, C, H>(
+    broker: Arc<BrokerRuntime<A, C, H>>,
+    bind: SocketAddr,
+    listener_profile: String,
+) -> anyhow::Result<()>
+where
+    A: AuthProvider + 'static,
+    C: AclProvider + 'static,
+    H: EventHook + 'static,
+{
     let listener = TcpListener::bind(bind).await?;
     loop {
         let (stream, _) = listener.accept().await?;
         let broker = broker.clone();
+        let listener_profile = listener_profile.clone();
         let bandwidth = broker.bandwidth_limits();
         let permit = match broker.try_acquire_connection_slot() {
             Ok(permit) => permit,
@@ -78,9 +92,12 @@ where
         };
         tokio::spawn(async move {
             let permit_guard = permit;
-            if let Err(error) = drive_session(
-                TcpTransport::with_bandwidth(stream, bandwidth.0, bandwidth.1),
-                broker,
+            if let Err(error) = with_listener_profile(
+                listener_profile,
+                drive_session(
+                    TcpTransport::with_bandwidth(stream, bandwidth.0, bandwidth.1),
+                    broker,
+                ),
             )
             .await
             {
@@ -102,11 +119,27 @@ where
     C: AclProvider + 'static,
     H: EventHook + 'static,
 {
+    serve_tls_with_profile(broker, bind, cert_path, key_path, "default".to_string()).await
+}
+
+pub async fn serve_tls_with_profile<A, C, H>(
+    broker: Arc<BrokerRuntime<A, C, H>>,
+    bind: SocketAddr,
+    cert_path: impl AsRef<Path>,
+    key_path: impl AsRef<Path>,
+    listener_profile: String,
+) -> anyhow::Result<()>
+where
+    A: AuthProvider + 'static,
+    C: AclProvider + 'static,
+    H: EventHook + 'static,
+{
     let listener = TcpListener::bind(bind).await?;
     let acceptor = load_tls_acceptor(cert_path.as_ref(), key_path.as_ref())?;
     loop {
         let (stream, _) = listener.accept().await?;
         let broker = broker.clone();
+        let listener_profile = listener_profile.clone();
         let bandwidth = broker.bandwidth_limits();
         let acceptor = acceptor.clone();
         let permit = match broker.try_acquire_connection_slot() {
@@ -120,9 +153,12 @@ where
             let permit_guard = permit;
             match acceptor.accept(stream).await {
                 Ok(stream) => {
-                    if let Err(error) = drive_session(
-                        TcpTransport::with_bandwidth(stream, bandwidth.0, bandwidth.1),
-                        broker,
+                    if let Err(error) = with_listener_profile(
+                        listener_profile,
+                        drive_session(
+                            TcpTransport::with_bandwidth(stream, bandwidth.0, bandwidth.1),
+                            broker,
+                        ),
                     )
                     .await
                     {
@@ -147,10 +183,24 @@ where
     C: AclProvider + 'static,
     H: EventHook + 'static,
 {
+    serve_ws_with_profile(broker, bind, "default".to_string()).await
+}
+
+pub async fn serve_ws_with_profile<A, C, H>(
+    broker: Arc<BrokerRuntime<A, C, H>>,
+    bind: SocketAddr,
+    listener_profile: String,
+) -> anyhow::Result<()>
+where
+    A: AuthProvider + 'static,
+    C: AclProvider + 'static,
+    H: EventHook + 'static,
+{
     let listener = TcpListener::bind(bind).await?;
     loop {
         let (stream, _) = listener.accept().await?;
         let broker = broker.clone();
+        let listener_profile = listener_profile.clone();
         let bandwidth = broker.bandwidth_limits();
         let permit = match broker.try_acquire_connection_slot() {
             Ok(permit) => permit,
@@ -163,9 +213,12 @@ where
             let permit_guard = permit;
             match accept_async(stream).await {
                 Ok(stream) => {
-                    if let Err(error) = drive_session(
-                        WsTransport::with_bandwidth(stream, bandwidth.0, bandwidth.1),
-                        broker,
+                    if let Err(error) = with_listener_profile(
+                        listener_profile,
+                        drive_session(
+                            WsTransport::with_bandwidth(stream, bandwidth.0, bandwidth.1),
+                            broker,
+                        ),
                     )
                     .await
                     {
@@ -192,11 +245,27 @@ where
     C: AclProvider + 'static,
     H: EventHook + 'static,
 {
+    serve_wss_with_profile(broker, bind, cert_path, key_path, "default".to_string()).await
+}
+
+pub async fn serve_wss_with_profile<A, C, H>(
+    broker: Arc<BrokerRuntime<A, C, H>>,
+    bind: SocketAddr,
+    cert_path: impl AsRef<Path>,
+    key_path: impl AsRef<Path>,
+    listener_profile: String,
+) -> anyhow::Result<()>
+where
+    A: AuthProvider + 'static,
+    C: AclProvider + 'static,
+    H: EventHook + 'static,
+{
     let listener = TcpListener::bind(bind).await?;
     let acceptor = load_tls_acceptor(cert_path.as_ref(), key_path.as_ref())?;
     loop {
         let (stream, _) = listener.accept().await?;
         let broker = broker.clone();
+        let listener_profile = listener_profile.clone();
         let bandwidth = broker.bandwidth_limits();
         let acceptor = acceptor.clone();
         let permit = match broker.try_acquire_connection_slot() {
@@ -211,9 +280,12 @@ where
             match acceptor.accept(stream).await {
                 Ok(stream) => match accept_async(stream).await {
                     Ok(stream) => {
-                        if let Err(error) = drive_session(
-                            WsTransport::with_bandwidth(stream, bandwidth.0, bandwidth.1),
-                            broker,
+                        if let Err(error) = with_listener_profile(
+                            listener_profile,
+                            drive_session(
+                                WsTransport::with_bandwidth(stream, bandwidth.0, bandwidth.1),
+                                broker,
+                            ),
                         )
                         .await
                         {
@@ -244,6 +316,21 @@ where
     C: AclProvider + 'static,
     H: EventHook + 'static,
 {
+    serve_quic_with_profile(broker, bind, cert_path, key_path, "default".to_string()).await
+}
+
+pub async fn serve_quic_with_profile<A, C, H>(
+    broker: Arc<BrokerRuntime<A, C, H>>,
+    bind: SocketAddr,
+    cert_path: impl AsRef<Path>,
+    key_path: impl AsRef<Path>,
+    listener_profile: String,
+) -> anyhow::Result<()>
+where
+    A: AuthProvider + 'static,
+    C: AclProvider + 'static,
+    H: EventHook + 'static,
+{
     let endpoint = Endpoint::server(
         load_quic_server_config(cert_path.as_ref(), key_path.as_ref())?,
         bind,
@@ -253,6 +340,7 @@ where
             return Ok(());
         };
         let broker = broker.clone();
+        let listener_profile = listener_profile.clone();
         let bandwidth = broker.bandwidth_limits();
         tokio::spawn(async move {
             match incoming.await {
@@ -269,14 +357,18 @@ where
                         match connection.accept_bi().await {
                             Ok((send, recv)) => {
                                 let broker = broker.clone();
+                                let listener_profile = listener_profile.clone();
                                 tokio::spawn(async move {
-                                    if let Err(error) = drive_session(
-                                        TcpTransport::with_bandwidth(
-                                            QuicBiStream { send, recv },
-                                            bandwidth.0,
-                                            bandwidth.1,
+                                    if let Err(error) = with_listener_profile(
+                                        listener_profile,
+                                        drive_session(
+                                            TcpTransport::with_bandwidth(
+                                                QuicBiStream { send, recv },
+                                                bandwidth.0,
+                                                bandwidth.1,
+                                            ),
+                                            broker,
                                         ),
-                                        broker,
                                     )
                                     .await
                                     {

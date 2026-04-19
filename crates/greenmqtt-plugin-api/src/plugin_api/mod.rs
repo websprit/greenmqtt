@@ -3,6 +3,11 @@ use greenmqtt_core::{
     ClientIdentity, OfflineMessage, PublishOutcome, PublishRequest, RetainedMessage, SessionRecord,
     Subscription,
 };
+use std::future::Future;
+
+tokio::task_local! {
+    static LISTENER_PROFILE: String;
+}
 
 pub const BRIDGE_CLIENT_ID_PREFIX: &str = "greenmqtt-bridge-";
 pub const BRIDGE_TRACE_ID_PROPERTY: &str = "greenmqtt-bridge-trace-id";
@@ -105,4 +110,15 @@ pub trait EventHook: Send + Sync {
     ) -> anyhow::Result<()> {
         Ok(())
     }
+}
+
+pub async fn with_listener_profile<F, R>(profile: String, future: F) -> R
+where
+    F: Future<Output = R>,
+{
+    LISTENER_PROFILE.scope(profile, future).await
+}
+
+pub fn current_listener_profile() -> Option<String> {
+    LISTENER_PROFILE.try_with(|profile| profile.clone()).ok()
 }
