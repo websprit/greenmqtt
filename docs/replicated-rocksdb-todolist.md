@@ -133,8 +133,13 @@ Naming rules:
 - `greenmqtt-rpc` now exposes gRPC metadata APIs plus generic range get/scan/apply/checkpoint/snapshot
   RPCs backed by the in-memory range host.
 - `greenmqtt-retain` now includes a range-backed retain implementation that works over both
-  local executors and the gRPC kv-range executor, but broker/runtime wiring still points to the
-  legacy retain implementations.
+  local executors and the gRPC kv-range executor, and CLI/runtime wiring now supports an opt-in
+  replicated retain mode while legacy retain remains the default.
 - `greenmqtt-dist` now includes a range-backed dist implementation over kv-range, but broker/runtime
-  wiring still points to the legacy dist implementations.
+  wiring now supports an opt-in replicated dist mode while legacy dist remains the default.
+- `greenmqtt-sessiondict` now includes a range-backed session directory implementation, and
+  CLI/runtime wiring now supports an opt-in replicated sessiondict mode while legacy sessiondict
+  remains the default.
+- `greenmqtt-inbox` now includes a range-backed inbox/inflight implementation, and CLI/runtime
+  wiring now supports an opt-in replicated inbox mode while legacy inbox remains the default.
 - RocksDB-backed range engine and real replicated raft behavior remain unfinished.

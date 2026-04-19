@@ -1,12 +1,18 @@
 use super::{
     inbox_session_shard, inbox_tenant_scan_shard, inflight_session_shard,
     inflight_tenant_scan_shard, subscription_shard, InboxHandle, InboxService,
-    PersistentInboxHandle,
+    PersistentInboxHandle, ReplicatedInboxHandle,
 };
 use async_trait::async_trait;
+use bytes::Bytes;
 use greenmqtt_core::{
-    InflightMessage, InflightPhase, OfflineMessage, PublishProperties, ServiceShardKey,
-    SessionKind, Subscription,
+    InflightMessage, InflightPhase, OfflineMessage, PublishProperties, RangeBoundary,
+    RangeReplica, ReplicaRole, ReplicaSyncState, ReplicatedRangeDescriptor, ServiceShardKey,
+    ServiceShardLifecycle, SessionKind, Subscription,
+};
+use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter, MemoryKvRangeRouter};
+use greenmqtt_kv_engine::{
+    KvEngine, KvMutation, KvRangeBootstrap, KvRangeCheckpoint, KvRangeSnapshot, MemoryKvEngine,
 };
 use greenmqtt_storage::{
     InboxStore, InflightStore, MemoryInboxStore, MemoryInflightStore, MemorySubscriptionStore,
@@ -14,6 +20,50 @@ use greenmqtt_storage::{
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+
+#[derive(Clone)]
+struct LocalKvRangeExecutor {
+    engine: MemoryKvEngine,
+}
+
+#[async_trait]
+impl KvRangeExecutor for LocalKvRangeExecutor {
+    async fn get(&self, range_id: &str, key: &[u8]) -> anyhow::Result<Option<Bytes>> {
+        let range = self.engine.open_range(range_id).await?;
+        range.reader().get(key).await
+    }
+
+    async fn scan(
+        &self,
+        range_id: &str,
+        boundary: Option<RangeBoundary>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
+        let range = self.engine.open_range(range_id).await?;
+        range.reader()
+            .scan(&boundary.unwrap_or_else(RangeBoundary::full), limit)
+            .await
+    }
+
+    async fn apply(&self, range_id: &str, mutations: Vec<KvMutation>) -> anyhow::Result<()> {
+        let range = self.engine.open_range(range_id).await?;
+        range.writer().apply(mutations).await
+    }
+
+    async fn checkpoint(
+        &self,
+        range_id: &str,
+        checkpoint_id: &str,
+    ) -> anyhow::Result<KvRangeCheckpoint> {
+        let range = self.engine.open_range(range_id).await?;
+        range.checkpoint(checkpoint_id).await
+    }
+
+    async fn snapshot(&self, range_id: &str) -> anyhow::Result<KvRangeSnapshot> {
+        let range = self.engine.open_range(range_id).await?;
+        range.snapshot().await
+    }
+}
 
 #[tokio::test]
 async fn fetch_drains_offline_queue() {
@@ -1950,4 +2000,120 @@ async fn list_all_offline_and_inflight_return_global_views() {
 
     assert_eq!(inbox.list_all_offline().await.unwrap().len(), 2);
     assert_eq!(inbox.list_all_inflight().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn replicated_inbox_handles_subscriptions_offline_and_inflight_over_kv_ranges() {
+    let engine = MemoryKvEngine::default();
+    engine
+        .bootstrap(KvRangeBootstrap {
+            range_id: "inbox-range-t1".into(),
+            boundary: RangeBoundary::full(),
+        })
+        .await
+        .unwrap();
+    engine
+        .bootstrap(KvRangeBootstrap {
+            range_id: "inflight-range-t1".into(),
+            boundary: RangeBoundary::full(),
+        })
+        .await
+        .unwrap();
+
+    let router = Arc::new(MemoryKvRangeRouter::default());
+    router
+        .upsert(ReplicatedRangeDescriptor::new(
+            "inbox-range-t1",
+            inbox_tenant_scan_shard("t1"),
+            RangeBoundary::full(),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ))
+        .await
+        .unwrap();
+    router
+        .upsert(ReplicatedRangeDescriptor::new(
+            "inflight-range-t1",
+            inflight_tenant_scan_shard("t1"),
+            RangeBoundary::full(),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ))
+        .await
+        .unwrap();
+
+    let inbox = ReplicatedInboxHandle::new(
+        router,
+        Arc::new(LocalKvRangeExecutor {
+            engine: engine.clone(),
+        }),
+    );
+    let subscription = Subscription {
+        session_id: "s1".into(),
+        tenant_id: "t1".into(),
+        topic_filter: "devices/+/state".into(),
+        qos: 1,
+        subscription_identifier: None,
+        no_local: false,
+        retain_as_published: false,
+        retain_handling: 0,
+        shared_group: Some("workers".into()),
+        kind: SessionKind::Persistent,
+    };
+    inbox.subscribe(subscription.clone()).await.unwrap();
+    assert_eq!(inbox.list_subscriptions(&"s1".into()).await.unwrap(), vec![subscription]);
+
+    inbox
+        .enqueue(OfflineMessage {
+            tenant_id: "t1".into(),
+            session_id: "s1".into(),
+            topic: "devices/a/state".into(),
+            payload: b"offline".to_vec().into(),
+            qos: 1,
+            retain: false,
+            from_session_id: "src".into(),
+            properties: PublishProperties::default(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(inbox.peek(&"s1".into()).await.unwrap().len(), 1);
+    assert_eq!(inbox.fetch(&"s1".into()).await.unwrap().len(), 1);
+    assert!(inbox.peek(&"s1".into()).await.unwrap().is_empty());
+
+    inbox
+        .stage_inflight(InflightMessage {
+            tenant_id: "t1".into(),
+            session_id: "s1".into(),
+            packet_id: 42,
+            topic: "devices/a/state".into(),
+            payload: b"inflight".to_vec().into(),
+            qos: 1,
+            retain: false,
+            from_session_id: "src".into(),
+            properties: PublishProperties::default(),
+            phase: InflightPhase::Publish,
+        })
+        .await
+        .unwrap();
+    assert_eq!(inbox.fetch_inflight(&"s1".into()).await.unwrap().len(), 1);
+    inbox.ack_inflight(&"s1".into(), 42).await.unwrap();
+    assert!(inbox.fetch_inflight(&"s1".into()).await.unwrap().is_empty());
 }

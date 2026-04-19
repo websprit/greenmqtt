@@ -854,7 +854,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bincode",
+ "bytes",
  "greenmqtt-core",
+ "greenmqtt-kv-client",
+ "greenmqtt-kv-engine",
  "greenmqtt-storage",
  "tokio",
 ]
@@ -987,7 +991,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bincode",
+ "bytes",
  "greenmqtt-core",
+ "greenmqtt-kv-client",
+ "greenmqtt-kv-engine",
  "greenmqtt-storage",
  "tokio",
 ]

@@ -9,9 +9,9 @@ use greenmqtt_core::{
     ConnectRequest, Lifecycle, PublishProperties, PublishRequest, ServiceEndpoint, ServiceKind,
     SessionKind,
 };
-use greenmqtt_dist::{DistHandle, DistRouter, PersistentDistHandle};
+use greenmqtt_dist::{DistHandle, DistRouter, PersistentDistHandle, ReplicatedDistHandle};
 use greenmqtt_http_api::HttpApi;
-use greenmqtt_inbox::{InboxHandle, InboxService, PersistentInboxHandle};
+use greenmqtt_inbox::{InboxHandle, InboxService, PersistentInboxHandle, ReplicatedInboxHandle};
 use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter};
 use greenmqtt_plugin_api::{
     current_listener_profile, AclAction, AclDecision, AclProvider, AclRule, AuthProvider,
@@ -25,7 +25,9 @@ use greenmqtt_rpc::{
     DistGrpcClient, InboxGrpcClient, KvRangeGrpcClient, MetadataGrpcClient, RetainGrpcClient,
     RpcRuntime, SessionDictGrpcClient, StaticPeerForwarder, StaticServiceEndpointRegistry,
 };
-use greenmqtt_sessiondict::{PersistentSessionDictHandle, SessionDictHandle, SessionDirectory};
+use greenmqtt_sessiondict::{
+    PersistentSessionDictHandle, ReplicatedSessionDictHandle, SessionDictHandle, SessionDirectory,
+};
 use greenmqtt_storage::{
     RedisInboxStore, RedisInflightStore, RedisRetainStore, RedisRouteStore, RedisSessionStore,
     RedisSubscriptionStore, RocksInboxStore, RocksInflightStore, RocksRetainStore, RocksRouteStore,
@@ -664,7 +666,8 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
     let output_mode = output_mode();
 
-    let (sessiondict, dist, inbox, default_retain): AppStateServices = match state_endpoint.as_deref() {
+    let (default_sessiondict, default_dist, default_inbox, default_retain): AppStateServices =
+        match state_endpoint.as_deref() {
         Some(endpoint) => (
             Arc::new(SessionDictGrpcClient::connect(endpoint).await?),
             Arc::new(DistGrpcClient::connect(endpoint).await?),
@@ -684,9 +687,13 @@ async fn main() -> anyhow::Result<()> {
                         Arc::new(RetainHandle::default()),
                     ),
                 }
+                }
             }
-        }
-    };
+        };
+    let sessiondict =
+        configured_sessiondict_service(default_sessiondict, state_endpoint.as_deref()).await?;
+    let dist = configured_dist_service(default_dist, state_endpoint.as_deref()).await?;
+    let inbox = configured_inbox_service(default_inbox, state_endpoint.as_deref()).await?;
     let retain = configured_retain_service(default_retain, state_endpoint.as_deref()).await?;
 
     let tcp_listeners = if mode == "serve" {
@@ -2680,6 +2687,120 @@ async fn configured_retain_service(
             Ok(Arc::new(ReplicatedRetainHandle::new(router, executor)))
         }
         other => anyhow::bail!("unsupported GREENMQTT_RETAIN_MODE: {other}"),
+    }
+}
+
+async fn configured_dist_service(
+    default_dist: Arc<dyn DistRouter>,
+    state_endpoint: Option<&str>,
+) -> anyhow::Result<Arc<dyn DistRouter>> {
+    let mode = std::env::var("GREENMQTT_DIST_MODE")
+        .unwrap_or_else(|_| "legacy".to_string())
+        .to_lowercase();
+    match mode.as_str() {
+        "legacy" => Ok(default_dist),
+        "replicated" => {
+            let metadata_endpoint = std::env::var("GREENMQTT_METADATA_ENDPOINT")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| state_endpoint.map(ToString::to_string))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "replicated dist mode requires GREENMQTT_METADATA_ENDPOINT or GREENMQTT_STATE_ENDPOINT"
+                    )
+                })?;
+            let range_endpoint = std::env::var("GREENMQTT_RANGE_ENDPOINT")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| state_endpoint.map(ToString::to_string))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "replicated dist mode requires GREENMQTT_RANGE_ENDPOINT or GREENMQTT_STATE_ENDPOINT"
+                    )
+                })?;
+            let router: Arc<dyn KvRangeRouter> =
+                Arc::new(MetadataGrpcClient::connect(metadata_endpoint).await?);
+            let executor: Arc<dyn KvRangeExecutor> =
+                Arc::new(KvRangeGrpcClient::connect(range_endpoint).await?);
+            Ok(Arc::new(ReplicatedDistHandle::new(router, executor)))
+        }
+        other => anyhow::bail!("unsupported GREENMQTT_DIST_MODE: {other}"),
+    }
+}
+
+async fn configured_sessiondict_service(
+    default_sessiondict: Arc<dyn SessionDirectory>,
+    state_endpoint: Option<&str>,
+) -> anyhow::Result<Arc<dyn SessionDirectory>> {
+    let mode = std::env::var("GREENMQTT_SESSIONDICT_MODE")
+        .unwrap_or_else(|_| "legacy".to_string())
+        .to_lowercase();
+    match mode.as_str() {
+        "legacy" => Ok(default_sessiondict),
+        "replicated" => {
+            let metadata_endpoint = std::env::var("GREENMQTT_METADATA_ENDPOINT")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| state_endpoint.map(ToString::to_string))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "replicated sessiondict mode requires GREENMQTT_METADATA_ENDPOINT or GREENMQTT_STATE_ENDPOINT"
+                    )
+                })?;
+            let range_endpoint = std::env::var("GREENMQTT_RANGE_ENDPOINT")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| state_endpoint.map(ToString::to_string))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "replicated sessiondict mode requires GREENMQTT_RANGE_ENDPOINT or GREENMQTT_STATE_ENDPOINT"
+                    )
+                })?;
+            let router: Arc<dyn KvRangeRouter> =
+                Arc::new(MetadataGrpcClient::connect(metadata_endpoint).await?);
+            let executor: Arc<dyn KvRangeExecutor> =
+                Arc::new(KvRangeGrpcClient::connect(range_endpoint).await?);
+            Ok(Arc::new(ReplicatedSessionDictHandle::new(router, executor)))
+        }
+        other => anyhow::bail!("unsupported GREENMQTT_SESSIONDICT_MODE: {other}"),
+    }
+}
+
+async fn configured_inbox_service(
+    default_inbox: Arc<dyn InboxService>,
+    state_endpoint: Option<&str>,
+) -> anyhow::Result<Arc<dyn InboxService>> {
+    let mode = std::env::var("GREENMQTT_INBOX_MODE")
+        .unwrap_or_else(|_| "legacy".to_string())
+        .to_lowercase();
+    match mode.as_str() {
+        "legacy" => Ok(default_inbox),
+        "replicated" => {
+            let metadata_endpoint = std::env::var("GREENMQTT_METADATA_ENDPOINT")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| state_endpoint.map(ToString::to_string))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "replicated inbox mode requires GREENMQTT_METADATA_ENDPOINT or GREENMQTT_STATE_ENDPOINT"
+                    )
+                })?;
+            let range_endpoint = std::env::var("GREENMQTT_RANGE_ENDPOINT")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| state_endpoint.map(ToString::to_string))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "replicated inbox mode requires GREENMQTT_RANGE_ENDPOINT or GREENMQTT_STATE_ENDPOINT"
+                    )
+                })?;
+            let router: Arc<dyn KvRangeRouter> =
+                Arc::new(MetadataGrpcClient::connect(metadata_endpoint).await?);
+            let executor: Arc<dyn KvRangeExecutor> =
+                Arc::new(KvRangeGrpcClient::connect(range_endpoint).await?);
+            Ok(Arc::new(ReplicatedInboxHandle::new(router, executor)))
+        }
+        other => anyhow::bail!("unsupported GREENMQTT_INBOX_MODE: {other}"),
     }
 }
 

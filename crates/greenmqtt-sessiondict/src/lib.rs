@@ -1,5 +1,8 @@
 use async_trait::async_trait;
+use bytes::Bytes;
 use greenmqtt_core::{ClientIdentity, Lifecycle, ServiceShardKey, ServiceShardKind, SessionRecord};
+use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter};
+use greenmqtt_kv_engine::KvMutation;
 use greenmqtt_storage::SessionStore;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -126,6 +129,12 @@ pub struct PersistentSessionDictHandle {
     inner: Arc<RwLock<SessionDirectoryState>>,
 }
 
+#[derive(Clone)]
+pub struct ReplicatedSessionDictHandle {
+    router: Arc<dyn KvRangeRouter>,
+    executor: Arc<dyn KvRangeExecutor>,
+}
+
 pub fn session_record_shard(record: &SessionRecord) -> ServiceShardKey {
     ServiceShardKey::sessiondict(record.identity.tenant_id.clone(), record.session_id.clone())
 }
@@ -182,6 +191,112 @@ impl PersistentSessionDictHandle {
             None
         }
     }
+}
+
+impl ReplicatedSessionDictHandle {
+    pub fn new(router: Arc<dyn KvRangeRouter>, executor: Arc<dyn KvRangeExecutor>) -> Self {
+        Self { router, executor }
+    }
+
+    async fn tenant_routes(&self, tenant_id: &str) -> anyhow::Result<Vec<greenmqtt_kv_client::RangeRoute>> {
+        self.router.route_shard(&session_scan_shard(tenant_id)).await
+    }
+
+    async fn apply_grouped(
+        &self,
+        tenant_id: &str,
+        mutations: Vec<KvMutation>,
+    ) -> anyhow::Result<()> {
+        let shard = session_scan_shard(tenant_id);
+        let mut grouped: HashMap<String, Vec<KvMutation>> = HashMap::new();
+        for mutation in mutations {
+            let route = self
+                .router
+                .route_key(&shard, &mutation.key)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("no sessiondict range available for tenant {tenant_id}"))?;
+            grouped
+                .entry(route.descriptor.id.clone())
+                .or_default()
+                .push(mutation);
+        }
+        for (range_id, mutations) in grouped {
+            self.executor.apply(&range_id, mutations).await?;
+        }
+        Ok(())
+    }
+
+    async fn scan_session_records_for_tenant(&self, tenant_id: &str) -> anyhow::Result<Vec<SessionRecord>> {
+        let mut records = Vec::new();
+        for route in self.tenant_routes(tenant_id).await? {
+            for (key, value) in self
+                .executor
+                .scan(&route.descriptor.id, None, usize::MAX)
+                .await?
+            {
+                if key.starts_with(SESSION_KEY_PREFIX) {
+                    let record = decode_session_record(&value)?;
+                    if record.identity.tenant_id == tenant_id {
+                        records.push(record);
+                    }
+                }
+            }
+        }
+        records.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+        Ok(records)
+    }
+
+    async fn scan_all_session_records(&self) -> anyhow::Result<Vec<SessionRecord>> {
+        let mut records = Vec::new();
+        for descriptor in self.router.list().await? {
+            if descriptor.shard.kind != ServiceShardKind::SessionDict {
+                continue;
+            }
+            for (key, value) in self
+                .executor
+                .scan(&descriptor.id, None, usize::MAX)
+                .await?
+            {
+                if key.starts_with(SESSION_KEY_PREFIX) {
+                    records.push(decode_session_record(&value)?);
+                }
+            }
+        }
+        records.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+        Ok(records)
+    }
+}
+
+const IDENTITY_KEY_PREFIX: &[u8] = b"identity\0";
+const SESSION_KEY_PREFIX: &[u8] = b"session\0";
+
+fn encoded_identity_key(identity: &ClientIdentity) -> Bytes {
+    let mut key = Vec::with_capacity(
+        IDENTITY_KEY_PREFIX.len()
+            + identity.user_id.len()
+            + identity.client_id.len()
+            + 2,
+    );
+    key.extend_from_slice(IDENTITY_KEY_PREFIX);
+    key.extend_from_slice(identity.user_id.as_bytes());
+    key.push(0);
+    key.extend_from_slice(identity.client_id.as_bytes());
+    Bytes::from(key)
+}
+
+fn encoded_session_key(session_id: &str) -> Bytes {
+    let mut key = Vec::with_capacity(SESSION_KEY_PREFIX.len() + session_id.len());
+    key.extend_from_slice(SESSION_KEY_PREFIX);
+    key.extend_from_slice(session_id.as_bytes());
+    Bytes::from(key)
+}
+
+fn encode_session_record(record: &SessionRecord) -> anyhow::Result<Bytes> {
+    Ok(Bytes::from(bincode::serialize(record)?))
+}
+
+fn decode_session_record(value: &[u8]) -> anyhow::Result<SessionRecord> {
+    Ok(bincode::deserialize(value)?)
 }
 
 #[async_trait]
@@ -421,6 +536,122 @@ impl SessionDirectory for PersistentSessionDictHandle {
 }
 
 #[async_trait]
+impl SessionDirectory for ReplicatedSessionDictHandle {
+    async fn register(&self, record: SessionRecord) -> anyhow::Result<Option<SessionRecord>> {
+        let replaced_by_identity = self.lookup_identity(&record.identity).await?;
+        let replaced_by_session = self.lookup_session(&record.session_id).await?;
+        let replaced = replaced_by_identity.clone().or(replaced_by_session.clone());
+        let mut mutations = Vec::new();
+
+        if let Some(previous) = replaced_by_identity {
+            mutations.push(KvMutation {
+                key: encoded_identity_key(&previous.identity),
+                value: None,
+            });
+            mutations.push(KvMutation {
+                key: encoded_session_key(&previous.session_id),
+                value: None,
+            });
+        }
+
+        if let Some(previous) = replaced_by_session {
+            if replaced
+                .as_ref()
+                .map(|candidate| candidate.session_id.as_str())
+                != Some(previous.session_id.as_str())
+            {
+                mutations.push(KvMutation {
+                    key: encoded_identity_key(&previous.identity),
+                    value: None,
+                });
+                mutations.push(KvMutation {
+                    key: encoded_session_key(&previous.session_id),
+                    value: None,
+                });
+            }
+        }
+
+        let encoded = encode_session_record(&record)?;
+        mutations.push(KvMutation {
+            key: encoded_identity_key(&record.identity),
+            value: Some(encoded.clone()),
+        });
+        mutations.push(KvMutation {
+            key: encoded_session_key(&record.session_id),
+            value: Some(encoded),
+        });
+        self.apply_grouped(&record.identity.tenant_id, mutations).await?;
+        Ok(replaced)
+    }
+
+    async fn unregister(&self, session_id: &str) -> anyhow::Result<Option<SessionRecord>> {
+        let Some(record) = self.lookup_session(session_id).await? else {
+            return Ok(None);
+        };
+        self.apply_grouped(
+            &record.identity.tenant_id,
+            vec![
+                KvMutation {
+                    key: encoded_identity_key(&record.identity),
+                    value: None,
+                },
+                KvMutation {
+                    key: encoded_session_key(&record.session_id),
+                    value: None,
+                },
+            ],
+        )
+        .await?;
+        Ok(Some(record))
+    }
+
+    async fn lookup_identity(
+        &self,
+        identity: &ClientIdentity,
+    ) -> anyhow::Result<Option<SessionRecord>> {
+        let shard = session_scan_shard(&identity.tenant_id);
+        let Some(route) = self
+            .router
+            .route_key(&shard, &encoded_identity_key(identity))
+            .await?
+        else {
+            return Ok(None);
+        };
+        self.executor
+            .get(&route.descriptor.id, &encoded_identity_key(identity))
+            .await?
+            .map(|value| decode_session_record(&value))
+            .transpose()
+    }
+
+    async fn lookup_session(&self, session_id: &str) -> anyhow::Result<Option<SessionRecord>> {
+        let target_key = encoded_session_key(session_id);
+        for descriptor in self.router.list().await? {
+            if descriptor.shard.kind != ServiceShardKind::SessionDict {
+                continue;
+            }
+            for (key, value) in self.executor.scan(&descriptor.id, None, usize::MAX).await? {
+                if key == target_key {
+                    return Ok(Some(decode_session_record(&value)?));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    async fn list_sessions(&self, tenant_id: Option<&str>) -> anyhow::Result<Vec<SessionRecord>> {
+        match tenant_id {
+            Some(tenant_id) => self.scan_session_records_for_tenant(tenant_id).await,
+            None => self.scan_all_session_records().await,
+        }
+    }
+
+    async fn session_count(&self) -> anyhow::Result<usize> {
+        Ok(self.scan_all_session_records().await?.len())
+    }
+}
+
+#[async_trait]
 impl Lifecycle for SessionDictHandle {
     async fn start(&self) -> anyhow::Result<()> {
         Ok(())
@@ -446,13 +677,67 @@ impl Lifecycle for PersistentSessionDictHandle {
 mod tests {
     use super::{
         session_identity_shard, session_record_shard, session_scan_shard,
-        PersistentSessionDictHandle, SessionDictHandle, SessionDirectory, SessionDirectoryState,
+        PersistentSessionDictHandle, ReplicatedSessionDictHandle, SessionDictHandle,
+        SessionDirectory, SessionDirectoryState,
     };
     use async_trait::async_trait;
-    use greenmqtt_core::{ClientIdentity, ServiceShardKey, SessionKind, SessionRecord};
+    use bytes::Bytes;
+    use greenmqtt_core::{
+        ClientIdentity, RangeBoundary, RangeReplica, ReplicaRole, ReplicaSyncState,
+        ReplicatedRangeDescriptor, ServiceShardKey, ServiceShardLifecycle, SessionKind,
+        SessionRecord,
+    };
+    use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter, MemoryKvRangeRouter};
+    use greenmqtt_kv_engine::{
+        KvEngine, KvMutation, KvRangeBootstrap, KvRangeCheckpoint, KvRangeSnapshot, MemoryKvEngine,
+    };
     use greenmqtt_storage::{MemorySessionStore, SessionStore};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[derive(Clone)]
+    struct LocalKvRangeExecutor {
+        engine: MemoryKvEngine,
+    }
+
+    #[async_trait]
+    impl KvRangeExecutor for LocalKvRangeExecutor {
+        async fn get(&self, range_id: &str, key: &[u8]) -> anyhow::Result<Option<Bytes>> {
+            let range = self.engine.open_range(range_id).await?;
+            range.reader().get(key).await
+        }
+
+        async fn scan(
+            &self,
+            range_id: &str,
+            boundary: Option<RangeBoundary>,
+            limit: usize,
+        ) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
+            let range = self.engine.open_range(range_id).await?;
+            range.reader()
+                .scan(&boundary.unwrap_or_else(RangeBoundary::full), limit)
+                .await
+        }
+
+        async fn apply(&self, range_id: &str, mutations: Vec<KvMutation>) -> anyhow::Result<()> {
+            let range = self.engine.open_range(range_id).await?;
+            range.writer().apply(mutations).await
+        }
+
+        async fn checkpoint(
+            &self,
+            range_id: &str,
+            checkpoint_id: &str,
+        ) -> anyhow::Result<KvRangeCheckpoint> {
+            let range = self.engine.open_range(range_id).await?;
+            range.checkpoint(checkpoint_id).await
+        }
+
+        async fn snapshot(&self, range_id: &str) -> anyhow::Result<KvRangeSnapshot> {
+            let range = self.engine.open_range(range_id).await?;
+            range.snapshot().await
+        }
+    }
 
     #[tokio::test]
     async fn replacing_same_client_returns_previous_session() {
@@ -492,6 +777,80 @@ mod tests {
                 .session_id,
             "s2"
         );
+    }
+
+    #[tokio::test]
+    async fn replicated_sessiondict_registers_looks_up_and_unregisters_sessions() {
+        let engine = MemoryKvEngine::default();
+        engine
+            .bootstrap(KvRangeBootstrap {
+                range_id: "session-range-t1".into(),
+                boundary: RangeBoundary::full(),
+            })
+            .await
+            .unwrap();
+        let router = Arc::new(MemoryKvRangeRouter::default());
+        router
+            .upsert(ReplicatedRangeDescriptor::new(
+                "session-range-t1",
+                session_scan_shard("t1"),
+                RangeBoundary::full(),
+                1,
+                1,
+                Some(1),
+                vec![RangeReplica::new(
+                    1,
+                    ReplicaRole::Voter,
+                    ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ))
+            .await
+            .unwrap();
+        let service = ReplicatedSessionDictHandle::new(
+            router,
+            Arc::new(LocalKvRangeExecutor {
+                engine: engine.clone(),
+            }),
+        );
+
+        let identity = ClientIdentity {
+            tenant_id: "t1".into(),
+            user_id: "u1".into(),
+            client_id: "c1".into(),
+        };
+        let record = SessionRecord {
+            session_id: "s1".into(),
+            node_id: 1,
+            kind: SessionKind::Persistent,
+            identity: identity.clone(),
+            session_expiry_interval_secs: Some(60),
+            expires_at_ms: Some(1234),
+        };
+        assert!(service.register(record.clone()).await.unwrap().is_none());
+        assert_eq!(
+            service
+                .lookup_identity(&identity)
+                .await
+                .unwrap()
+                .unwrap()
+                .session_id,
+            "s1"
+        );
+        assert_eq!(
+            service.lookup_session("s1").await.unwrap().unwrap().node_id,
+            1
+        );
+        assert_eq!(service.list_sessions(Some("t1")).await.unwrap().len(), 1);
+        assert_eq!(service.session_count().await.unwrap(), 1);
+
+        let removed = service.unregister("s1").await.unwrap().unwrap();
+        assert_eq!(removed.session_id, "s1");
+        assert!(service.lookup_identity(&identity).await.unwrap().is_none());
+        assert!(service.lookup_session("s1").await.unwrap().is_none());
+        assert_eq!(service.session_count().await.unwrap(), 0);
     }
 
     #[test]
