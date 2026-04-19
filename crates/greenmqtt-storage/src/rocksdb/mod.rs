@@ -1,24 +1,24 @@
 use super::{InboxStore, InflightStore, RetainStore, RouteStore, SessionStore, SubscriptionStore};
 use crate::{
-    inbox_key, inbox_prefix, inbox_tenant_index_key, inbox_tenant_prefix, inflight_key,
-    inflight_prefix, inflight_tenant_index_key, inflight_tenant_prefix, is_inbox_internal_key,
-    is_inflight_internal_key, is_route_internal_key, is_session_internal_key,
-    is_subscription_internal_key, next_inbox_seq, open_rocks_db, read_rocks_count, retain_key,
-    retain_prefix, route_exact_index_key, route_exact_index_prefix, route_filter_index_key,
-    route_filter_index_prefix, route_filter_shared_index_key, route_filter_shared_index_prefix,
-    route_key, route_prefix, route_session_index_key, route_session_index_prefix,
-    route_session_topic_shared_index_key, route_session_topic_shared_index_key_from_parts,
-    route_tenant_shared_index_key, route_tenant_shared_index_prefix, route_topic_filter_is_exact,
-    route_wildcard_index_key, route_wildcard_index_prefix, session_id_index_key, session_key,
-    session_prefix, subscription_key, subscription_prefix, subscription_tenant_index_key,
+    decode_rocks_value, encode_rocks_value, inbox_key, inbox_prefix, inbox_tenant_index_key,
+    inbox_tenant_prefix, inflight_key, inflight_prefix, inflight_tenant_index_key,
+    inflight_tenant_prefix, is_inbox_internal_key, is_inflight_internal_key, is_route_internal_key,
+    is_session_internal_key, is_subscription_internal_key, next_inbox_seq, open_rocks_db,
+    read_rocks_count, retain_key, retain_prefix, route_exact_index_key, route_exact_index_prefix,
+    route_filter_index_key, route_filter_index_prefix, route_filter_shared_index_key,
+    route_filter_shared_index_prefix, route_key, route_prefix, route_session_index_key,
+    route_session_index_prefix, route_session_topic_shared_index_key,
+    route_session_topic_shared_index_key_from_parts, route_tenant_shared_index_key,
+    route_tenant_shared_index_prefix, route_topic_filter_is_exact, route_wildcard_index_key,
+    route_wildcard_index_prefix, session_id_index_key, session_key, session_prefix,
+    subscription_key, subscription_prefix, subscription_tenant_index_key,
     subscription_tenant_prefix, subscription_tenant_shared_index_key,
     subscription_tenant_shared_prefix, subscription_tenant_topic_index_key,
     subscription_tenant_topic_prefix, subscription_tenant_topic_shared_index_key,
-    subscription_tenant_topic_shared_prefix, trailing_u64, update_rocks_count, INBOX_COUNT_KEY,
-    INFLIGHT_COUNT_KEY, RETAIN_COUNT_KEY, ROUTE_COUNT_KEY, SESSION_COUNT_KEY,
-    SUBSCRIPTION_COUNT_KEY,
+    subscription_tenant_topic_shared_prefix, trailing_u64, INBOX_COUNT_KEY, INFLIGHT_COUNT_KEY,
+    RETAIN_COUNT_KEY, ROUTE_COUNT_KEY, SESSION_COUNT_KEY, SUBSCRIPTION_COUNT_KEY,
 };
-use ::rocksdb::{Direction, IteratorMode, DB};
+use ::rocksdb::{Direction, IteratorMode, WriteBatch, DB};
 use async_trait::async_trait;
 use greenmqtt_core::{
     InflightMessage, OfflineMessage, RetainedMessage, RouteRecord, SessionRecord, Subscription,
@@ -49,6 +49,53 @@ pub struct RocksRetainStore {
 
 pub struct RocksRouteStore {
     db: DB,
+}
+
+fn write_batch(db: &DB, batch: WriteBatch) -> anyhow::Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    db.write(batch)?;
+    Ok(())
+}
+
+fn put_count_delta(
+    db: &DB,
+    batch: &mut WriteBatch,
+    key: &[u8],
+    delta: isize,
+) -> anyhow::Result<()> {
+    let next = super::apply_count_delta(read_rocks_count(db, key)?, delta)?;
+    batch.put(key, super::encode_count(next));
+    Ok(())
+}
+
+fn batch_put_route(batch: &mut WriteBatch, route: &RouteRecord, encoded: &[u8]) {
+    batch.put(route_key(route), encoded);
+    batch.put(route_session_index_key(route), encoded);
+    batch.put(route_session_topic_shared_index_key(route), encoded);
+    batch.put(route_tenant_shared_index_key(route), encoded);
+    batch.put(route_filter_index_key(route), encoded);
+    batch.put(route_filter_shared_index_key(route), encoded);
+    if route_topic_filter_is_exact(&route.topic_filter) {
+        batch.put(route_exact_index_key(route), encoded);
+    } else {
+        batch.put(route_wildcard_index_key(route), encoded);
+    }
+}
+
+fn batch_delete_route(batch: &mut WriteBatch, route: &RouteRecord) {
+    batch.delete(route_key(route));
+    batch.delete(route_session_index_key(route));
+    batch.delete(route_session_topic_shared_index_key(route));
+    batch.delete(route_tenant_shared_index_key(route));
+    batch.delete(route_filter_index_key(route));
+    batch.delete(route_filter_shared_index_key(route));
+    if route_topic_filter_is_exact(&route.topic_filter) {
+        batch.delete(route_exact_index_key(route));
+    } else {
+        batch.delete(route_wildcard_index_key(route));
+    }
 }
 
 impl RocksSessionStore {
@@ -107,21 +154,20 @@ impl SessionStore for RocksSessionStore {
             .load_session(&session.identity.tenant_id, &session.identity.client_id)
             .await?;
         let is_new = previous.is_none();
+        let encoded = encode_rocks_value(session)?;
+        let mut batch = WriteBatch::default();
         if let Some(previous) = previous {
-            self.db.delete(session_id_index_key(&previous.session_id))?;
+            batch.delete(session_id_index_key(&previous.session_id));
         }
-        self.db.put(
+        batch.put(
             session_key(&session.identity.tenant_id, &session.identity.client_id),
-            serde_json::to_vec(session)?,
-        )?;
-        self.db.put(
-            session_id_index_key(&session.session_id),
-            serde_json::to_vec(session)?,
-        )?;
+            &encoded,
+        );
+        batch.put(session_id_index_key(&session.session_id), &encoded);
         if is_new {
-            update_rocks_count(&self.db, SESSION_COUNT_KEY, 1)?;
+            put_count_delta(&self.db, &mut batch, SESSION_COUNT_KEY, 1)?;
         }
-        self.db.flush()?;
+        write_batch(&self.db, batch)?;
         Ok(())
     }
 
@@ -133,7 +179,7 @@ impl SessionStore for RocksSessionStore {
         Ok(self
             .db
             .get(session_key(tenant_id, client_id))?
-            .map(|value| serde_json::from_slice(&value))
+            .map(|value| decode_rocks_value(&value))
             .transpose()?)
     }
 
@@ -144,17 +190,18 @@ impl SessionStore for RocksSessionStore {
         Ok(self
             .db
             .get(session_id_index_key(session_id))?
-            .map(|value| serde_json::from_slice(&value))
+            .map(|value| decode_rocks_value(&value))
             .transpose()?)
     }
 
     async fn delete_session(&self, tenant_id: &str, client_id: &str) -> anyhow::Result<()> {
+        let mut batch = WriteBatch::default();
         if let Some(existing) = self.load_session(tenant_id, client_id).await? {
-            self.db.delete(session_id_index_key(&existing.session_id))?;
-            update_rocks_count(&self.db, SESSION_COUNT_KEY, -1)?;
+            batch.delete(session_id_index_key(&existing.session_id));
+            put_count_delta(&self.db, &mut batch, SESSION_COUNT_KEY, -1)?;
         }
-        self.db.delete(session_key(tenant_id, client_id))?;
-        self.db.flush()?;
+        batch.delete(session_key(tenant_id, client_id));
+        write_batch(&self.db, batch)?;
         Ok(())
     }
 
@@ -165,7 +212,7 @@ impl SessionStore for RocksSessionStore {
             if is_session_internal_key(key.as_ref()) {
                 continue;
             }
-            sessions.push(serde_json::from_slice(&value)?);
+            sessions.push(decode_rocks_value(&value)?);
         }
         Ok(sessions)
     }
@@ -181,7 +228,7 @@ impl SessionStore for RocksSessionStore {
             if !key.starts_with(&prefix) {
                 break;
             }
-            sessions.push(serde_json::from_slice(&value)?);
+            sessions.push(decode_rocks_value(&value)?);
         }
         Ok(sessions)
     }
@@ -200,27 +247,20 @@ impl SubscriptionStore for RocksSubscriptionStore {
             &subscription.topic_filter,
         );
         let is_new = self.db.get_pinned(&key)?.is_none();
-        self.db.put(key, serde_json::to_vec(subscription)?)?;
-        self.db.put(
-            subscription_tenant_index_key(subscription),
-            serde_json::to_vec(subscription)?,
-        )?;
-        self.db.put(
-            subscription_tenant_shared_index_key(subscription),
-            serde_json::to_vec(subscription)?,
-        )?;
-        self.db.put(
-            subscription_tenant_topic_index_key(subscription),
-            serde_json::to_vec(subscription)?,
-        )?;
-        self.db.put(
+        let encoded = encode_rocks_value(subscription)?;
+        let mut batch = WriteBatch::default();
+        batch.put(key, &encoded);
+        batch.put(subscription_tenant_index_key(subscription), &encoded);
+        batch.put(subscription_tenant_shared_index_key(subscription), &encoded);
+        batch.put(subscription_tenant_topic_index_key(subscription), &encoded);
+        batch.put(
             subscription_tenant_topic_shared_index_key(subscription),
-            serde_json::to_vec(subscription)?,
-        )?;
+            &encoded,
+        );
         if is_new {
-            update_rocks_count(&self.db, SUBSCRIPTION_COUNT_KEY, 1)?;
+            put_count_delta(&self.db, &mut batch, SUBSCRIPTION_COUNT_KEY, 1)?;
         }
-        self.db.flush()?;
+        write_batch(&self.db, batch)?;
         Ok(())
     }
 
@@ -233,7 +273,7 @@ impl SubscriptionStore for RocksSubscriptionStore {
         Ok(self
             .db
             .get(subscription_key(session_id, shared_group, topic_filter))?
-            .map(|value| serde_json::from_slice(&value))
+            .map(|value| decode_rocks_value(&value))
             .transpose()?)
     }
 
@@ -248,19 +288,16 @@ impl SubscriptionStore for RocksSubscriptionStore {
             .await?;
         let key = subscription_key(session_id, shared_group, topic_filter);
         let removed = self.db.get_pinned(&key)?.is_some();
-        self.db.delete(key)?;
+        let mut batch = WriteBatch::default();
+        batch.delete(key);
         if let Some(subscription) = removed_subscription {
-            self.db
-                .delete(subscription_tenant_index_key(&subscription))?;
-            self.db
-                .delete(subscription_tenant_shared_index_key(&subscription))?;
-            self.db
-                .delete(subscription_tenant_topic_index_key(&subscription))?;
-            self.db
-                .delete(subscription_tenant_topic_shared_index_key(&subscription))?;
-            update_rocks_count(&self.db, SUBSCRIPTION_COUNT_KEY, -1)?;
+            batch.delete(subscription_tenant_index_key(&subscription));
+            batch.delete(subscription_tenant_shared_index_key(&subscription));
+            batch.delete(subscription_tenant_topic_index_key(&subscription));
+            batch.delete(subscription_tenant_topic_shared_index_key(&subscription));
+            put_count_delta(&self.db, &mut batch, SUBSCRIPTION_COUNT_KEY, -1)?;
         }
-        self.db.flush()?;
+        write_batch(&self.db, batch)?;
         Ok(removed)
     }
 
@@ -275,7 +312,7 @@ impl SubscriptionStore for RocksSubscriptionStore {
             if !key.starts_with(&prefix) {
                 break;
             }
-            subscriptions.push(serde_json::from_slice(&value)?);
+            subscriptions.push(decode_rocks_value(&value)?);
         }
         Ok(subscriptions)
     }
@@ -311,7 +348,7 @@ impl SubscriptionStore for RocksSubscriptionStore {
             if !key.starts_with(&prefix) {
                 break;
             }
-            let subscription: Subscription = serde_json::from_slice(&value)?;
+            let subscription: Subscription = decode_rocks_value(&value)?;
             if subscription.topic_filter == topic_filter {
                 subscriptions.push(subscription);
             }
@@ -334,7 +371,7 @@ impl SubscriptionStore for RocksSubscriptionStore {
             if !key.starts_with(&prefix) {
                 break;
             }
-            let subscription: Subscription = serde_json::from_slice(&value)?;
+            let subscription: Subscription = decode_rocks_value(&value)?;
             if subscription.topic_filter == topic_filter {
                 count += 1;
             }
@@ -356,20 +393,24 @@ impl SubscriptionStore for RocksSubscriptionStore {
             entries.push((key, value));
         }
         let removed = entries.len();
+        let mut batch = WriteBatch::default();
         for (key, value) in entries {
-            let subscription: Subscription = serde_json::from_slice(&value)?;
-            self.db.delete(key)?;
-            self.db
-                .delete(subscription_tenant_index_key(&subscription))?;
-            self.db
-                .delete(subscription_tenant_shared_index_key(&subscription))?;
-            self.db
-                .delete(subscription_tenant_topic_index_key(&subscription))?;
-            self.db
-                .delete(subscription_tenant_topic_shared_index_key(&subscription))?;
+            let subscription: Subscription = decode_rocks_value(&value)?;
+            batch.delete(key);
+            batch.delete(subscription_tenant_index_key(&subscription));
+            batch.delete(subscription_tenant_shared_index_key(&subscription));
+            batch.delete(subscription_tenant_topic_index_key(&subscription));
+            batch.delete(subscription_tenant_topic_shared_index_key(&subscription));
         }
-        update_rocks_count(&self.db, SUBSCRIPTION_COUNT_KEY, -(removed as isize))?;
-        self.db.flush()?;
+        if removed > 0 {
+            put_count_delta(
+                &self.db,
+                &mut batch,
+                SUBSCRIPTION_COUNT_KEY,
+                -(removed as isize),
+            )?;
+        }
+        write_batch(&self.db, batch)?;
         Ok(removed)
     }
 
@@ -384,27 +425,31 @@ impl SubscriptionStore for RocksSubscriptionStore {
             if !key.starts_with(&prefix) {
                 break;
             }
-            let subscription: Subscription = serde_json::from_slice(&value)?;
+            let subscription: Subscription = decode_rocks_value(&value)?;
             subscriptions.push(subscription);
         }
         let removed = subscriptions.len();
+        let mut batch = WriteBatch::default();
         for subscription in subscriptions {
-            self.db.delete(subscription_key(
+            batch.delete(subscription_key(
                 &subscription.session_id,
                 subscription.shared_group.as_deref(),
                 &subscription.topic_filter,
-            ))?;
-            self.db
-                .delete(subscription_tenant_index_key(&subscription))?;
-            self.db
-                .delete(subscription_tenant_shared_index_key(&subscription))?;
-            self.db
-                .delete(subscription_tenant_topic_index_key(&subscription))?;
-            self.db
-                .delete(subscription_tenant_topic_shared_index_key(&subscription))?;
+            ));
+            batch.delete(subscription_tenant_index_key(&subscription));
+            batch.delete(subscription_tenant_shared_index_key(&subscription));
+            batch.delete(subscription_tenant_topic_index_key(&subscription));
+            batch.delete(subscription_tenant_topic_shared_index_key(&subscription));
         }
-        update_rocks_count(&self.db, SUBSCRIPTION_COUNT_KEY, -(removed as isize))?;
-        self.db.flush()?;
+        if removed > 0 {
+            put_count_delta(
+                &self.db,
+                &mut batch,
+                SUBSCRIPTION_COUNT_KEY,
+                -(removed as isize),
+            )?;
+        }
+        write_batch(&self.db, batch)?;
         Ok(removed)
     }
 
@@ -424,27 +469,31 @@ impl SubscriptionStore for RocksSubscriptionStore {
             if !key.starts_with(&prefix) {
                 break;
             }
-            let subscription: Subscription = serde_json::from_slice(&value)?;
+            let subscription: Subscription = decode_rocks_value(&value)?;
             subscriptions.push(subscription);
         }
         let removed = subscriptions.len();
+        let mut batch = WriteBatch::default();
         for subscription in subscriptions {
-            self.db.delete(subscription_key(
+            batch.delete(subscription_key(
                 &subscription.session_id,
                 subscription.shared_group.as_deref(),
                 &subscription.topic_filter,
-            ))?;
-            self.db
-                .delete(subscription_tenant_index_key(&subscription))?;
-            self.db
-                .delete(subscription_tenant_shared_index_key(&subscription))?;
-            self.db
-                .delete(subscription_tenant_topic_index_key(&subscription))?;
-            self.db
-                .delete(subscription_tenant_topic_shared_index_key(&subscription))?;
+            ));
+            batch.delete(subscription_tenant_index_key(&subscription));
+            batch.delete(subscription_tenant_shared_index_key(&subscription));
+            batch.delete(subscription_tenant_topic_index_key(&subscription));
+            batch.delete(subscription_tenant_topic_shared_index_key(&subscription));
         }
-        update_rocks_count(&self.db, SUBSCRIPTION_COUNT_KEY, -(removed as isize))?;
-        self.db.flush()?;
+        if removed > 0 {
+            put_count_delta(
+                &self.db,
+                &mut batch,
+                SUBSCRIPTION_COUNT_KEY,
+                -(removed as isize),
+            )?;
+        }
+        write_batch(&self.db, batch)?;
         Ok(removed)
     }
 
@@ -463,27 +512,31 @@ impl SubscriptionStore for RocksSubscriptionStore {
             if !key.starts_with(&prefix) {
                 break;
             }
-            let subscription: Subscription = serde_json::from_slice(&value)?;
+            let subscription: Subscription = decode_rocks_value(&value)?;
             subscriptions.push(subscription);
         }
         let removed = subscriptions.len();
+        let mut batch = WriteBatch::default();
         for subscription in subscriptions {
-            self.db.delete(subscription_key(
+            batch.delete(subscription_key(
                 &subscription.session_id,
                 subscription.shared_group.as_deref(),
                 &subscription.topic_filter,
-            ))?;
-            self.db
-                .delete(subscription_tenant_index_key(&subscription))?;
-            self.db
-                .delete(subscription_tenant_shared_index_key(&subscription))?;
-            self.db
-                .delete(subscription_tenant_topic_index_key(&subscription))?;
-            self.db
-                .delete(subscription_tenant_topic_shared_index_key(&subscription))?;
+            ));
+            batch.delete(subscription_tenant_index_key(&subscription));
+            batch.delete(subscription_tenant_shared_index_key(&subscription));
+            batch.delete(subscription_tenant_topic_index_key(&subscription));
+            batch.delete(subscription_tenant_topic_shared_index_key(&subscription));
         }
-        update_rocks_count(&self.db, SUBSCRIPTION_COUNT_KEY, -(removed as isize))?;
-        self.db.flush()?;
+        if removed > 0 {
+            put_count_delta(
+                &self.db,
+                &mut batch,
+                SUBSCRIPTION_COUNT_KEY,
+                -(removed as isize),
+            )?;
+        }
+        write_batch(&self.db, batch)?;
         Ok(removed)
     }
 
@@ -501,7 +554,7 @@ impl SubscriptionStore for RocksSubscriptionStore {
             if !key.starts_with(&prefix) {
                 break;
             }
-            subscriptions.push(serde_json::from_slice(&value)?);
+            subscriptions.push(decode_rocks_value(&value)?);
         }
         Ok(subscriptions)
     }
@@ -521,7 +574,7 @@ impl SubscriptionStore for RocksSubscriptionStore {
             if !key.starts_with(&prefix) {
                 break;
             }
-            subscriptions.push(serde_json::from_slice(&value)?);
+            subscriptions.push(decode_rocks_value(&value)?);
         }
         Ok(subscriptions)
     }
@@ -577,7 +630,7 @@ impl SubscriptionStore for RocksSubscriptionStore {
             if !key.starts_with(&prefix) {
                 break;
             }
-            subscriptions.push(serde_json::from_slice(&value)?);
+            subscriptions.push(decode_rocks_value(&value)?);
         }
         Ok(subscriptions)
     }
@@ -598,7 +651,7 @@ impl SubscriptionStore for RocksSubscriptionStore {
             if !key.starts_with(&prefix) {
                 break;
             }
-            subscriptions.push(serde_json::from_slice(&value)?);
+            subscriptions.push(decode_rocks_value(&value)?);
         }
         Ok(subscriptions)
     }
@@ -651,7 +704,7 @@ impl SubscriptionStore for RocksSubscriptionStore {
             if is_subscription_internal_key(key.as_ref()) {
                 continue;
             }
-            subscriptions.push(serde_json::from_slice(&value)?);
+            subscriptions.push(decode_rocks_value(&value)?);
         }
         subscriptions.sort_by(|left: &Subscription, right: &Subscription| {
             left.tenant_id
@@ -671,15 +724,15 @@ impl SubscriptionStore for RocksSubscriptionStore {
 impl InboxStore for RocksInboxStore {
     async fn append_message(&self, message: &OfflineMessage) -> anyhow::Result<()> {
         let seq = next_inbox_seq(&self.seq);
-        let value = serde_json::to_vec(message)?;
-        self.db
-            .put(inbox_key(&message.session_id, seq), value.clone())?;
-        self.db.put(
+        let value = encode_rocks_value(message)?;
+        let mut batch = WriteBatch::default();
+        batch.put(inbox_key(&message.session_id, seq), &value);
+        batch.put(
             inbox_tenant_index_key(&message.tenant_id, &message.session_id, seq),
-            value,
-        )?;
-        update_rocks_count(&self.db, INBOX_COUNT_KEY, 1)?;
-        self.db.flush()?;
+            &value,
+        );
+        put_count_delta(&self.db, &mut batch, INBOX_COUNT_KEY, 1)?;
+        write_batch(&self.db, batch)?;
         Ok(())
     }
 
@@ -694,7 +747,7 @@ impl InboxStore for RocksInboxStore {
             if !key.starts_with(&prefix) {
                 break;
             }
-            messages.push(serde_json::from_slice(&value)?);
+            messages.push(decode_rocks_value(&value)?);
         }
         Ok(messages)
     }
@@ -706,7 +759,7 @@ impl InboxStore for RocksInboxStore {
             if is_inbox_internal_key(key.as_ref()) {
                 continue;
             }
-            messages.push(serde_json::from_slice(&value)?);
+            messages.push(decode_rocks_value(&value)?);
         }
         messages.sort_by(|left: &OfflineMessage, right: &OfflineMessage| {
             left.tenant_id
@@ -728,7 +781,7 @@ impl InboxStore for RocksInboxStore {
             if !key.starts_with(&prefix) {
                 break;
             }
-            messages.push(serde_json::from_slice(&value)?);
+            messages.push(decode_rocks_value(&value)?);
         }
         messages.sort_by(|left: &OfflineMessage, right: &OfflineMessage| {
             left.session_id
@@ -782,20 +835,27 @@ impl InboxStore for RocksInboxStore {
             if !key.starts_with(&prefix) {
                 break;
             }
-            let message: OfflineMessage = serde_json::from_slice(&value)?;
+            let message: OfflineMessage = decode_rocks_value(&value)?;
             let seq = trailing_u64(key.as_ref());
             keys.push((key, message.tenant_id.clone(), seq));
             messages.push(message);
         }
+        let mut batch = WriteBatch::default();
         for (key, tenant_id, seq) in keys {
-            self.db.delete(key)?;
+            batch.delete(key);
             if let Some(seq) = seq {
-                self.db
-                    .delete(inbox_tenant_index_key(&tenant_id, session_id, seq))?;
+                batch.delete(inbox_tenant_index_key(&tenant_id, session_id, seq));
             }
         }
-        update_rocks_count(&self.db, INBOX_COUNT_KEY, -(messages.len() as isize))?;
-        self.db.flush()?;
+        if !messages.is_empty() {
+            put_count_delta(
+                &self.db,
+                &mut batch,
+                INBOX_COUNT_KEY,
+                -(messages.len() as isize),
+            )?;
+        }
+        write_batch(&self.db, batch)?;
         Ok(messages)
     }
 
@@ -811,20 +871,22 @@ impl InboxStore for RocksInboxStore {
             if !key.starts_with(&prefix) {
                 break;
             }
-            let message: OfflineMessage = serde_json::from_slice(&value)?;
+            let message: OfflineMessage = decode_rocks_value(&value)?;
             let seq = trailing_u64(key.as_ref());
             keys.push((key, message.tenant_id, seq));
         }
+        let mut batch = WriteBatch::default();
         for (key, tenant_id, seq) in keys {
-            self.db.delete(key)?;
+            batch.delete(key);
             if let Some(seq) = seq {
-                self.db
-                    .delete(inbox_tenant_index_key(&tenant_id, session_id, seq))?;
+                batch.delete(inbox_tenant_index_key(&tenant_id, session_id, seq));
             }
             removed += 1;
         }
-        update_rocks_count(&self.db, INBOX_COUNT_KEY, -(removed as isize))?;
-        self.db.flush()?;
+        if removed > 0 {
+            put_count_delta(&self.db, &mut batch, INBOX_COUNT_KEY, -(removed as isize))?;
+        }
+        write_batch(&self.db, batch)?;
         Ok(removed)
     }
 
@@ -839,19 +901,22 @@ impl InboxStore for RocksInboxStore {
             if !key.starts_with(&prefix) {
                 break;
             }
-            let message: OfflineMessage = serde_json::from_slice(&value)?;
+            let message: OfflineMessage = decode_rocks_value(&value)?;
             let seq = trailing_u64(key.as_ref());
             keys.push((key, message.session_id, seq));
         }
         let removed = keys.len();
+        let mut batch = WriteBatch::default();
         for (tenant_key, session_id, seq) in keys {
-            self.db.delete(tenant_key)?;
+            batch.delete(tenant_key);
             if let Some(seq) = seq {
-                self.db.delete(inbox_key(&session_id, seq))?;
+                batch.delete(inbox_key(&session_id, seq));
             }
         }
-        update_rocks_count(&self.db, INBOX_COUNT_KEY, -(removed as isize))?;
-        self.db.flush()?;
+        if removed > 0 {
+            put_count_delta(&self.db, &mut batch, INBOX_COUNT_KEY, -(removed as isize))?;
+        }
+        write_batch(&self.db, batch)?;
         Ok(removed)
     }
 
@@ -864,23 +929,24 @@ impl InboxStore for RocksInboxStore {
 impl InflightStore for RocksInflightStore {
     async fn save_inflight(&self, message: &InflightMessage) -> anyhow::Result<()> {
         let key = inflight_key(&message.session_id, message.packet_id);
+        let mut batch = WriteBatch::default();
         if let Some(previous) = self.db.get(&key)? {
-            let previous: InflightMessage = serde_json::from_slice(&previous)?;
-            self.db.delete(inflight_tenant_index_key(
+            let previous: InflightMessage = decode_rocks_value(&previous)?;
+            batch.delete(inflight_tenant_index_key(
                 &previous.tenant_id,
                 &previous.session_id,
                 previous.packet_id,
-            ))?;
+            ));
         } else {
-            update_rocks_count(&self.db, INFLIGHT_COUNT_KEY, 1)?;
+            put_count_delta(&self.db, &mut batch, INFLIGHT_COUNT_KEY, 1)?;
         }
-        let value = serde_json::to_vec(message)?;
-        self.db.put(&key, value.clone())?;
-        self.db.put(
+        let value = encode_rocks_value(message)?;
+        batch.put(&key, &value);
+        batch.put(
             inflight_tenant_index_key(&message.tenant_id, &message.session_id, message.packet_id),
-            value,
-        )?;
-        self.db.flush()?;
+            &value,
+        );
+        write_batch(&self.db, batch)?;
         Ok(())
     }
 
@@ -895,7 +961,7 @@ impl InflightStore for RocksInflightStore {
             if !key.starts_with(&prefix) {
                 break;
             }
-            messages.push(serde_json::from_slice(&value)?);
+            messages.push(decode_rocks_value(&value)?);
         }
         Ok(messages)
     }
@@ -907,7 +973,7 @@ impl InflightStore for RocksInflightStore {
             if is_inflight_internal_key(key.as_ref()) {
                 continue;
             }
-            messages.push(serde_json::from_slice(&value)?);
+            messages.push(decode_rocks_value(&value)?);
         }
         messages.sort_by(|left: &InflightMessage, right: &InflightMessage| {
             left.tenant_id
@@ -929,7 +995,7 @@ impl InflightStore for RocksInflightStore {
             if !key.starts_with(&prefix) {
                 break;
             }
-            messages.push(serde_json::from_slice(&value)?);
+            messages.push(decode_rocks_value(&value)?);
         }
         messages.sort_by(|left: &InflightMessage, right: &InflightMessage| {
             left.session_id
@@ -973,17 +1039,18 @@ impl InflightStore for RocksInflightStore {
 
     async fn delete_inflight(&self, session_id: &str, packet_id: u16) -> anyhow::Result<()> {
         let key = inflight_key(session_id, packet_id);
+        let mut batch = WriteBatch::default();
         if let Some(removed) = self.db.get(&key)? {
-            let removed: InflightMessage = serde_json::from_slice(&removed)?;
-            self.db.delete(inflight_tenant_index_key(
+            let removed: InflightMessage = decode_rocks_value(&removed)?;
+            batch.delete(inflight_tenant_index_key(
                 &removed.tenant_id,
                 &removed.session_id,
                 removed.packet_id,
-            ))?;
-            update_rocks_count(&self.db, INFLIGHT_COUNT_KEY, -1)?;
+            ));
+            put_count_delta(&self.db, &mut batch, INFLIGHT_COUNT_KEY, -1)?;
         }
-        self.db.delete(key)?;
-        self.db.flush()?;
+        batch.delete(key);
+        write_batch(&self.db, batch)?;
         Ok(())
     }
 
@@ -998,17 +1065,24 @@ impl InflightStore for RocksInflightStore {
             if !key.starts_with(&prefix) {
                 break;
             }
-            let message: InflightMessage = serde_json::from_slice(&value)?;
+            let message: InflightMessage = decode_rocks_value(&value)?;
             keys.push((key, message.tenant_id, message.packet_id));
         }
         let removed = keys.len();
+        let mut batch = WriteBatch::default();
         for (key, tenant_id, packet_id) in keys {
-            self.db.delete(key)?;
-            self.db
-                .delete(inflight_tenant_index_key(&tenant_id, session_id, packet_id))?;
+            batch.delete(key);
+            batch.delete(inflight_tenant_index_key(&tenant_id, session_id, packet_id));
         }
-        update_rocks_count(&self.db, INFLIGHT_COUNT_KEY, -(removed as isize))?;
-        self.db.flush()?;
+        if removed > 0 {
+            put_count_delta(
+                &self.db,
+                &mut batch,
+                INFLIGHT_COUNT_KEY,
+                -(removed as isize),
+            )?;
+        }
+        write_batch(&self.db, batch)?;
         Ok(removed)
     }
 
@@ -1023,16 +1097,24 @@ impl InflightStore for RocksInflightStore {
             if !key.starts_with(&prefix) {
                 break;
             }
-            let message: InflightMessage = serde_json::from_slice(&value)?;
+            let message: InflightMessage = decode_rocks_value(&value)?;
             keys.push((key, message.session_id, message.packet_id));
         }
         let removed = keys.len();
+        let mut batch = WriteBatch::default();
         for (tenant_key, session_id, packet_id) in keys {
-            self.db.delete(tenant_key)?;
-            self.db.delete(inflight_key(&session_id, packet_id))?;
+            batch.delete(tenant_key);
+            batch.delete(inflight_key(&session_id, packet_id));
         }
-        update_rocks_count(&self.db, INFLIGHT_COUNT_KEY, -(removed as isize))?;
-        self.db.flush()?;
+        if removed > 0 {
+            put_count_delta(
+                &self.db,
+                &mut batch,
+                INFLIGHT_COUNT_KEY,
+                -(removed as isize),
+            )?;
+        }
+        write_batch(&self.db, batch)?;
         Ok(removed)
     }
 
@@ -1046,18 +1128,19 @@ impl RetainStore for RocksRetainStore {
     async fn put_retain(&self, message: &RetainedMessage) -> anyhow::Result<()> {
         let key = retain_key(&message.tenant_id, &message.topic);
         let existing = self.db.get_pinned(&key)?.is_some();
+        let mut batch = WriteBatch::default();
         if message.payload.is_empty() {
             if existing {
-                self.db.delete(key)?;
-                update_rocks_count(&self.db, RETAIN_COUNT_KEY, -1)?;
+                batch.delete(key);
+                put_count_delta(&self.db, &mut batch, RETAIN_COUNT_KEY, -1)?;
             }
         } else {
-            self.db.put(key, serde_json::to_vec(message)?)?;
+            batch.put(key, encode_rocks_value(message)?);
             if !existing {
-                update_rocks_count(&self.db, RETAIN_COUNT_KEY, 1)?;
+                put_count_delta(&self.db, &mut batch, RETAIN_COUNT_KEY, 1)?;
             }
         }
-        self.db.flush()?;
+        write_batch(&self.db, batch)?;
         Ok(())
     }
 
@@ -1069,7 +1152,7 @@ impl RetainStore for RocksRetainStore {
         Ok(self
             .db
             .get(retain_key(tenant_id, topic))?
-            .map(|value| serde_json::from_slice(&value))
+            .map(|value| decode_rocks_value(&value))
             .transpose()?)
     }
 
@@ -1088,7 +1171,7 @@ impl RetainStore for RocksRetainStore {
             if !key.starts_with(&prefix) {
                 break;
             }
-            let message: RetainedMessage = serde_json::from_slice(&value)?;
+            let message: RetainedMessage = decode_rocks_value(&value)?;
             if greenmqtt_core::topic_matches(topic_filter, &message.topic) {
                 messages.push(message);
             }
@@ -1107,7 +1190,7 @@ impl RetainStore for RocksRetainStore {
             if !key.starts_with(&prefix) {
                 break;
             }
-            messages.push(serde_json::from_slice(&value)?);
+            messages.push(decode_rocks_value(&value)?);
         }
         Ok(messages)
     }
@@ -1122,61 +1205,30 @@ impl RouteStore for RocksRouteStore {
     async fn save_route(&self, route: &RouteRecord) -> anyhow::Result<()> {
         let key = route_key(route);
         let is_new = self.db.get_pinned(&key)?.is_none();
-        self.db.put(key, serde_json::to_vec(route)?)?;
-        self.db
-            .put(route_session_index_key(route), serde_json::to_vec(route)?)?;
-        self.db.put(
-            route_session_topic_shared_index_key(route),
-            serde_json::to_vec(route)?,
-        )?;
-        self.db.put(
-            route_tenant_shared_index_key(route),
-            serde_json::to_vec(route)?,
-        )?;
-        self.db
-            .put(route_filter_index_key(route), serde_json::to_vec(route)?)?;
-        self.db.put(
-            route_filter_shared_index_key(route),
-            serde_json::to_vec(route)?,
-        )?;
-        if route_topic_filter_is_exact(&route.topic_filter) {
-            self.db
-                .put(route_exact_index_key(route), serde_json::to_vec(route)?)?;
-        } else {
-            self.db
-                .put(route_wildcard_index_key(route), serde_json::to_vec(route)?)?;
-        }
+        let encoded = encode_rocks_value(route)?;
+        let mut batch = WriteBatch::default();
+        batch_put_route(&mut batch, route, &encoded);
         if is_new {
-            update_rocks_count(&self.db, ROUTE_COUNT_KEY, 1)?;
+            put_count_delta(&self.db, &mut batch, ROUTE_COUNT_KEY, 1)?;
         }
-        self.db.flush()?;
+        write_batch(&self.db, batch)?;
         Ok(())
     }
 
     async fn delete_route(&self, route: &RouteRecord) -> anyhow::Result<()> {
         let removed = self.db.get_pinned(route_key(route))?.is_some();
-        self.db.delete(route_key(route))?;
-        self.db.delete(route_session_index_key(route))?;
-        self.db
-            .delete(route_session_topic_shared_index_key(route))?;
-        self.db.delete(route_tenant_shared_index_key(route))?;
-        self.db.delete(route_filter_index_key(route))?;
-        self.db.delete(route_filter_shared_index_key(route))?;
-        if route_topic_filter_is_exact(&route.topic_filter) {
-            self.db.delete(route_exact_index_key(route))?;
-        } else {
-            self.db.delete(route_wildcard_index_key(route))?;
-        }
+        let mut batch = WriteBatch::default();
+        batch_delete_route(&mut batch, route);
         if removed {
-            update_rocks_count(&self.db, ROUTE_COUNT_KEY, -1)?;
+            put_count_delta(&self.db, &mut batch, ROUTE_COUNT_KEY, -1)?;
         }
-        self.db.flush()?;
+        write_batch(&self.db, batch)?;
         Ok(())
     }
 
     async fn remove_session_routes(&self, session_id: &str) -> anyhow::Result<usize> {
         let prefix = route_session_index_prefix(session_id);
-        let mut routes = Vec::new();
+        let mut routes: Vec<RouteRecord> = Vec::new();
         for item in self
             .db
             .iterator(IteratorMode::From(&prefix, Direction::Forward))
@@ -1185,11 +1237,21 @@ impl RouteStore for RocksRouteStore {
             if !key.starts_with(&prefix) {
                 break;
             }
-            routes.push(serde_json::from_slice::<RouteRecord>(&value)?);
+            routes.push(decode_rocks_value(&value)?);
         }
+        let mut batch = WriteBatch::default();
         for route in &routes {
-            self.delete_route(route).await?;
+            batch_delete_route(&mut batch, route);
         }
+        if !routes.is_empty() {
+            put_count_delta(
+                &self.db,
+                &mut batch,
+                ROUTE_COUNT_KEY,
+                -(routes.len() as isize),
+            )?;
+        }
+        write_batch(&self.db, batch)?;
         Ok(routes.len())
     }
 
@@ -1204,11 +1266,21 @@ impl RouteStore for RocksRouteStore {
             if !key.starts_with(&prefix) {
                 break;
             }
-            routes.push(serde_json::from_slice::<RouteRecord>(&value)?);
+            routes.push(decode_rocks_value(&value)?);
         }
+        let mut batch = WriteBatch::default();
         for route in &routes {
-            self.delete_route(route).await?;
+            batch_delete_route(&mut batch, route);
         }
+        if !routes.is_empty() {
+            put_count_delta(
+                &self.db,
+                &mut batch,
+                ROUTE_COUNT_KEY,
+                -(routes.len() as isize),
+            )?;
+        }
+        write_batch(&self.db, batch)?;
         Ok(routes.len())
     }
 
@@ -1227,11 +1299,21 @@ impl RouteStore for RocksRouteStore {
             if !key.starts_with(&prefix) {
                 break;
             }
-            routes.push(serde_json::from_slice::<RouteRecord>(&value)?);
+            routes.push(decode_rocks_value(&value)?);
         }
+        let mut batch = WriteBatch::default();
         for route in &routes {
-            self.delete_route(route).await?;
+            batch_delete_route(&mut batch, route);
         }
+        if !routes.is_empty() {
+            put_count_delta(
+                &self.db,
+                &mut batch,
+                ROUTE_COUNT_KEY,
+                -(routes.len() as isize),
+            )?;
+        }
+        write_batch(&self.db, batch)?;
         Ok(routes.len())
     }
 
@@ -1248,7 +1330,7 @@ impl RouteStore for RocksRouteStore {
                 topic_filter,
                 shared_group,
             ))?
-            .map(|value| serde_json::from_slice::<RouteRecord>(value.as_ref()))
+            .map(|value| decode_rocks_value(value.as_ref()))
             .transpose()?)
     }
 
@@ -1283,11 +1365,21 @@ impl RouteStore for RocksRouteStore {
             if !key.starts_with(&prefix) {
                 break;
             }
-            routes.push(serde_json::from_slice::<RouteRecord>(&value)?);
+            routes.push(decode_rocks_value(&value)?);
         }
+        let mut batch = WriteBatch::default();
         for route in &routes {
-            self.delete_route(route).await?;
+            batch_delete_route(&mut batch, route);
         }
+        if !routes.is_empty() {
+            put_count_delta(
+                &self.db,
+                &mut batch,
+                ROUTE_COUNT_KEY,
+                -(routes.len() as isize),
+            )?;
+        }
+        write_batch(&self.db, batch)?;
         Ok(routes.len())
     }
 
@@ -1307,11 +1399,21 @@ impl RouteStore for RocksRouteStore {
             if !key.starts_with(&prefix) {
                 break;
             }
-            routes.push(serde_json::from_slice::<RouteRecord>(&value)?);
+            routes.push(decode_rocks_value(&value)?);
         }
+        let mut batch = WriteBatch::default();
         for route in &routes {
-            self.delete_route(route).await?;
+            batch_delete_route(&mut batch, route);
         }
+        if !routes.is_empty() {
+            put_count_delta(
+                &self.db,
+                &mut batch,
+                ROUTE_COUNT_KEY,
+                -(routes.len() as isize),
+            )?;
+        }
+        write_batch(&self.db, batch)?;
         Ok(routes.len())
     }
 
@@ -1321,7 +1423,7 @@ impl RouteStore for RocksRouteStore {
         node_id: u64,
     ) -> anyhow::Result<usize> {
         let prefix = route_session_index_prefix(session_id);
-        let mut routes = Vec::new();
+        let mut routes: Vec<RouteRecord> = Vec::new();
         for item in self
             .db
             .iterator(IteratorMode::From(&prefix, Direction::Forward))
@@ -1330,13 +1432,16 @@ impl RouteStore for RocksRouteStore {
             if !key.starts_with(&prefix) {
                 break;
             }
-            routes.push(serde_json::from_slice::<RouteRecord>(&value)?);
+            routes.push(decode_rocks_value(&value)?);
         }
+        let mut batch = WriteBatch::default();
         for route in &routes {
             let mut updated = route.clone();
             updated.node_id = node_id;
-            self.save_route(&updated).await?;
+            let encoded = encode_rocks_value(&updated)?;
+            batch_put_route(&mut batch, &updated, &encoded);
         }
+        write_batch(&self.db, batch)?;
         Ok(routes.len())
     }
 
@@ -1347,7 +1452,7 @@ impl RouteStore for RocksRouteStore {
             if is_route_internal_key(key.as_ref()) {
                 continue;
             }
-            routes.push(serde_json::from_slice(&value)?);
+            routes.push(decode_rocks_value(&value)?);
         }
         Ok(routes)
     }
@@ -1363,7 +1468,7 @@ impl RouteStore for RocksRouteStore {
             if !key.starts_with(&prefix) {
                 break;
             }
-            routes.push(serde_json::from_slice(&value)?);
+            routes.push(decode_rocks_value(&value)?);
         }
         Ok(routes)
     }
@@ -1399,7 +1504,7 @@ impl RouteStore for RocksRouteStore {
             if !key.starts_with(&prefix) {
                 break;
             }
-            routes.push(serde_json::from_slice(&value)?);
+            routes.push(decode_rocks_value(&value)?);
         }
         Ok(routes)
     }
@@ -1439,7 +1544,7 @@ impl RouteStore for RocksRouteStore {
             if !key.starts_with(&prefix) {
                 break;
             }
-            routes.push(serde_json::from_slice(&value)?);
+            routes.push(decode_rocks_value(&value)?);
         }
         Ok(routes)
     }
@@ -1460,7 +1565,7 @@ impl RouteStore for RocksRouteStore {
             if !key.starts_with(&prefix) {
                 break;
             }
-            routes.push(serde_json::from_slice(&value)?);
+            routes.push(decode_rocks_value(&value)?);
         }
         Ok(routes)
     }
@@ -1521,7 +1626,7 @@ impl RouteStore for RocksRouteStore {
             if !key.starts_with(&prefix) {
                 break;
             }
-            routes.push(serde_json::from_slice(&value)?);
+            routes.push(decode_rocks_value(&value)?);
         }
         Ok(routes)
     }
@@ -1540,7 +1645,7 @@ impl RouteStore for RocksRouteStore {
             if !key.starts_with(&prefix) {
                 break;
             }
-            routes.push(serde_json::from_slice(&value)?);
+            routes.push(decode_rocks_value(&value)?);
         }
         Ok(routes)
     }
@@ -1556,7 +1661,7 @@ impl RouteStore for RocksRouteStore {
             if !key.starts_with(&prefix) {
                 break;
             }
-            routes.push(serde_json::from_slice(&value)?);
+            routes.push(decode_rocks_value(&value)?);
         }
         Ok(routes)
     }
@@ -1576,7 +1681,7 @@ impl RouteStore for RocksRouteStore {
             if !key.starts_with(&prefix) {
                 break;
             }
-            let route: RouteRecord = serde_json::from_slice(&value)?;
+            let route: RouteRecord = decode_rocks_value(&value)?;
             if route.topic_filter == topic_filter {
                 routes.push(route);
             }
@@ -1615,7 +1720,7 @@ impl RouteStore for RocksRouteStore {
             if !key.starts_with(&prefix) {
                 break;
             }
-            let route: RouteRecord = serde_json::from_slice(&value)?;
+            let route: RouteRecord = decode_rocks_value(&value)?;
             if route.topic_filter == topic_filter {
                 count += 1;
             }

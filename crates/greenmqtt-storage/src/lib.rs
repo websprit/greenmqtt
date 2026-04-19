@@ -27,6 +27,7 @@ pub use traits::{
 use ::rocksdb::{Options, DB};
 use ::sled::Tree;
 use greenmqtt_core::{RouteRecord, Subscription};
+use serde::{de::DeserializeOwned, Serialize};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -541,12 +542,6 @@ fn read_rocks_count(db: &DB, key: &[u8]) -> anyhow::Result<usize> {
     }
 }
 
-fn update_rocks_count(db: &DB, key: &[u8], delta: isize) -> anyhow::Result<()> {
-    let next = apply_count_delta(read_rocks_count(db, key)?, delta)?;
-    db.put(key, encode_count(next))?;
-    Ok(())
-}
-
 fn retain_key(tenant_id: &str, topic: &str) -> Vec<u8> {
     composite_key(&[tenant_id.as_bytes(), topic.as_bytes()])
 }
@@ -619,9 +614,174 @@ fn prefixed_key(parts: &[&[u8]]) -> Vec<u8> {
     composite_key(parts)
 }
 
+const ROCKS_VALUE_ENCODING_VERSION: u8 = 1;
+const ROCKS_BLOCK_CACHE_BYTES: usize = 32 * 1024 * 1024;
+const ROCKS_MEMTABLE_BUDGET_BYTES: usize = 128 * 1024 * 1024;
+const ROCKS_WRITE_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+const ROCKS_BLOOM_FILTER_BITS_PER_KEY: f64 = 10.0;
+const ROCKS_MAX_BACKGROUND_JOBS: i32 = 4;
+const ROCKS_BYTES_PER_SYNC: u64 = 1 << 20;
+const ROCKS_MEMTABLE_PREFIX_BLOOM_RATIO: f64 = 0.125;
+
+#[derive(Debug, Clone, PartialEq)]
+struct RocksDbConfig {
+    block_cache_bytes: usize,
+    memtable_budget_bytes: usize,
+    write_buffer_bytes: usize,
+    bloom_filter_bits_per_key: f64,
+    max_background_jobs: i32,
+    parallelism: i32,
+    bytes_per_sync: u64,
+    optimize_filters_for_hits: bool,
+    memtable_whole_key_filtering: bool,
+    memtable_prefix_bloom_ratio: f64,
+}
+
+impl Default for RocksDbConfig {
+    fn default() -> Self {
+        Self {
+            block_cache_bytes: ROCKS_BLOCK_CACHE_BYTES,
+            memtable_budget_bytes: ROCKS_MEMTABLE_BUDGET_BYTES,
+            write_buffer_bytes: ROCKS_WRITE_BUFFER_BYTES,
+            bloom_filter_bits_per_key: ROCKS_BLOOM_FILTER_BITS_PER_KEY,
+            max_background_jobs: ROCKS_MAX_BACKGROUND_JOBS,
+            parallelism: std::thread::available_parallelism()
+                .map(|parallelism| parallelism.get())
+                .unwrap_or(4)
+                .min(i32::MAX as usize) as i32,
+            bytes_per_sync: ROCKS_BYTES_PER_SYNC,
+            optimize_filters_for_hits: true,
+            memtable_whole_key_filtering: true,
+            memtable_prefix_bloom_ratio: ROCKS_MEMTABLE_PREFIX_BLOOM_RATIO,
+        }
+    }
+}
+
+impl RocksDbConfig {
+    fn from_env() -> anyhow::Result<Self> {
+        let defaults = Self::default();
+        Ok(Self {
+            block_cache_bytes: env_or_parse(
+                "GREENMQTT_ROCKSDB_BLOCK_CACHE_BYTES",
+                defaults.block_cache_bytes,
+            )?,
+            memtable_budget_bytes: env_or_parse(
+                "GREENMQTT_ROCKSDB_MEMTABLE_BUDGET_BYTES",
+                defaults.memtable_budget_bytes,
+            )?,
+            write_buffer_bytes: env_or_parse(
+                "GREENMQTT_ROCKSDB_WRITE_BUFFER_BYTES",
+                defaults.write_buffer_bytes,
+            )?,
+            bloom_filter_bits_per_key: env_or_parse(
+                "GREENMQTT_ROCKSDB_BLOOM_FILTER_BITS_PER_KEY",
+                defaults.bloom_filter_bits_per_key,
+            )?,
+            max_background_jobs: env_or_parse(
+                "GREENMQTT_ROCKSDB_MAX_BACKGROUND_JOBS",
+                defaults.max_background_jobs,
+            )?,
+            parallelism: env_or_parse("GREENMQTT_ROCKSDB_PARALLELISM", defaults.parallelism)?,
+            bytes_per_sync: env_or_parse(
+                "GREENMQTT_ROCKSDB_BYTES_PER_SYNC",
+                defaults.bytes_per_sync,
+            )?,
+            optimize_filters_for_hits: env_or_parse(
+                "GREENMQTT_ROCKSDB_OPTIMIZE_FILTERS_FOR_HITS",
+                defaults.optimize_filters_for_hits,
+            )?,
+            memtable_whole_key_filtering: env_or_parse(
+                "GREENMQTT_ROCKSDB_MEMTABLE_WHOLE_KEY_FILTERING",
+                defaults.memtable_whole_key_filtering,
+            )?,
+            memtable_prefix_bloom_ratio: env_or_parse(
+                "GREENMQTT_ROCKSDB_MEMTABLE_PREFIX_BLOOM_RATIO",
+                defaults.memtable_prefix_bloom_ratio,
+            )?,
+        })
+    }
+}
+
+fn env_or_parse<T>(name: &str, default: T) -> anyhow::Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse()
+            .map_err(|error| anyhow::anyhow!("invalid {name} value `{value}`: {error}")),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(anyhow::anyhow!("failed to read {name}: {error}")),
+    }
+}
+
+fn encode_rocks_value<T: Serialize>(value: &T) -> anyhow::Result<Vec<u8>> {
+    let mut encoded = Vec::with_capacity(64);
+    encoded.push(ROCKS_VALUE_ENCODING_VERSION);
+    encoded.extend(bincode::serialize(value)?);
+    Ok(encoded)
+}
+
+fn decode_rocks_value<T: DeserializeOwned>(value: &[u8]) -> anyhow::Result<T> {
+    let (version, payload) = value
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("missing rocksdb value encoding version"))?;
+    anyhow::ensure!(
+        *version == ROCKS_VALUE_ENCODING_VERSION,
+        "unsupported rocksdb value encoding version: {version}"
+    );
+    Ok(bincode::deserialize(payload)?)
+}
+
+fn rocks_prefix_extractor(key: &[u8]) -> &[u8] {
+    if key.starts_with(&[0xFF]) {
+        let mut zero_count = 0usize;
+        for (index, byte) in key.iter().enumerate() {
+            if *byte == 0 {
+                zero_count += 1;
+                if zero_count == 2 {
+                    return &key[..=index];
+                }
+            }
+        }
+        return key;
+    }
+
+    for (index, byte) in key.iter().enumerate() {
+        if *byte == 0 {
+            return &key[..=index];
+        }
+    }
+    key
+}
+
 fn open_rocks_db(path: impl AsRef<Path>) -> anyhow::Result<DB> {
+    use ::rocksdb::{BlockBasedOptions, Cache, DBCompressionType, SliceTransform};
+
+    let config = RocksDbConfig::from_env()?;
+    let mut block_based = BlockBasedOptions::default();
+    let block_cache = Cache::new_lru_cache(config.block_cache_bytes);
+    block_based.set_block_cache(&block_cache);
+    block_based.set_bloom_filter(config.bloom_filter_bits_per_key, true);
+
     let mut options = Options::default();
     options.create_if_missing(true);
+    options.set_block_based_table_factory(&block_based);
+    options.set_compression_type(DBCompressionType::Lz4);
+    options.set_write_buffer_size(config.write_buffer_bytes);
+    options.optimize_level_style_compaction(config.memtable_budget_bytes);
+    options.set_max_background_jobs(config.max_background_jobs);
+    options.increase_parallelism(config.parallelism);
+    options.set_bytes_per_sync(config.bytes_per_sync);
+    options.set_optimize_filters_for_hits(config.optimize_filters_for_hits);
+    options.set_memtable_whole_key_filtering(config.memtable_whole_key_filtering);
+    options.set_memtable_prefix_bloom_ratio(config.memtable_prefix_bloom_ratio);
+    options.set_prefix_extractor(SliceTransform::create(
+        "greenmqtt-prefix",
+        rocks_prefix_extractor,
+        None,
+    ));
     Ok(DB::open(&options, path)?)
 }
 

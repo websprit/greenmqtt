@@ -2,10 +2,10 @@ use super::{
     InboxStore, InflightStore, MemoryInboxStore, MemoryInflightStore, MemoryRetainStore,
     MemoryRouteStore, MemorySessionStore, MemorySubscriptionStore, RedisInboxStore,
     RedisInflightStore, RedisRetainStore, RedisRouteStore, RedisSessionStore,
-    RedisSubscriptionStore, RetainStore, RocksInboxStore, RocksInflightStore, RocksRetainStore,
-    RocksRouteStore, RocksSessionStore, RocksSubscriptionStore, RouteStore, SessionStore,
-    SledInboxStore, SledInflightStore, SledRetainStore, SledRouteStore, SledSessionStore,
-    SledSubscriptionStore, SubscriptionStore,
+    RedisSubscriptionStore, RetainStore, RocksDbConfig, RocksInboxStore, RocksInflightStore,
+    RocksRetainStore, RocksRouteStore, RocksSessionStore, RocksSubscriptionStore, RouteStore,
+    SessionStore, SledInboxStore, SledInflightStore, SledRetainStore, SledRouteStore,
+    SledSessionStore, SledSubscriptionStore, SubscriptionStore,
 };
 use greenmqtt_core::{
     ClientIdentity, InflightMessage, InflightPhase, OfflineMessage, PublishProperties,
@@ -13,7 +13,13 @@ use greenmqtt_core::{
 };
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
+
+fn env_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 #[tokio::test]
 async fn memory_stores_round_trip_data() {
@@ -77,6 +83,79 @@ async fn rocksdb_stores_round_trip_data() {
     )
     .await;
     assert_route_store_roundtrip(&route_store).await;
+}
+
+#[test]
+fn rocksdb_config_uses_defaults_when_env_is_absent() {
+    let _guard = env_lock().lock().unwrap();
+    for key in [
+        "GREENMQTT_ROCKSDB_BLOCK_CACHE_BYTES",
+        "GREENMQTT_ROCKSDB_MEMTABLE_BUDGET_BYTES",
+        "GREENMQTT_ROCKSDB_WRITE_BUFFER_BYTES",
+        "GREENMQTT_ROCKSDB_BLOOM_FILTER_BITS_PER_KEY",
+        "GREENMQTT_ROCKSDB_MAX_BACKGROUND_JOBS",
+        "GREENMQTT_ROCKSDB_PARALLELISM",
+        "GREENMQTT_ROCKSDB_BYTES_PER_SYNC",
+        "GREENMQTT_ROCKSDB_OPTIMIZE_FILTERS_FOR_HITS",
+        "GREENMQTT_ROCKSDB_MEMTABLE_WHOLE_KEY_FILTERING",
+        "GREENMQTT_ROCKSDB_MEMTABLE_PREFIX_BLOOM_RATIO",
+    ] {
+        std::env::remove_var(key);
+    }
+
+    let config = RocksDbConfig::from_env().unwrap();
+    assert_eq!(config.block_cache_bytes, 32 * 1024 * 1024);
+    assert_eq!(config.memtable_budget_bytes, 128 * 1024 * 1024);
+    assert_eq!(config.write_buffer_bytes, 16 * 1024 * 1024);
+    assert_eq!(config.bloom_filter_bits_per_key, 10.0);
+    assert_eq!(config.max_background_jobs, 4);
+    assert!(config.parallelism >= 1);
+    assert_eq!(config.bytes_per_sync, 1 << 20);
+    assert!(config.optimize_filters_for_hits);
+    assert!(config.memtable_whole_key_filtering);
+    assert_eq!(config.memtable_prefix_bloom_ratio, 0.125);
+}
+
+#[test]
+fn rocksdb_config_reads_env_overrides() {
+    let _guard = env_lock().lock().unwrap();
+    std::env::set_var("GREENMQTT_ROCKSDB_BLOCK_CACHE_BYTES", "1048576");
+    std::env::set_var("GREENMQTT_ROCKSDB_MEMTABLE_BUDGET_BYTES", "2097152");
+    std::env::set_var("GREENMQTT_ROCKSDB_WRITE_BUFFER_BYTES", "524288");
+    std::env::set_var("GREENMQTT_ROCKSDB_BLOOM_FILTER_BITS_PER_KEY", "7.5");
+    std::env::set_var("GREENMQTT_ROCKSDB_MAX_BACKGROUND_JOBS", "6");
+    std::env::set_var("GREENMQTT_ROCKSDB_PARALLELISM", "3");
+    std::env::set_var("GREENMQTT_ROCKSDB_BYTES_PER_SYNC", "65536");
+    std::env::set_var("GREENMQTT_ROCKSDB_OPTIMIZE_FILTERS_FOR_HITS", "false");
+    std::env::set_var("GREENMQTT_ROCKSDB_MEMTABLE_WHOLE_KEY_FILTERING", "false");
+    std::env::set_var("GREENMQTT_ROCKSDB_MEMTABLE_PREFIX_BLOOM_RATIO", "0.2");
+
+    let config = RocksDbConfig::from_env().unwrap();
+    assert_eq!(config.block_cache_bytes, 1_048_576);
+    assert_eq!(config.memtable_budget_bytes, 2_097_152);
+    assert_eq!(config.write_buffer_bytes, 524_288);
+    assert_eq!(config.bloom_filter_bits_per_key, 7.5);
+    assert_eq!(config.max_background_jobs, 6);
+    assert_eq!(config.parallelism, 3);
+    assert_eq!(config.bytes_per_sync, 65_536);
+    assert!(!config.optimize_filters_for_hits);
+    assert!(!config.memtable_whole_key_filtering);
+    assert_eq!(config.memtable_prefix_bloom_ratio, 0.2);
+
+    for key in [
+        "GREENMQTT_ROCKSDB_BLOCK_CACHE_BYTES",
+        "GREENMQTT_ROCKSDB_MEMTABLE_BUDGET_BYTES",
+        "GREENMQTT_ROCKSDB_WRITE_BUFFER_BYTES",
+        "GREENMQTT_ROCKSDB_BLOOM_FILTER_BITS_PER_KEY",
+        "GREENMQTT_ROCKSDB_MAX_BACKGROUND_JOBS",
+        "GREENMQTT_ROCKSDB_PARALLELISM",
+        "GREENMQTT_ROCKSDB_BYTES_PER_SYNC",
+        "GREENMQTT_ROCKSDB_OPTIMIZE_FILTERS_FOR_HITS",
+        "GREENMQTT_ROCKSDB_MEMTABLE_WHOLE_KEY_FILTERING",
+        "GREENMQTT_ROCKSDB_MEMTABLE_PREFIX_BLOOM_RATIO",
+    ] {
+        std::env::remove_var(key);
+    }
 }
 
 #[tokio::test]
@@ -1123,6 +1202,64 @@ async fn memory_route_store_count_tracks_replace_without_growth() {
         route_store.list_session_routes("s1").await.unwrap()[0].node_id,
         7
     );
+}
+
+#[tokio::test]
+async fn rocksdb_route_store_bulk_reassign_and_remove_preserve_indexes() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let route_store = RocksRouteStore::open(tempdir.path().join("routes")).unwrap();
+
+    for (topic_filter, shared_group) in [
+        ("devices/+/state", Some("workers")),
+        ("devices/a/status", None),
+    ] {
+        route_store
+            .save_route(&RouteRecord {
+                tenant_id: "t1".into(),
+                topic_filter: topic_filter.into(),
+                session_id: "s1".into(),
+                node_id: 1,
+                subscription_identifier: Some(1),
+                no_local: false,
+                retain_as_published: false,
+                shared_group: shared_group.map(str::to_string),
+                kind: SessionKind::Persistent,
+            })
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        route_store.reassign_session_routes("s1", 9).await.unwrap(),
+        2
+    );
+    assert_eq!(route_store.count_routes().await.unwrap(), 2);
+    assert!(route_store
+        .list_session_routes("s1")
+        .await
+        .unwrap()
+        .iter()
+        .all(|route| route.node_id == 9));
+    assert_eq!(
+        route_store
+            .list_topic_filter_shared_routes("t1", "devices/+/state", Some("workers"))
+            .await
+            .unwrap()[0]
+            .node_id,
+        9
+    );
+    assert_eq!(route_store.remove_session_routes("s1").await.unwrap(), 2);
+    assert!(route_store
+        .list_session_routes("s1")
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(route_store
+        .list_topic_filter_shared_routes("t1", "devices/+/state", Some("workers"))
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(route_store.count_routes().await.unwrap(), 0);
 }
 
 #[tokio::test]

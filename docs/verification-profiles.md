@@ -99,6 +99,73 @@ If performance fails:
 2. Compare the JSON summary durations between the last green run and the failing run.
 3. Do not promote to release mode until `status: 0`.
 
+RocksDB tuning environment variables:
+- `GREENMQTT_ROCKSDB_BLOCK_CACHE_BYTES`
+- `GREENMQTT_ROCKSDB_MEMTABLE_BUDGET_BYTES`
+- `GREENMQTT_ROCKSDB_WRITE_BUFFER_BYTES`
+- `GREENMQTT_ROCKSDB_BLOOM_FILTER_BITS_PER_KEY`
+- `GREENMQTT_ROCKSDB_MAX_BACKGROUND_JOBS`
+- `GREENMQTT_ROCKSDB_PARALLELISM`
+- `GREENMQTT_ROCKSDB_BYTES_PER_SYNC`
+- `GREENMQTT_ROCKSDB_OPTIMIZE_FILTERS_FOR_HITS`
+- `GREENMQTT_ROCKSDB_MEMTABLE_WHOLE_KEY_FILTERING`
+- `GREENMQTT_ROCKSDB_MEMTABLE_PREFIX_BLOOM_RATIO`
+
+Use these only when `GREENMQTT_STORAGE_BACKEND=rocksdb`.
+
+Example tuning templates:
+
+Balanced local profile:
+
+```bash
+env \
+  GREENMQTT_STORAGE_BACKEND=rocksdb \
+  GREENMQTT_ROCKSDB_BLOCK_CACHE_BYTES=$((64 * 1024 * 1024)) \
+  GREENMQTT_ROCKSDB_MEMTABLE_BUDGET_BYTES=$((128 * 1024 * 1024)) \
+  GREENMQTT_ROCKSDB_WRITE_BUFFER_BYTES=$((16 * 1024 * 1024)) \
+  GREENMQTT_ROCKSDB_MAX_BACKGROUND_JOBS=4 \
+  GREENMQTT_ROCKSDB_PARALLELISM=4 \
+  ./scripts/run-performance-profile.sh
+```
+
+Write-heavy throughput profile:
+
+```bash
+env \
+  GREENMQTT_STORAGE_BACKEND=rocksdb \
+  GREENMQTT_ROCKSDB_BLOCK_CACHE_BYTES=$((32 * 1024 * 1024)) \
+  GREENMQTT_ROCKSDB_MEMTABLE_BUDGET_BYTES=$((256 * 1024 * 1024)) \
+  GREENMQTT_ROCKSDB_WRITE_BUFFER_BYTES=$((32 * 1024 * 1024)) \
+  GREENMQTT_ROCKSDB_MAX_BACKGROUND_JOBS=6 \
+  GREENMQTT_ROCKSDB_PARALLELISM=6 \
+  GREENMQTT_ROCKSDB_BYTES_PER_SYNC=$((4 * 1024 * 1024)) \
+  ./scripts/run-performance-profile.sh --release
+```
+
+Read-heavy lookup profile:
+
+```bash
+env \
+  GREENMQTT_STORAGE_BACKEND=rocksdb \
+  GREENMQTT_ROCKSDB_BLOCK_CACHE_BYTES=$((128 * 1024 * 1024)) \
+  GREENMQTT_ROCKSDB_BLOOM_FILTER_BITS_PER_KEY=12 \
+  GREENMQTT_ROCKSDB_OPTIMIZE_FILTERS_FOR_HITS=true \
+  GREENMQTT_ROCKSDB_MEMTABLE_PREFIX_BLOOM_RATIO=0.2 \
+  ./scripts/run-performance-profile.sh --release
+```
+
+For backend comparisons, keep the workload fixed and change one RocksDB variable group at a time:
+
+```bash
+env \
+  GREENMQTT_COMPARE_BACKENDS=rocksdb \
+  GREENMQTT_STORAGE_BACKEND=rocksdb \
+  GREENMQTT_ROCKSDB_BLOCK_CACHE_BYTES=$((64 * 1024 * 1024)) \
+  GREENMQTT_ROCKSDB_MEMTABLE_BUDGET_BYTES=$((256 * 1024 * 1024)) \
+  GREENMQTT_ROCKSDB_WRITE_BUFFER_BYTES=$((32 * 1024 * 1024)) \
+  cargo run -p greenmqtt-cli -- compare-bench
+```
+
 ### Cluster profile
 
 `local` is the operator baseline.  
