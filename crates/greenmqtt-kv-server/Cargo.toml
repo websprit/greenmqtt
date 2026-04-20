@@ -13,6 +13,7 @@ greenmqtt-core = { path = "../greenmqtt-core" }
 greenmqtt-kv-balance = { path = "../greenmqtt-kv-balance" }
 greenmqtt-kv-engine = { path = "../greenmqtt-kv-engine" }
 greenmqtt-kv-raft = { path = "../greenmqtt-kv-raft" }
+metrics.workspace = true
 serde.workspace = true
 tokio.workspace = true
 

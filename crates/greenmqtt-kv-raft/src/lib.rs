@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use greenmqtt_core::{NodeId, RangeId, RangeReplica, ReplicaRole};
+use metrics::counter;
 use rocksdb::{Direction, IteratorMode, Options, WriteBatch, DB};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -70,6 +71,15 @@ pub struct RaftStatusSnapshot {
     pub applied_index: LogIndex,
     pub leader_node_id: Option<NodeId>,
     pub cluster_config: RaftClusterConfig,
+    pub replica_progress: Vec<ReplicaProgressSnapshot>,
+    pub latest_snapshot_index: Option<LogIndex>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplicaProgressSnapshot {
+    pub node_id: NodeId,
+    pub match_index: LogIndex,
+    pub next_index: LogIndex,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -517,6 +527,8 @@ impl MemoryRaftNode {
 
     fn reset_replication_progress(state: &mut MemoryRaftState) {
         let local_index = Self::last_log_index(state).max(state.commit_index);
+        let previous_match_indexes = state.match_indexes.clone();
+        let previous_next_indexes = state.next_indexes.clone();
         let mut match_indexes = HashMap::new();
         let mut next_indexes = HashMap::new();
         for node_id in state
@@ -528,10 +540,16 @@ impl MemoryRaftNode {
             let index = if *node_id == state.local_node_id {
                 local_index
             } else {
-                0
+                previous_match_indexes.get(node_id).copied().unwrap_or(0)
             };
             match_indexes.insert(*node_id, index);
-            next_indexes.insert(*node_id, local_index + 1);
+            next_indexes.insert(
+                *node_id,
+                previous_next_indexes
+                    .get(node_id)
+                    .copied()
+                    .unwrap_or(index.saturating_add(1)),
+            );
         }
         state.match_indexes = match_indexes;
         state.next_indexes = next_indexes;
@@ -557,6 +575,18 @@ impl MemoryRaftNode {
             state.commit_index = majority_index;
             Self::enqueue_newly_committed_entries(state, previous_commit);
         }
+    }
+
+    fn replica_match_index(state: &MemoryRaftState, node_id: NodeId) -> LogIndex {
+        state.match_indexes.get(&node_id).copied().unwrap_or(0)
+    }
+
+    fn replica_caught_up_to_commit(state: &MemoryRaftState, node_id: NodeId) -> bool {
+        Self::replica_match_index(state, node_id) >= state.commit_index
+    }
+
+    fn replica_caught_up_to_tail(state: &MemoryRaftState, node_id: NodeId) -> bool {
+        Self::replica_match_index(state, node_id) >= Self::last_log_index(state)
     }
 
     fn enqueue_newly_committed_entries(state: &mut MemoryRaftState, previous_commit: LogIndex) {
@@ -652,6 +682,19 @@ impl MemoryRaftNode {
         state.leader_lease_acks.insert(state.local_node_id);
         state.leader_lease_ticks_remaining = if Self::quorum_size(state) == 1 { 3 } else { 0 };
         Self::reset_replication_progress(state);
+    }
+
+    fn note_election(&self) {
+        counter!("kv_raft_election_total", "range_id" => self.range_id.clone()).increment(1);
+    }
+
+    fn note_stepdown(&self) {
+        counter!("kv_raft_stepdown_total", "range_id" => self.range_id.clone()).increment(1);
+    }
+
+    fn note_snapshot_install(&self) {
+        counter!("kv_raft_snapshot_install_total", "range_id" => self.range_id.clone())
+            .increment(1);
     }
 
     fn note_leader_lease_ack(state: &mut MemoryRaftState, node_id: NodeId) {
@@ -794,6 +837,7 @@ impl RaftNode for MemoryRaftNode {
             {
                 Self::begin_election(&mut state);
                 Self::enqueue_request_votes(&mut state);
+                self.note_election();
             }
             Self::stored_state(&state)
         };
@@ -813,6 +857,22 @@ impl RaftNode for MemoryRaftNode {
             applied_index: state.applied_index,
             leader_node_id: state.leader_node_id,
             cluster_config: state.cluster_config.clone(),
+            replica_progress: state
+                .cluster_config
+                .voters
+                .iter()
+                .chain(state.cluster_config.learners.iter())
+                .copied()
+                .map(|node_id| ReplicaProgressSnapshot {
+                    node_id,
+                    match_index: state.match_indexes.get(&node_id).copied().unwrap_or(0),
+                    next_index: state.next_indexes.get(&node_id).copied().unwrap_or(1),
+                })
+                .collect(),
+            latest_snapshot_index: state
+                .latest_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.index),
         })
     }
 
@@ -905,6 +965,7 @@ impl RaftNode for MemoryRaftNode {
                         state.election_elapsed_ticks = 0;
                         state.leader_lease_ticks_remaining = 0;
                         state.leader_lease_acks.clear();
+                        self.note_stepdown();
                     }
                     if request.term == state.current_term
                         && Self::candidate_log_is_up_to_date(
@@ -946,6 +1007,7 @@ impl RaftNode for MemoryRaftNode {
                             state.votes_granted.clear();
                             state.leader_lease_ticks_remaining = 0;
                             state.leader_lease_acks.clear();
+                            self.note_stepdown();
                         }
                         state.current_term = request.term;
                         state.leader_node_id = Some(request.leader_id);
@@ -965,6 +1027,7 @@ impl RaftNode for MemoryRaftNode {
                         let commit_index = state.commit_index;
                         state.match_indexes.insert(local_node_id, commit_index);
                         state.committed_queue.clear();
+                        self.note_snapshot_install();
                     }
                 }
                 RaftMessage::AppendEntriesResponse(response) => {
@@ -976,6 +1039,7 @@ impl RaftNode for MemoryRaftNode {
                         state.votes_granted.clear();
                         state.leader_lease_ticks_remaining = 0;
                         state.leader_lease_acks.clear();
+                        self.note_stepdown();
                     } else if state.leader_node_id == Some(state.local_node_id)
                         && state.role == RaftNodeRole::Leader
                     {
@@ -1011,6 +1075,7 @@ impl RaftNode for MemoryRaftNode {
                         state.votes_granted.clear();
                         state.leader_lease_ticks_remaining = 0;
                         state.leader_lease_acks.clear();
+                        self.note_stepdown();
                     } else if state.role == RaftNodeRole::Candidate && response.vote_granted {
                         state.votes_granted.insert(from);
                         if state.votes_granted.len() >= Self::quorum_size(&state) {
@@ -1076,6 +1141,14 @@ impl RaftNode for MemoryRaftNode {
             let exists = state.cluster_config.voters.contains(&target)
                 || state.cluster_config.learners.contains(&target);
             anyhow::ensure!(exists, "target node is not part of raft config");
+            anyhow::ensure!(
+                state.cluster_config.voters.contains(&target),
+                "target node must be a voter before leadership transfer"
+            );
+            anyhow::ensure!(
+                Self::replica_caught_up_to_tail(&state, target),
+                "target node is not caught up to the leader log tail"
+            );
             state.leader_node_id = Some(target);
             state.role = if target == state.local_node_id {
                 RaftNodeRole::Leader
@@ -1097,18 +1170,23 @@ impl RaftNode for MemoryRaftNode {
     async fn change_cluster_config(&self, change: RaftConfigChange) -> anyhow::Result<()> {
         let persisted = {
             let mut state = self.inner.lock().expect("raft state poisoned");
-            match change {
+            let (next_voters, next_learners) = match change {
                 RaftConfigChange::ReplaceVoters { voters } => {
-                    state.cluster_config.voters = voters;
+                    (voters, state.cluster_config.learners.clone())
                 }
                 RaftConfigChange::ReplaceLearners { learners } => {
-                    state.cluster_config.learners = learners;
+                    (state.cluster_config.voters.clone(), learners)
                 }
-                RaftConfigChange::ReplaceCluster { voters, learners } => {
-                    state.cluster_config.voters = voters;
-                    state.cluster_config.learners = learners;
-                }
+                RaftConfigChange::ReplaceCluster { voters, learners } => (voters, learners),
+            };
+            for node_id in next_voters.iter().chain(next_learners.iter()) {
+                anyhow::ensure!(
+                    Self::replica_caught_up_to_commit(&state, *node_id),
+                    "replica {node_id} is not caught up to commit index"
+                );
             }
+            state.cluster_config.voters = next_voters;
+            state.cluster_config.learners = next_learners;
             if state
                 .leader_node_id
                 .is_some_and(|leader| !state.cluster_config.voters.contains(&leader))
@@ -1231,7 +1309,11 @@ impl RaftNode for MemoryRaftNode {
     async fn compact_log_to_snapshot(&self) -> anyhow::Result<usize> {
         let (removed, persisted) = {
             let mut state = self.inner.lock().expect("raft state poisoned");
-            let Some(snapshot_index) = state.latest_snapshot.as_ref().map(|snapshot| snapshot.index) else {
+            let Some(snapshot_index) = state
+                .latest_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.index)
+            else {
                 return Ok(0);
             };
             anyhow::ensure!(
@@ -1254,9 +1336,10 @@ impl RaftNode for MemoryRaftNode {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppendEntriesRequest, AppendEntriesResponse, MemoryRaftNode, MemoryRaftStateStore,
-        RaftClusterConfig, RaftConfigChange, RaftMessage, RaftNode, RaftNodeRole, RaftSnapshot,
-        RaftStateStore, RequestVoteRequest, RequestVoteResponse, RocksDbRaftStateStore,
+        AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, MemoryRaftNode,
+        MemoryRaftStateStore, RaftClusterConfig, RaftConfigChange, RaftMessage, RaftNode,
+        RaftNodeRole, RaftSnapshot, RaftStateStore, RequestVoteRequest, RequestVoteResponse,
+        RocksDbRaftStateStore,
     };
     use bytes::Bytes;
     use greenmqtt_core::{NodeId, ReplicaRole, ReplicaSyncState};
@@ -1284,6 +1367,24 @@ mod tests {
         for outbound in source.drain_outbox().await.unwrap() {
             if outbound.target_node_id == target.local_node_id() {
                 target.receive(from, outbound.message).await.unwrap();
+            }
+        }
+    }
+
+    async fn deliver_outbox_to_targets(
+        from: NodeId,
+        source: &MemoryRaftNode,
+        targets: &[&MemoryRaftNode],
+    ) {
+        for outbound in source.drain_outbox().await.unwrap() {
+            for target in targets {
+                if outbound.target_node_id == target.local_node_id() {
+                    target
+                        .receive(from, outbound.message.clone())
+                        .await
+                        .unwrap();
+                    break;
+                }
             }
         }
     }
@@ -1869,6 +1970,422 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_raft_node_blocks_leadership_transfer_to_uncaught_up_replica() {
+        let node = MemoryRaftNode::new(
+            1,
+            "range-unsafe-transfer",
+            RaftClusterConfig {
+                voters: vec![1, 2, 3],
+                learners: Vec::new(),
+            },
+        );
+        node.recover().await.unwrap();
+        elect_local_leader(&node).await;
+        node.propose(Bytes::from_static(b"cmd")).await.unwrap();
+        let error = node.transfer_leadership(2).await.unwrap_err().to_string();
+        assert!(error.contains("not caught up"));
+    }
+
+    #[tokio::test]
+    async fn memory_raft_node_blocks_replica_config_change_until_target_is_caught_up() {
+        let node = MemoryRaftNode::new(
+            1,
+            "range-unsafe-config",
+            RaftClusterConfig {
+                voters: vec![1, 2],
+                learners: vec![3],
+            },
+        );
+        node.recover().await.unwrap();
+        elect_local_leader(&node).await;
+        let index = node.propose(Bytes::from_static(b"cmd")).await.unwrap();
+        node.receive(
+            2,
+            RaftMessage::AppendEntriesResponse(AppendEntriesResponse {
+                term: node.status().await.unwrap().current_term,
+                success: true,
+                match_index: index,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let error = node
+            .change_cluster_config(RaftConfigChange::ReplaceCluster {
+                voters: vec![1, 3],
+                learners: Vec::new(),
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not caught up"));
+    }
+
+    #[tokio::test]
+    async fn leader_crash_before_commit_keeps_uncommitted_entry_out_of_committed_queue() {
+        let store = Arc::new(MemoryRaftStateStore::default());
+        let leader = MemoryRaftNode::with_state_store(
+            1,
+            "range-crash-before-commit",
+            RaftClusterConfig {
+                voters: vec![1, 2, 3],
+                learners: Vec::new(),
+            },
+            store.clone(),
+        );
+        leader.recover().await.unwrap();
+        elect_local_leader(&leader).await;
+        leader.propose(Bytes::from_static(b"cmd")).await.unwrap();
+
+        let restored = MemoryRaftNode::with_state_store(
+            1,
+            "range-crash-before-commit",
+            RaftClusterConfig::default(),
+            store,
+        );
+        restored.recover().await.unwrap();
+        let status = restored.status().await.unwrap();
+        assert_eq!(status.commit_index, 0);
+        assert_eq!(status.applied_index, 0);
+        assert!(restored.committed_entries().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn leader_crash_after_quorum_commit_before_apply_preserves_committed_queue() {
+        let store = Arc::new(MemoryRaftStateStore::default());
+        let leader = MemoryRaftNode::with_state_store(
+            1,
+            "range-crash-after-commit",
+            RaftClusterConfig {
+                voters: vec![1, 2, 3],
+                learners: Vec::new(),
+            },
+            store.clone(),
+        );
+        leader.recover().await.unwrap();
+        elect_local_leader(&leader).await;
+        let index = leader.propose(Bytes::from_static(b"cmd")).await.unwrap();
+        leader
+            .receive(
+                2,
+                RaftMessage::AppendEntriesResponse(AppendEntriesResponse {
+                    term: leader.status().await.unwrap().current_term,
+                    success: true,
+                    match_index: index,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let restored = MemoryRaftNode::with_state_store(
+            1,
+            "range-crash-after-commit",
+            RaftClusterConfig::default(),
+            store,
+        );
+        restored.recover().await.unwrap();
+        let status = restored.status().await.unwrap();
+        assert_eq!(status.commit_index, 1);
+        assert_eq!(status.applied_index, 0);
+        assert_eq!(restored.committed_entries().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn follower_restart_during_catch_up_recovers_and_continues_replication() {
+        let follower_store = Arc::new(MemoryRaftStateStore::default());
+        let leader = MemoryRaftNode::new(
+            1,
+            "range-catchup-restart",
+            RaftClusterConfig {
+                voters: vec![1, 2, 3],
+                learners: Vec::new(),
+            },
+        );
+        let follower = MemoryRaftNode::with_state_store(
+            2,
+            "range-catchup-restart",
+            RaftClusterConfig {
+                voters: vec![1, 2, 3],
+                learners: Vec::new(),
+            },
+            follower_store.clone(),
+        );
+        leader.recover().await.unwrap();
+        follower.recover().await.unwrap();
+        elect_local_leader(&leader).await;
+
+        leader.propose(Bytes::from_static(b"one")).await.unwrap();
+        deliver_outbox_once(1, &leader, &follower).await;
+
+        let restarted = MemoryRaftNode::with_state_store(
+            2,
+            "range-catchup-restart",
+            RaftClusterConfig::default(),
+            follower_store.clone(),
+        );
+        restarted.recover().await.unwrap();
+        leader.propose(Bytes::from_static(b"two")).await.unwrap();
+        deliver_outbox_once(1, &leader, &restarted).await;
+
+        let persisted = follower_store
+            .load("range-catchup-restart")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.log.len(), 2);
+        assert_eq!(persisted.log[0].command, Bytes::from_static(b"one"));
+        assert_eq!(persisted.log[1].command, Bytes::from_static(b"two"));
+    }
+
+    #[tokio::test]
+    async fn partitioned_leader_steps_down_on_higher_term_append_entries_response() {
+        let leader = MemoryRaftNode::new(
+            1,
+            "range-stepdown",
+            RaftClusterConfig {
+                voters: vec![1, 2, 3],
+                learners: Vec::new(),
+            },
+        );
+        leader.recover().await.unwrap();
+        elect_local_leader(&leader).await;
+        leader
+            .receive(
+                2,
+                RaftMessage::AppendEntriesResponse(AppendEntriesResponse {
+                    term: leader.status().await.unwrap().current_term + 1,
+                    success: false,
+                    match_index: 0,
+                }),
+            )
+            .await
+            .unwrap();
+        let status = leader.status().await.unwrap();
+        assert_eq!(status.role, RaftNodeRole::Follower);
+        assert_eq!(status.leader_node_id, None);
+    }
+
+    #[tokio::test]
+    async fn memory_raft_node_prevents_split_brain_after_higher_term_leader_emerges() {
+        let stale_leader = MemoryRaftNode::new(
+            1,
+            "range-split-brain",
+            RaftClusterConfig {
+                voters: vec![1, 2, 3],
+                learners: Vec::new(),
+            },
+        );
+        let replacement = MemoryRaftNode::new(
+            2,
+            "range-split-brain",
+            RaftClusterConfig {
+                voters: vec![1, 2, 3],
+                learners: Vec::new(),
+            },
+        );
+        stale_leader.recover().await.unwrap();
+        replacement.recover().await.unwrap();
+        elect_local_leader(&stale_leader).await;
+
+        for _ in 0..8 {
+            replacement.tick().await.unwrap();
+        }
+        if replacement.status().await.unwrap().role == RaftNodeRole::Candidate {
+            replacement
+                .receive(
+                    3,
+                    RaftMessage::RequestVoteResponse(RequestVoteResponse {
+                        term: replacement.status().await.unwrap().current_term,
+                        vote_granted: true,
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(replacement.status().await.unwrap().role, RaftNodeRole::Leader);
+        let new_term = replacement.status().await.unwrap().current_term;
+
+        stale_leader
+            .receive(
+                2,
+                RaftMessage::AppendEntries(AppendEntriesRequest {
+                    term: new_term,
+                    leader_id: 2,
+                    prev_log_index: 0,
+                    prev_log_term: 0,
+                    entries: Vec::new(),
+                    leader_commit: 0,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let stale_status = stale_leader.status().await.unwrap();
+        let replacement_status = replacement.status().await.unwrap();
+        assert_eq!(stale_status.role, RaftNodeRole::Follower);
+        assert_eq!(stale_status.leader_node_id, Some(2));
+        assert_eq!(replacement_status.role, RaftNodeRole::Leader);
+        assert_eq!(replacement_status.leader_node_id, Some(2));
+    }
+
+    #[tokio::test]
+    async fn membership_change_uses_safe_staging_before_final_voter_set() {
+        let node = MemoryRaftNode::new(
+            1,
+            "range-membership-stage",
+            RaftClusterConfig {
+                voters: vec![1],
+                learners: Vec::new(),
+            },
+        );
+        node.recover().await.unwrap();
+        elect_local_leader(&node).await;
+
+        node.change_cluster_config(RaftConfigChange::ReplaceCluster {
+            voters: vec![1],
+            learners: vec![2, 3],
+        })
+        .await
+        .unwrap();
+        let staged = node.status().await.unwrap();
+        assert_eq!(staged.cluster_config.voters, vec![1]);
+        assert_eq!(staged.cluster_config.learners, vec![2, 3]);
+
+        node.change_cluster_config(RaftConfigChange::ReplaceCluster {
+            voters: vec![1, 2, 3],
+            learners: Vec::new(),
+        })
+        .await
+        .unwrap();
+        let final_status = node.status().await.unwrap();
+        assert_eq!(final_status.cluster_config.voters, vec![1, 2, 3]);
+        assert!(final_status.cluster_config.learners.is_empty());
+    }
+
+    #[tokio::test]
+    async fn three_replica_reference_soak_survives_restarts_and_repeated_replication() {
+        let leader_store = Arc::new(MemoryRaftStateStore::default());
+        let follower2_store = Arc::new(MemoryRaftStateStore::default());
+        let follower3_store = Arc::new(MemoryRaftStateStore::default());
+        let leader = MemoryRaftNode::with_state_store(
+            1,
+            "range-soak",
+            RaftClusterConfig {
+                voters: vec![1, 2, 3],
+                learners: Vec::new(),
+            },
+            leader_store,
+        );
+        let mut follower2 = MemoryRaftNode::with_state_store(
+            2,
+            "range-soak",
+            RaftClusterConfig {
+                voters: vec![1, 2, 3],
+                learners: Vec::new(),
+            },
+            follower2_store.clone(),
+        );
+        let follower3 = MemoryRaftNode::with_state_store(
+            3,
+            "range-soak",
+            RaftClusterConfig {
+                voters: vec![1, 2, 3],
+                learners: Vec::new(),
+            },
+            follower3_store.clone(),
+        );
+        leader.recover().await.unwrap();
+        follower2.recover().await.unwrap();
+        follower3.recover().await.unwrap();
+        elect_local_leader(&leader).await;
+
+        async fn pump_cluster(
+            leader: &MemoryRaftNode,
+            follower2: &MemoryRaftNode,
+            follower3: &MemoryRaftNode,
+        ) {
+            for _ in 0..8 {
+                leader.tick().await.unwrap();
+                deliver_outbox_to_targets(1, leader, &[follower2, follower3]).await;
+                deliver_outbox_once(2, follower2, leader).await;
+                deliver_outbox_once(3, follower3, leader).await;
+            }
+        }
+
+        for index in 0..32 {
+            leader
+                .propose(Bytes::from(format!("cmd-{index}").into_bytes()))
+                .await
+                .unwrap();
+            pump_cluster(&leader, &follower2, &follower3).await;
+
+            if index % 8 == 7 {
+                follower2 = MemoryRaftNode::with_state_store(
+                    2,
+                    "range-soak",
+                    RaftClusterConfig::default(),
+                    follower2_store.clone(),
+                );
+                follower2.recover().await.unwrap();
+            }
+        }
+
+        leader.propose(Bytes::from_static(b"final-sync")).await.unwrap();
+        pump_cluster(&leader, &follower2, &follower3).await;
+
+        let leader_status = leader.status().await.unwrap();
+        let follower2_status = follower2.status().await.unwrap();
+        let follower3_status = follower3.status().await.unwrap();
+        assert!(leader_status.commit_index >= 32);
+        assert!(follower2_status.last_log_index >= 32);
+        assert!(follower3_status.last_log_index >= 32);
+    }
+
+    #[tokio::test]
+    async fn snapshot_install_after_log_truncation_restores_follower_state() {
+        let leader = MemoryRaftNode::single_node(1, "range-snapshot-trunc");
+        leader.recover().await.unwrap();
+        leader.propose(Bytes::from_static(b"a")).await.unwrap();
+        leader.mark_applied(1).await.unwrap();
+        leader.propose(Bytes::from_static(b"b")).await.unwrap();
+        leader.mark_applied(2).await.unwrap();
+        leader
+            .install_snapshot(RaftSnapshot {
+                range_id: "range-snapshot-trunc".into(),
+                term: 1,
+                index: 2,
+                payload: Bytes::from_static(b"snapshot"),
+            })
+            .await
+            .unwrap();
+        leader.compact_log_to_snapshot().await.unwrap();
+
+        let follower = MemoryRaftNode::new(
+            2,
+            "range-snapshot-trunc",
+            RaftClusterConfig {
+                voters: vec![1, 2],
+                learners: Vec::new(),
+            },
+        );
+        follower.recover().await.unwrap();
+        follower
+            .receive(
+                1,
+                RaftMessage::InstallSnapshot(InstallSnapshotRequest {
+                    term: 1,
+                    leader_id: 1,
+                    snapshot: leader.latest_snapshot().await.unwrap().unwrap(),
+                }),
+            )
+            .await
+            .unwrap();
+        let status = follower.status().await.unwrap();
+        assert_eq!(status.commit_index, 2);
+        assert_eq!(status.applied_index, 2);
+    }
+
+    #[tokio::test]
     async fn memory_raft_node_restores_persisted_state_from_state_store() {
         let store = Arc::new(MemoryRaftStateStore::default());
         let node = MemoryRaftNode::with_state_store(
@@ -1893,9 +2410,19 @@ mod tests {
         )
         .await
         .unwrap();
+        node.receive(
+            3,
+            RaftMessage::AppendEntriesResponse(AppendEntriesResponse {
+                term: node.status().await.unwrap().current_term,
+                success: true,
+                match_index: index,
+            }),
+        )
+        .await
+        .unwrap();
         node.change_cluster_config(RaftConfigChange::ReplaceCluster {
-            voters: vec![1, 3, 5],
-            learners: vec![2],
+            voters: vec![1, 2, 3],
+            learners: Vec::new(),
         })
         .await
         .unwrap();
@@ -1910,8 +2437,8 @@ mod tests {
         assert_eq!(status.applied_index, 0);
         assert_eq!(status.leader_node_id, Some(3));
         assert_eq!(status.role, RaftNodeRole::Follower);
-        assert_eq!(status.cluster_config.voters, vec![1, 3, 5]);
-        assert_eq!(status.cluster_config.learners, vec![2]);
+        assert_eq!(status.cluster_config.voters, vec![1, 2, 3]);
+        assert!(status.cluster_config.learners.is_empty());
     }
 
     #[tokio::test]

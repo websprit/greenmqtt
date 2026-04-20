@@ -39,6 +39,17 @@ pub enum RetryDirective {
     FailFast,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum KvRangeErrorKind {
+    NotLeader(Option<NodeId>),
+    EpochMismatch,
+    RangeNotFound,
+    ConfigChanging,
+    SnapshotInProgress,
+    RetryExhausted,
+    Other,
+}
+
 #[async_trait]
 pub trait KvRangeRouter: Send + Sync {
     async fn upsert(&self, descriptor: ReplicatedRangeDescriptor) -> anyhow::Result<()>;
@@ -56,19 +67,64 @@ pub trait KvRangeRouter: Send + Sync {
 #[async_trait]
 pub trait KvRangeExecutor: Send + Sync {
     async fn get(&self, range_id: &str, key: &[u8]) -> anyhow::Result<Option<Bytes>>;
+    async fn get_fenced(
+        &self,
+        range_id: &str,
+        key: &[u8],
+        expected_epoch: Option<u64>,
+    ) -> anyhow::Result<Option<Bytes>> {
+        let _ = expected_epoch;
+        self.get(range_id, key).await
+    }
     async fn scan(
         &self,
         range_id: &str,
         boundary: Option<greenmqtt_core::RangeBoundary>,
         limit: usize,
     ) -> anyhow::Result<Vec<(Bytes, Bytes)>>;
+    async fn scan_fenced(
+        &self,
+        range_id: &str,
+        boundary: Option<greenmqtt_core::RangeBoundary>,
+        limit: usize,
+        expected_epoch: Option<u64>,
+    ) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
+        let _ = expected_epoch;
+        self.scan(range_id, boundary, limit).await
+    }
     async fn apply(&self, range_id: &str, mutations: Vec<KvMutation>) -> anyhow::Result<()>;
+    async fn apply_fenced(
+        &self,
+        range_id: &str,
+        mutations: Vec<KvMutation>,
+        expected_epoch: Option<u64>,
+    ) -> anyhow::Result<()> {
+        let _ = expected_epoch;
+        self.apply(range_id, mutations).await
+    }
     async fn checkpoint(
         &self,
         range_id: &str,
         checkpoint_id: &str,
     ) -> anyhow::Result<KvRangeCheckpoint>;
+    async fn checkpoint_fenced(
+        &self,
+        range_id: &str,
+        checkpoint_id: &str,
+        expected_epoch: Option<u64>,
+    ) -> anyhow::Result<KvRangeCheckpoint> {
+        let _ = expected_epoch;
+        self.checkpoint(range_id, checkpoint_id).await
+    }
     async fn snapshot(&self, range_id: &str) -> anyhow::Result<KvRangeSnapshot>;
+    async fn snapshot_fenced(
+        &self,
+        range_id: &str,
+        expected_epoch: Option<u64>,
+    ) -> anyhow::Result<KvRangeSnapshot> {
+        let _ = expected_epoch;
+        self.snapshot(range_id).await
+    }
 }
 
 #[async_trait]
@@ -174,23 +230,129 @@ impl LeaderRoutedKvRangeExecutor {
         }
         Ok(self.fallback.clone())
     }
+
+    fn classify_error(error: &anyhow::Error) -> KvRangeErrorKind {
+        let message = error.to_string();
+        if let Some(rest) = message.strip_prefix("kv/not-leader") {
+            let leader = rest
+                .split("leader=")
+                .nth(1)
+                .and_then(|value| value.split_whitespace().next())
+                .and_then(|value| value.parse().ok());
+            return KvRangeErrorKind::NotLeader(leader);
+        }
+        if message.starts_with("kv/epoch-mismatch") {
+            return KvRangeErrorKind::EpochMismatch;
+        }
+        if message.starts_with("kv/range-not-found") {
+            return KvRangeErrorKind::RangeNotFound;
+        }
+        if message.starts_with("kv/config-changing") {
+            return KvRangeErrorKind::ConfigChanging;
+        }
+        if message.starts_with("kv/snapshot-in-progress") {
+            return KvRangeErrorKind::SnapshotInProgress;
+        }
+        KvRangeErrorKind::Other
+    }
+
+    async fn execute_query_with_retry<T, F, Fut>(
+        &self,
+        range_id: &str,
+        route: RangeRoute,
+        op: F,
+    ) -> anyhow::Result<T>
+    where
+        F: Fn(Arc<dyn KvRangeExecutor>) -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<T>>,
+    {
+        let mut current = route;
+        for attempt in 0..3 {
+            let executor = self.query_executor(&current).await?;
+            match op(executor).await {
+                Ok(value) => return Ok(value),
+                Err(error) => match Self::classify_error(&error) {
+                    KvRangeErrorKind::NotLeader(Some(node_id)) => {
+                        if let Some(executor) =
+                            self.routed_executor_for_node(&current, node_id).await?
+                        {
+                            current.leader_node_id = Some(node_id);
+                            return op(executor).await;
+                        }
+                    }
+                    KvRangeErrorKind::EpochMismatch | KvRangeErrorKind::RangeNotFound => {
+                        current = self.route_by_id(range_id).await?;
+                    }
+                    KvRangeErrorKind::ConfigChanging | KvRangeErrorKind::SnapshotInProgress => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        current = self.route_by_id(range_id).await?;
+                    }
+                    KvRangeErrorKind::Other | KvRangeErrorKind::RetryExhausted => {
+                        return Err(error);
+                    }
+                    KvRangeErrorKind::NotLeader(None) => {
+                        current = self.route_by_id(range_id).await?;
+                    }
+                },
+            }
+            if attempt == 2 {
+                anyhow::bail!("kv/retry-exhausted range={range_id}");
+            }
+        }
+        anyhow::bail!("kv/retry-exhausted range={range_id}")
+    }
+
+    async fn execute_leader_with_retry<T, F, Fut>(
+        &self,
+        range_id: &str,
+        route: RangeRoute,
+        op: F,
+    ) -> anyhow::Result<T>
+    where
+        F: Fn(Arc<dyn KvRangeExecutor>) -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<T>>,
+    {
+        let mut current = route;
+        for attempt in 0..3 {
+            let executor = self.leader_executor(&current).await?;
+            match op(executor).await {
+                Ok(value) => return Ok(value),
+                Err(error) => match Self::classify_error(&error) {
+                    KvRangeErrorKind::NotLeader(Some(node_id)) => {
+                        current.leader_node_id = Some(node_id);
+                    }
+                    KvRangeErrorKind::EpochMismatch | KvRangeErrorKind::RangeNotFound => {
+                        current = self.route_by_id(range_id).await?;
+                    }
+                    KvRangeErrorKind::ConfigChanging | KvRangeErrorKind::SnapshotInProgress => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        current = self.route_by_id(range_id).await?;
+                    }
+                    KvRangeErrorKind::Other | KvRangeErrorKind::RetryExhausted => {
+                        return Err(error);
+                    }
+                    KvRangeErrorKind::NotLeader(None) => {
+                        current = self.route_by_id(range_id).await?;
+                    }
+                },
+            }
+            if attempt == 2 {
+                anyhow::bail!("kv/retry-exhausted range={range_id}");
+            }
+        }
+        anyhow::bail!("kv/retry-exhausted range={range_id}")
+    }
 }
 
 #[async_trait]
 impl KvRangeExecutor for LeaderRoutedKvRangeExecutor {
     async fn get(&self, range_id: &str, key: &[u8]) -> anyhow::Result<Option<Bytes>> {
         let route = self.route_by_id(range_id).await?;
-        let executor = self.query_executor(&route).await?;
-        match executor.get(range_id, key).await {
-            Ok(value) => Ok(value),
-            Err(_) => {
-                let refreshed = self.route_by_id(range_id).await?;
-                self.query_executor(&refreshed)
-                    .await?
-                    .get(range_id, key)
-                    .await
-            }
-        }
+        let expected_epoch = route.descriptor.epoch;
+        self.execute_query_with_retry(range_id, route, |executor| async move {
+            executor.get_fenced(range_id, key, Some(expected_epoch)).await
+        })
+        .await
     }
 
     async fn scan(
@@ -200,32 +362,30 @@ impl KvRangeExecutor for LeaderRoutedKvRangeExecutor {
         limit: usize,
     ) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
         let route = self.route_by_id(range_id).await?;
-        let executor = self.query_executor(&route).await?;
-        match executor.scan(range_id, boundary.clone(), limit).await {
-            Ok(entries) => Ok(entries),
-            Err(_) => {
-                let refreshed = self.route_by_id(range_id).await?;
-                self.query_executor(&refreshed)
-                    .await?
-                    .scan(range_id, boundary, limit)
+        let expected_epoch = route.descriptor.epoch;
+        self.execute_query_with_retry(range_id, route, |executor| {
+            let boundary = boundary.clone();
+            async move {
+                executor
+                    .scan_fenced(range_id, boundary, limit, Some(expected_epoch))
                     .await
             }
-        }
+        })
+        .await
     }
 
     async fn apply(&self, range_id: &str, mutations: Vec<KvMutation>) -> anyhow::Result<()> {
         let route = self.route_by_id(range_id).await?;
-        let executor = self.leader_executor(&route).await?;
-        match executor.apply(range_id, mutations.clone()).await {
-            Ok(()) => Ok(()),
-            Err(_) => {
-                let refreshed = self.route_by_id(range_id).await?;
-                self.leader_executor(&refreshed)
-                    .await?
-                    .apply(range_id, mutations)
+        let expected_epoch = route.descriptor.epoch;
+        self.execute_leader_with_retry(range_id, route, |executor| {
+            let mutations = mutations.clone();
+            async move {
+                executor
+                    .apply_fenced(range_id, mutations, Some(expected_epoch))
                     .await
             }
-        }
+        })
+        .await
     }
 
     async fn checkpoint(
@@ -234,32 +394,22 @@ impl KvRangeExecutor for LeaderRoutedKvRangeExecutor {
         checkpoint_id: &str,
     ) -> anyhow::Result<KvRangeCheckpoint> {
         let route = self.route_by_id(range_id).await?;
-        let executor = self.leader_executor(&route).await?;
-        match executor.checkpoint(range_id, checkpoint_id).await {
-            Ok(checkpoint) => Ok(checkpoint),
-            Err(_) => {
-                let refreshed = self.route_by_id(range_id).await?;
-                self.leader_executor(&refreshed)
-                    .await?
-                    .checkpoint(range_id, checkpoint_id)
-                    .await
-            }
-        }
+        let expected_epoch = route.descriptor.epoch;
+        self.execute_leader_with_retry(range_id, route, |executor| async move {
+            executor
+                .checkpoint_fenced(range_id, checkpoint_id, Some(expected_epoch))
+                .await
+        })
+        .await
     }
 
     async fn snapshot(&self, range_id: &str) -> anyhow::Result<KvRangeSnapshot> {
         let route = self.route_by_id(range_id).await?;
-        let executor = self.leader_executor(&route).await?;
-        match executor.snapshot(range_id).await {
-            Ok(snapshot) => Ok(snapshot),
-            Err(_) => {
-                let refreshed = self.route_by_id(range_id).await?;
-                self.leader_executor(&refreshed)
-                    .await?
-                    .snapshot(range_id)
-                    .await
-            }
-        }
+        let expected_epoch = route.descriptor.epoch;
+        self.execute_leader_with_retry(range_id, route, |executor| async move {
+            executor.snapshot_fenced(range_id, Some(expected_epoch)).await
+        })
+        .await
     }
 }
 
@@ -402,6 +552,7 @@ mod tests {
     };
     use greenmqtt_kv_engine::{KvMutation, KvRangeCheckpoint, KvRangeSnapshot};
     use std::collections::{BTreeMap, HashMap};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, RwLock};
 
     fn descriptor(
@@ -600,6 +751,10 @@ mod tests {
             Ok(KvRangeSnapshot {
                 range_id: range_id.to_string(),
                 boundary: RangeBoundary::full(),
+                term: 0,
+                index: 0,
+                checksum: 0,
+                layout_version: 1,
                 data_path: format!("/tmp/{range_id}-snapshot"),
             })
         }
@@ -768,5 +923,142 @@ mod tests {
             node9_impl.get("range-1", b"beta").await.unwrap().unwrap(),
             Bytes::from_static(b"two")
         );
+    }
+
+    struct FlippingLeaderErrorExecutor {
+        failed: AtomicBool,
+    }
+
+    #[async_trait]
+    impl KvRangeExecutor for FlippingLeaderErrorExecutor {
+        async fn get(&self, _range_id: &str, _key: &[u8]) -> anyhow::Result<Option<Bytes>> {
+            if !self.failed.swap(true, Ordering::SeqCst) {
+                anyhow::bail!("kv/not-leader leader=9");
+            }
+            Ok(Some(Bytes::from_static(b"ok")))
+        }
+        async fn scan(
+            &self,
+            _range_id: &str,
+            _boundary: Option<greenmqtt_core::RangeBoundary>,
+            _limit: usize,
+        ) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
+            unreachable!()
+        }
+        async fn apply(&self, _range_id: &str, _mutations: Vec<KvMutation>) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn checkpoint(
+            &self,
+            _range_id: &str,
+            _checkpoint_id: &str,
+        ) -> anyhow::Result<KvRangeCheckpoint> {
+            unreachable!()
+        }
+        async fn snapshot(&self, _range_id: &str) -> anyhow::Result<KvRangeSnapshot> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn leader_routed_executor_retries_with_leader_hint() {
+        let router = Arc::new(MemoryKvRangeRouter::default());
+        let membership = Arc::new(TestMembershipRegistry::default());
+        let fallback: Arc<dyn KvRangeExecutor> = Arc::new(FlippingLeaderErrorExecutor {
+            failed: AtomicBool::new(false),
+        });
+        let node9_impl = Arc::new(TestExecutor::default());
+        node9_impl
+            .apply(
+                "range-1",
+                vec![KvMutation {
+                    key: Bytes::from_static(b"k"),
+                    value: Some(Bytes::from_static(b"v")),
+                }],
+            )
+            .await
+            .unwrap();
+        let factory = Arc::new(TestExecutorFactory::default());
+        factory.register("node9", node9_impl.clone());
+        membership
+            .upsert_member(ClusterNodeMembership::new(
+                9,
+                1,
+                ClusterNodeLifecycle::Serving,
+                vec![ServiceEndpoint::new(ServiceKind::Retain, 9, "node9")],
+            ))
+            .await
+            .unwrap();
+        router
+            .upsert(descriptor(
+                "range-1",
+                ServiceShardKey::retain("tenant-a"),
+                b"a",
+                b"z",
+                7,
+            ))
+            .await
+            .unwrap();
+        let executor = LeaderRoutedKvRangeExecutor::new(router, membership, fallback, factory);
+        let value = executor.get("range-1", b"k").await.unwrap().unwrap();
+        assert_eq!(value, Bytes::from_static(b"v"));
+    }
+
+    struct EpochMismatchExecutor {
+        failed: AtomicBool,
+    }
+
+    #[async_trait]
+    impl KvRangeExecutor for EpochMismatchExecutor {
+        async fn get(&self, _range_id: &str, _key: &[u8]) -> anyhow::Result<Option<Bytes>> {
+            if !self.failed.swap(true, Ordering::SeqCst) {
+                anyhow::bail!("kv/epoch-mismatch");
+            }
+            Ok(Some(Bytes::from_static(b"fresh")))
+        }
+        async fn scan(
+            &self,
+            _range_id: &str,
+            _boundary: Option<greenmqtt_core::RangeBoundary>,
+            _limit: usize,
+        ) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
+            unreachable!()
+        }
+        async fn apply(&self, _range_id: &str, _mutations: Vec<KvMutation>) -> anyhow::Result<()> {
+            unreachable!()
+        }
+        async fn checkpoint(
+            &self,
+            _range_id: &str,
+            _checkpoint_id: &str,
+        ) -> anyhow::Result<KvRangeCheckpoint> {
+            unreachable!()
+        }
+        async fn snapshot(&self, _range_id: &str) -> anyhow::Result<KvRangeSnapshot> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn leader_routed_executor_refreshes_route_after_epoch_mismatch() {
+        let router = Arc::new(MemoryKvRangeRouter::default());
+        let membership = Arc::new(TestMembershipRegistry::default());
+        let fallback: Arc<dyn KvRangeExecutor> = Arc::new(EpochMismatchExecutor {
+            failed: AtomicBool::new(false),
+        });
+        router
+            .upsert(descriptor(
+                "range-1",
+                ServiceShardKey::retain("tenant-a"),
+                b"a",
+                b"z",
+                1,
+            ))
+            .await
+            .unwrap();
+        let factory = Arc::new(TestExecutorFactory::default());
+        let executor = LeaderRoutedKvRangeExecutor::new(router, membership, fallback, factory);
+        let value = executor.get("range-1", b"k").await.unwrap().unwrap();
+        assert_eq!(value, Bytes::from_static(b"fresh"));
     }
 }

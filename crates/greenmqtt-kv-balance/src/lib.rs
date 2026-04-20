@@ -76,6 +76,62 @@ pub async fn execute_balance_commands(
     Ok(applied)
 }
 
+#[derive(Clone)]
+pub struct BalanceCoordinator {
+    controller: Arc<dyn BalanceController>,
+    executor: Arc<dyn BalanceCommandExecutor>,
+}
+
+impl BalanceCoordinator {
+    pub fn new(
+        controller: Arc<dyn BalanceController>,
+        executor: Arc<dyn BalanceCommandExecutor>,
+    ) -> Self {
+        Self {
+            controller,
+            executor,
+        }
+    }
+
+    pub async fn bootstrap_missing_ranges(
+        &self,
+        desired_ranges: Vec<ReplicatedRangeDescriptor>,
+    ) -> anyhow::Result<usize> {
+        let commands = self
+            .controller
+            .bootstrap_missing_ranges(desired_ranges)
+            .await?;
+        execute_balance_commands(self.executor.as_ref(), &commands).await
+    }
+
+    pub async fn reconcile_replica_counts(
+        &self,
+        voters_per_range: usize,
+        learners_per_range: usize,
+    ) -> anyhow::Result<usize> {
+        let commands = self
+            .controller
+            .reconcile_replica_counts(voters_per_range, learners_per_range)
+            .await?;
+        execute_balance_commands(self.executor.as_ref(), &commands).await
+    }
+
+    pub async fn rebalance_range_leaders(&self) -> anyhow::Result<usize> {
+        let commands = self.controller.rebalance_range_leaders().await?;
+        execute_balance_commands(self.executor.as_ref(), &commands).await
+    }
+
+    pub async fn cleanup_unreachable_replicas(&self) -> anyhow::Result<usize> {
+        let commands = self.controller.cleanup_unreachable_replicas().await?;
+        execute_balance_commands(self.executor.as_ref(), &commands).await
+    }
+
+    pub async fn recover_ranges(&self) -> anyhow::Result<usize> {
+        let commands = self.controller.recover_ranges().await?;
+        execute_balance_commands(self.executor.as_ref(), &commands).await
+    }
+}
+
 #[async_trait]
 pub trait BalanceController: Send + Sync {
     async fn bootstrap_missing_ranges(
@@ -700,7 +756,7 @@ impl ClusterWorkflowController for MetadataBalanceController {
 mod tests {
     use super::{
         execute_balance_commands, BalanceCommand, BalanceCommandExecutor, BalanceController,
-        MetadataBalanceController,
+        BalanceCoordinator, MetadataBalanceController,
     };
     use async_trait::async_trait;
     use greenmqtt_cluster::ClusterWorkflowController;
@@ -1336,11 +1392,56 @@ mod tests {
                 to_node_id: 2,
             },
         ];
-        let applied = execute_balance_commands(&executor, &commands).await.unwrap();
+        let applied = execute_balance_commands(&executor, &commands)
+            .await
+            .unwrap();
         assert_eq!(applied, 2);
         assert_eq!(
             executor.commands.lock().expect("executor poisoned").len(),
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn balance_coordinator_executes_controller_output_against_executor() {
+        let registry = Arc::new(StaticServiceEndpointRegistry::default());
+        registry
+            .upsert_member(ClusterNodeMembership::new(
+                7,
+                1,
+                ClusterNodeLifecycle::Serving,
+                vec![ServiceEndpoint::new(
+                    ServiceKind::Retain,
+                    7,
+                    "http://127.0.0.1:50070",
+                )],
+            ))
+            .await
+            .unwrap();
+        let controller: Arc<dyn BalanceController> =
+            Arc::new(MetadataBalanceController::new(registry.clone()));
+        let executor = Arc::new(RecordingExecutor::default());
+        let coordinator = BalanceCoordinator::new(controller, executor.clone());
+
+        let applied = coordinator
+            .bootstrap_missing_ranges(vec![ReplicatedRangeDescriptor::new(
+                "retain-range-coord",
+                ServiceShardKey::retain("t1"),
+                RangeBoundary::full(),
+                1,
+                1,
+                None,
+                Vec::new(),
+                0,
+                0,
+                ServiceShardLifecycle::Bootstrapping,
+            )])
+            .await
+            .unwrap();
+        assert_eq!(applied, 1);
+        assert_eq!(
+            executor.commands.lock().expect("executor poisoned").len(),
+            1
         );
     }
 }

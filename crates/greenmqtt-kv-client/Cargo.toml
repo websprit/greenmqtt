@@ -11,6 +11,6 @@ bytes.workspace = true
 greenmqtt-core = { path = "../greenmqtt-core" }
 greenmqtt-kv-engine = { path = "../greenmqtt-kv-engine" }
 serde.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true

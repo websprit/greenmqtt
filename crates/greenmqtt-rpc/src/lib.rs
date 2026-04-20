@@ -18,7 +18,7 @@ use greenmqtt_kv_engine::{
     KvEngine, KvMutation, KvRangeBootstrap, KvRangeCheckpoint, KvRangeSnapshot, RocksDbKvEngine,
 };
 use greenmqtt_kv_raft::RaftMessage;
-use greenmqtt_kv_server::{KvRangeHost, ReplicaTransport};
+use greenmqtt_kv_server::{KvRangeHost, RangeHealthSnapshot, ReplicaLagSnapshot, ReplicaTransport};
 use greenmqtt_proto::internal::{
     broker_peer_service_client::BrokerPeerServiceClient,
     broker_peer_service_server::{BrokerPeerService, BrokerPeerServiceServer},
@@ -32,6 +32,8 @@ use greenmqtt_proto::internal::{
     metadata_service_server::{MetadataService, MetadataServiceServer},
     raft_transport_service_client::RaftTransportServiceClient,
     raft_transport_service_server::{RaftTransportService, RaftTransportServiceServer},
+    range_admin_service_client::RangeAdminServiceClient,
+    range_admin_service_server::{RangeAdminService, RangeAdminServiceServer},
     retain_service_client::RetainServiceClient,
     retain_service_server::{RetainService, RetainServiceServer},
     session_dict_service_client::SessionDictServiceClient,
@@ -50,11 +52,13 @@ use greenmqtt_proto::internal::{
     ListSessionsRequest, LookupSessionByIdRequest, LookupSessionReply, LookupSessionRequest,
     MatchTopicReply, MatchTopicRequest, MemberListReply, MemberLookupRequest, MemberRecordReply,
     NamedBalancerStateRecord, PushDeliveriesReply, PushDeliveriesRequest, PushDeliveryReply,
-    PushDeliveryRequest, RaftTransportRequest, RangeListReply, RangeListRequest,
+    PushDeliveryRequest, RaftTransportRequest, RangeDebugReply, RangeHealthListReply,
+    RangeHealthRecord, RangeHealthReply, RangeHealthRequest, RangeListReply, RangeListRequest,
     RangeLookupRequest, RangeRecordReply, RangeUpsertRequest, RegisterSessionReply,
     RegisterSessionRequest, RemoveRouteRequest, RemoveSessionRoutesReply,
-    RemoveSessionRoutesRequest, RetainMatchReply, RetainMatchRequest, RetainWriteRequest,
-    RouteRangeRequest, ShardSnapshotChunk, ShardSnapshotRequest, UnregisterSessionRequest,
+    RemoveSessionRoutesRequest, ReplicaLagRecord, RetainMatchReply, RetainMatchRequest,
+    RetainWriteRequest, RouteRangeRequest, ShardSnapshotChunk, ShardSnapshotRequest,
+    UnregisterSessionRequest,
 };
 use greenmqtt_proto::{
     from_proto_balancer_state, from_proto_client_identity, from_proto_cluster_node_membership,
@@ -130,6 +134,11 @@ pub struct RaftTransportGrpcClient {
     inner: Arc<Mutex<RaftTransportServiceClient<Channel>>>,
 }
 
+#[derive(Clone)]
+pub struct RangeAdminGrpcClient {
+    inner: Arc<Mutex<RangeAdminServiceClient<Channel>>>,
+}
+
 #[derive(Clone, Default)]
 pub struct KvRangeGrpcExecutorFactory;
 
@@ -194,6 +203,9 @@ struct StaticPeerClient {
 #[derive(Clone, Default)]
 pub struct NoopDeliverySink;
 
+#[derive(Clone, Default)]
+pub struct NoopReplicaTransport;
+
 #[derive(Clone)]
 struct SessionDictRpc {
     inner: Arc<dyn SessionDirectory>,
@@ -237,6 +249,11 @@ struct RaftTransportRpc {
     inner: Option<Arc<dyn KvRangeHost>>,
 }
 
+#[derive(Clone)]
+struct RangeAdminRpc {
+    inner: Option<Arc<dyn KvRangeHost>>,
+}
+
 async fn apply_committed_entries_for_range(
     hosted: &greenmqtt_kv_server::HostedRange,
 ) -> anyhow::Result<usize> {
@@ -256,6 +273,42 @@ async fn apply_committed_entries_for_range(
         hosted.raft.mark_applied(index).await?;
     }
     Ok(applied)
+}
+
+fn proto_role(role: greenmqtt_kv_raft::RaftNodeRole) -> String {
+    match role {
+        greenmqtt_kv_raft::RaftNodeRole::Follower => "follower".to_string(),
+        greenmqtt_kv_raft::RaftNodeRole::Candidate => "candidate".to_string(),
+        greenmqtt_kv_raft::RaftNodeRole::Leader => "leader".to_string(),
+    }
+}
+
+fn to_proto_replica_lag(replica: &ReplicaLagSnapshot) -> ReplicaLagRecord {
+    ReplicaLagRecord {
+        node_id: replica.node_id,
+        lag: replica.lag,
+        match_index: replica.match_index,
+        next_index: replica.next_index,
+    }
+}
+
+fn to_proto_range_health(health: &RangeHealthSnapshot) -> RangeHealthRecord {
+    RangeHealthRecord {
+        range_id: health.range_id.clone(),
+        role: proto_role(health.role),
+        current_term: health.current_term,
+        leader_node_id: health.leader_node_id.unwrap_or_default(),
+        has_leader_node_id: health.leader_node_id.is_some(),
+        commit_index: health.commit_index,
+        applied_index: health.applied_index,
+        latest_snapshot_index: health.latest_snapshot_index.unwrap_or_default(),
+        has_latest_snapshot_index: health.latest_snapshot_index.is_some(),
+        replica_lag: health
+            .replica_lag
+            .iter()
+            .map(to_proto_replica_lag)
+            .collect(),
+    }
 }
 
 impl SessionDictShardSnapshot {
@@ -448,6 +501,26 @@ fn same_route_identity(left: &RouteRecord, right: &RouteRecord) -> bool {
         && left.topic_filter == right.topic_filter
         && left.session_id == right.session_id
         && left.shared_group == right.shared_group
+}
+
+fn validate_kv_request_fence(
+    hosted: &greenmqtt_kv_server::HostedRange,
+    expected_epoch: u64,
+) -> Result<(), Status> {
+    if expected_epoch != 0 && hosted.descriptor.epoch != expected_epoch {
+        return Err(internal_status(anyhow::anyhow!(
+            "range epoch mismatch: expected={}, actual={}",
+            expected_epoch,
+            hosted.descriptor.epoch
+        )));
+    }
+    if hosted.descriptor.lifecycle != ServiceShardLifecycle::Serving {
+        return Err(internal_status(anyhow::anyhow!(
+            "range lifecycle is not serving: {:?}",
+            hosted.descriptor.lifecycle
+        )));
+    }
+    Ok(())
 }
 
 async fn validate_snapshot_assignment(
@@ -2420,11 +2493,21 @@ impl KvRangeGrpcClient {
     }
 
     pub async fn get(&self, range_id: &str, key: &[u8]) -> anyhow::Result<Option<Bytes>> {
+        self.get_fenced(range_id, key, None).await
+    }
+
+    pub async fn get_fenced(
+        &self,
+        range_id: &str,
+        key: &[u8],
+        expected_epoch: Option<u64>,
+    ) -> anyhow::Result<Option<Bytes>> {
         let mut client = self.inner.lock().await;
         let reply = client
             .get(KvRangeGetRequest {
                 range_id: range_id.to_string(),
                 key: key.to_vec(),
+                expected_epoch: expected_epoch.unwrap_or_default(),
             })
             .await?
             .into_inner();
@@ -2437,6 +2520,16 @@ impl KvRangeGrpcClient {
         boundary: Option<greenmqtt_core::RangeBoundary>,
         limit: usize,
     ) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
+        self.scan_fenced(range_id, boundary, limit, None).await
+    }
+
+    pub async fn scan_fenced(
+        &self,
+        range_id: &str,
+        boundary: Option<greenmqtt_core::RangeBoundary>,
+        limit: usize,
+        expected_epoch: Option<u64>,
+    ) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
         let mut client = self.inner.lock().await;
         let reply = client
             .scan(KvRangeScanRequest {
@@ -2445,6 +2538,7 @@ impl KvRangeGrpcClient {
                     .as_ref()
                     .map(greenmqtt_proto::to_proto_range_boundary),
                 limit: limit as u32,
+                expected_epoch: expected_epoch.unwrap_or_default(),
             })
             .await?
             .into_inner();
@@ -2456,6 +2550,15 @@ impl KvRangeGrpcClient {
     }
 
     pub async fn apply(&self, range_id: &str, mutations: Vec<KvMutation>) -> anyhow::Result<()> {
+        self.apply_fenced(range_id, mutations, None).await
+    }
+
+    pub async fn apply_fenced(
+        &self,
+        range_id: &str,
+        mutations: Vec<KvMutation>,
+        expected_epoch: Option<u64>,
+    ) -> anyhow::Result<()> {
         let mut client = self.inner.lock().await;
         client
             .apply(KvRangeApplyRequest {
@@ -2464,6 +2567,7 @@ impl KvRangeGrpcClient {
                     .iter()
                     .map(greenmqtt_proto::to_proto_kv_mutation)
                     .collect(),
+                expected_epoch: expected_epoch.unwrap_or_default(),
             })
             .await?;
         Ok(())
@@ -2474,11 +2578,21 @@ impl KvRangeGrpcClient {
         range_id: &str,
         checkpoint_id: &str,
     ) -> anyhow::Result<KvRangeCheckpoint> {
+        self.checkpoint_fenced(range_id, checkpoint_id, None).await
+    }
+
+    pub async fn checkpoint_fenced(
+        &self,
+        range_id: &str,
+        checkpoint_id: &str,
+        expected_epoch: Option<u64>,
+    ) -> anyhow::Result<KvRangeCheckpoint> {
         let mut client = self.inner.lock().await;
         let reply = client
             .checkpoint(KvRangeCheckpointRequest {
                 range_id: range_id.to_string(),
                 checkpoint_id: checkpoint_id.to_string(),
+                expected_epoch: expected_epoch.unwrap_or_default(),
             })
             .await?
             .into_inner();
@@ -2486,10 +2600,19 @@ impl KvRangeGrpcClient {
     }
 
     pub async fn snapshot(&self, range_id: &str) -> anyhow::Result<KvRangeSnapshot> {
+        self.snapshot_fenced(range_id, None).await
+    }
+
+    pub async fn snapshot_fenced(
+        &self,
+        range_id: &str,
+        expected_epoch: Option<u64>,
+    ) -> anyhow::Result<KvRangeSnapshot> {
         let mut client = self.inner.lock().await;
         let reply = client
             .snapshot(KvRangeSnapshotRequest {
                 range_id: range_id.to_string(),
+                expected_epoch: expected_epoch.unwrap_or_default(),
             })
             .await?
             .into_inner();
@@ -2513,6 +2636,10 @@ impl RaftTransportGrpcClient {
         message: &RaftMessage,
     ) -> anyhow::Result<()> {
         let mut client = self.inner.lock().await;
+        if matches!(message, RaftMessage::InstallSnapshot(_)) {
+            counter!("kv_raft_snapshot_send_total", "range_id" => range_id.to_string())
+                .increment(1);
+        }
         client
             .send(to_proto_raft_transport_request(
                 range_id,
@@ -2521,6 +2648,36 @@ impl RaftTransportGrpcClient {
             ))
             .await?;
         Ok(())
+    }
+}
+
+impl RangeAdminGrpcClient {
+    pub async fn connect(endpoint: impl Into<String>) -> anyhow::Result<Self> {
+        Ok(Self {
+            inner: Arc::new(Mutex::new(
+                RangeAdminServiceClient::connect(endpoint.into()).await?,
+            )),
+        })
+    }
+
+    pub async fn list_range_health(&self) -> anyhow::Result<RangeHealthListReply> {
+        let mut client = self.inner.lock().await;
+        Ok(client.list_range_health(()).await?.into_inner())
+    }
+
+    pub async fn get_range_health(&self, range_id: &str) -> anyhow::Result<RangeHealthReply> {
+        let mut client = self.inner.lock().await;
+        Ok(client
+            .get_range_health(RangeHealthRequest {
+                range_id: range_id.to_string(),
+            })
+            .await?
+            .into_inner())
+    }
+
+    pub async fn debug_dump(&self) -> anyhow::Result<String> {
+        let mut client = self.inner.lock().await;
+        Ok(client.debug_dump(()).await?.into_inner().text)
     }
 }
 
@@ -2544,6 +2701,15 @@ impl KvRangeExecutor for KvRangeGrpcClient {
         Self::get(self, range_id, key).await
     }
 
+    async fn get_fenced(
+        &self,
+        range_id: &str,
+        key: &[u8],
+        expected_epoch: Option<u64>,
+    ) -> anyhow::Result<Option<Bytes>> {
+        Self::get_fenced(self, range_id, key, expected_epoch).await
+    }
+
     async fn scan(
         &self,
         range_id: &str,
@@ -2553,8 +2719,27 @@ impl KvRangeExecutor for KvRangeGrpcClient {
         Self::scan(self, range_id, boundary, limit).await
     }
 
+    async fn scan_fenced(
+        &self,
+        range_id: &str,
+        boundary: Option<greenmqtt_core::RangeBoundary>,
+        limit: usize,
+        expected_epoch: Option<u64>,
+    ) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
+        Self::scan_fenced(self, range_id, boundary, limit, expected_epoch).await
+    }
+
     async fn apply(&self, range_id: &str, mutations: Vec<KvMutation>) -> anyhow::Result<()> {
         Self::apply(self, range_id, mutations).await
+    }
+
+    async fn apply_fenced(
+        &self,
+        range_id: &str,
+        mutations: Vec<KvMutation>,
+        expected_epoch: Option<u64>,
+    ) -> anyhow::Result<()> {
+        Self::apply_fenced(self, range_id, mutations, expected_epoch).await
     }
 
     async fn checkpoint(
@@ -2565,8 +2750,25 @@ impl KvRangeExecutor for KvRangeGrpcClient {
         Self::checkpoint(self, range_id, checkpoint_id).await
     }
 
+    async fn checkpoint_fenced(
+        &self,
+        range_id: &str,
+        checkpoint_id: &str,
+        expected_epoch: Option<u64>,
+    ) -> anyhow::Result<KvRangeCheckpoint> {
+        Self::checkpoint_fenced(self, range_id, checkpoint_id, expected_epoch).await
+    }
+
     async fn snapshot(&self, range_id: &str) -> anyhow::Result<KvRangeSnapshot> {
         Self::snapshot(self, range_id).await
+    }
+
+    async fn snapshot_fenced(
+        &self,
+        range_id: &str,
+        expected_epoch: Option<u64>,
+    ) -> anyhow::Result<KvRangeSnapshot> {
+        Self::snapshot_fenced(self, range_id, expected_epoch).await
     }
 }
 
@@ -2743,6 +2945,9 @@ impl RpcRuntime {
                 inner: self.range_host.clone(),
             }))
             .add_service(RaftTransportServiceServer::new(RaftTransportRpc {
+                inner: self.range_host.clone(),
+            }))
+            .add_service(RangeAdminServiceServer::new(RangeAdminRpc {
                 inner: self.range_host.clone(),
             }))
             .serve(bind)
@@ -3272,6 +3477,19 @@ impl PeerForwarder for StaticPeerForwarder {
 impl DeliverySink for NoopDeliverySink {
     async fn push_delivery(&self, _delivery: Delivery) -> anyhow::Result<bool> {
         Ok(false)
+    }
+}
+
+#[async_trait]
+impl ReplicaTransport for NoopReplicaTransport {
+    async fn send(
+        &self,
+        _from_node_id: NodeId,
+        _target_node_id: NodeId,
+        _range_id: &str,
+        _message: &RaftMessage,
+    ) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 
@@ -4231,6 +4449,7 @@ impl KvRangeService for KvRangeRpc {
             .await
             .map_err(internal_status)?
             .ok_or_else(|| Status::not_found("range not found"))?;
+        validate_kv_request_fence(&hosted, request.expected_epoch)?;
         hosted.raft.read_index().await.map_err(internal_status)?;
         let value = hosted
             .space
@@ -4258,6 +4477,7 @@ impl KvRangeService for KvRangeRpc {
             .await
             .map_err(internal_status)?
             .ok_or_else(|| Status::not_found("range not found"))?;
+        validate_kv_request_fence(&hosted, request.expected_epoch)?;
         hosted.raft.read_index().await.map_err(internal_status)?;
         let boundary = request
             .boundary
@@ -4285,6 +4505,7 @@ impl KvRangeService for KvRangeRpc {
             .await
             .map_err(internal_status)?
             .ok_or_else(|| Status::not_found("range not found"))?;
+        validate_kv_request_fence(&hosted, request.expected_epoch)?;
         let mutations = request
             .mutations
             .into_iter()
@@ -4337,6 +4558,7 @@ impl KvRangeService for KvRangeRpc {
             .await
             .map_err(internal_status)?
             .ok_or_else(|| Status::not_found("range not found"))?;
+        validate_kv_request_fence(&hosted, request.expected_epoch)?;
         hosted.raft.read_index().await.map_err(internal_status)?;
         let checkpoint = hosted
             .space
@@ -4360,6 +4582,7 @@ impl KvRangeService for KvRangeRpc {
             .await
             .map_err(internal_status)?
             .ok_or_else(|| Status::not_found("range not found"))?;
+        validate_kv_request_fence(&hosted, request.expected_epoch)?;
         hosted.raft.read_index().await.map_err(internal_status)?;
         let snapshot = hosted.space.snapshot().await.map_err(internal_status)?;
         Ok(Response::new(to_proto_kv_range_snapshot(&snapshot)))
@@ -4380,6 +4603,9 @@ impl RaftTransportService for RaftTransportRpc {
             .await
             .map_err(internal_status)?
             .ok_or_else(|| Status::not_found("range not found"))?;
+        if matches!(message, RaftMessage::InstallSnapshot(_)) {
+            counter!("kv_raft_snapshot_receive_total", "range_id" => range_id.clone()).increment(1);
+        }
         hosted
             .raft
             .receive(from_node_id, message)
@@ -4389,8 +4615,89 @@ impl RaftTransportService for RaftTransportRpc {
     }
 }
 
+#[tonic::async_trait]
+impl RangeAdminService for RangeAdminRpc {
+    async fn list_range_health(
+        &self,
+        _request: Request<()>,
+    ) -> Result<Response<RangeHealthListReply>, Status> {
+        let host = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("kv range host unavailable"))?;
+        let runtime = greenmqtt_kv_server::ReplicaRuntime::new(
+            host.clone(),
+            Arc::new(crate::NoopReplicaTransport),
+        );
+        let health = runtime.health_snapshot().await.map_err(internal_status)?;
+        Ok(Response::new(RangeHealthListReply {
+            entries: health.iter().map(to_proto_range_health).collect(),
+        }))
+    }
+
+    async fn get_range_health(
+        &self,
+        request: Request<RangeHealthRequest>,
+    ) -> Result<Response<RangeHealthReply>, Status> {
+        let host = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("kv range host unavailable"))?;
+        let runtime = greenmqtt_kv_server::ReplicaRuntime::new(
+            host.clone(),
+            Arc::new(crate::NoopReplicaTransport),
+        );
+        let range_id = request.into_inner().range_id;
+        let health = runtime
+            .health_snapshot()
+            .await
+            .map_err(internal_status)?
+            .into_iter()
+            .find(|entry| entry.range_id == range_id)
+            .ok_or_else(|| Status::not_found("range not found"))?;
+        Ok(Response::new(RangeHealthReply {
+            health: Some(to_proto_range_health(&health)),
+        }))
+    }
+
+    async fn debug_dump(&self, _request: Request<()>) -> Result<Response<RangeDebugReply>, Status> {
+        let host = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("kv range host unavailable"))?;
+        let runtime = greenmqtt_kv_server::ReplicaRuntime::new(
+            host.clone(),
+            Arc::new(crate::NoopReplicaTransport),
+        );
+        let text = runtime.debug_dump().await.map_err(internal_status)?;
+        Ok(Response::new(RangeDebugReply { text }))
+    }
+}
+
 fn internal_status(error: anyhow::Error) -> Status {
-    Status::internal(error.to_string())
+    let message = error.to_string();
+    if message.contains("range not found") {
+        return Status::not_found(format!("kv/range-not-found {message}"));
+    }
+    if message.contains("range epoch mismatch") {
+        return Status::failed_precondition(format!("kv/epoch-mismatch {message}"));
+    }
+    if message.contains("propose requires local leader ownership") {
+        return Status::failed_precondition(format!("kv/not-leader {message}"));
+    }
+    if message.contains("read index requires local leader ownership") {
+        return Status::failed_precondition(format!("kv/not-leader {message}"));
+    }
+    if message.contains("range lifecycle is not serving") {
+        return Status::failed_precondition(format!("kv/config-changing {message}"));
+    }
+    if message.contains("active leader lease") {
+        return Status::failed_precondition(format!("kv/config-changing {message}"));
+    }
+    if message.contains("timed out waiting for raft command to apply") {
+        return Status::deadline_exceeded(format!("kv/config-changing {message}"));
+    }
+    Status::internal(format!("kv/internal {message}"))
 }
 
 #[cfg(test)]

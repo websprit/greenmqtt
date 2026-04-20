@@ -1,11 +1,12 @@
 use async_trait::async_trait;
 use bytes::Bytes;
-use greenmqtt_core::{NodeId, ReplicatedRangeDescriptor, ServiceShardLifecycle};
+use greenmqtt_core::{NodeId, RangeBoundary, ReplicatedRangeDescriptor, ServiceShardLifecycle};
 use greenmqtt_kv_balance::{BalanceCommand, BalanceCommandExecutor};
 use greenmqtt_kv_engine::{KvMutation, KvRangeSnapshot, KvRangeSpace};
 use greenmqtt_kv_raft::{
     RaftConfigChange, RaftLogEntry, RaftMessage, RaftNode, RaftSnapshot, RaftStatusSnapshot,
 };
+use metrics::gauge;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
@@ -32,6 +33,26 @@ pub struct AppliedRangeSnapshot {
     pub entries: Vec<(Bytes, Bytes)>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplicaLagSnapshot {
+    pub node_id: NodeId,
+    pub lag: u64,
+    pub match_index: u64,
+    pub next_index: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RangeHealthSnapshot {
+    pub range_id: String,
+    pub role: greenmqtt_kv_raft::RaftNodeRole,
+    pub current_term: u64,
+    pub leader_node_id: Option<NodeId>,
+    pub commit_index: u64,
+    pub applied_index: u64,
+    pub latest_snapshot_index: Option<u64>,
+    pub replica_lag: Vec<ReplicaLagSnapshot>,
+}
+
 #[async_trait]
 pub trait KvRangeHost: Send + Sync {
     async fn add_range(&self, range: HostedRange) -> anyhow::Result<()>;
@@ -51,6 +72,15 @@ pub struct MemoryKvRangeHost {
 }
 
 #[async_trait]
+pub trait RangeLifecycleManager: Send + Sync {
+    async fn create_range(
+        &self,
+        descriptor: ReplicatedRangeDescriptor,
+    ) -> anyhow::Result<HostedRange>;
+    async fn retire_range(&self, range_id: &str) -> anyhow::Result<()>;
+}
+
+#[async_trait]
 pub trait ReplicaTransport: Send + Sync {
     async fn send(
         &self,
@@ -65,6 +95,7 @@ pub trait ReplicaTransport: Send + Sync {
 pub struct ReplicaRuntime {
     host: Arc<dyn KvRangeHost>,
     transport: Arc<dyn ReplicaTransport>,
+    lifecycle: Option<Arc<dyn RangeLifecycleManager>>,
     pending: Arc<Mutex<VecDeque<PendingOutbound>>>,
     send_timeout: Duration,
     max_pending: usize,
@@ -90,6 +121,7 @@ impl ReplicaRuntime {
         Self {
             host,
             transport,
+            lifecycle: None,
             pending: Arc::new(Mutex::new(VecDeque::new())),
             send_timeout: Duration::from_secs(1),
             max_pending: 1024,
@@ -101,6 +133,7 @@ impl ReplicaRuntime {
     pub fn with_config(
         host: Arc<dyn KvRangeHost>,
         transport: Arc<dyn ReplicaTransport>,
+        lifecycle: Option<Arc<dyn RangeLifecycleManager>>,
         send_timeout: Duration,
         max_pending: usize,
         snapshot_threshold: u64,
@@ -109,12 +142,57 @@ impl ReplicaRuntime {
         Self {
             host,
             transport,
+            lifecycle,
             pending: Arc::new(Mutex::new(VecDeque::new())),
             send_timeout,
             max_pending,
             snapshot_threshold,
             compact_threshold,
         }
+    }
+
+    async fn replace_range(&self, range: HostedRange) -> anyhow::Result<()> {
+        self.host.add_range(range).await
+    }
+
+    async fn rewrite_descriptor<F>(&self, range_id: &str, update: F) -> anyhow::Result<HostedRange>
+    where
+        F: FnOnce(&mut ReplicatedRangeDescriptor),
+    {
+        let mut range = self
+            .host
+            .remove_range(range_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("range `{range_id}` not found"))?;
+        update(&mut range.descriptor);
+        self.host.add_range(range.clone()).await?;
+        Ok(range)
+    }
+
+    pub async fn validate_serving_fence(
+        &self,
+        range_id: &str,
+        expected_epoch: Option<u64>,
+    ) -> anyhow::Result<HostedRange> {
+        let range = self
+            .host
+            .open_range(range_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("range `{range_id}` not found"))?;
+        if let Some(expected_epoch) = expected_epoch {
+            anyhow::ensure!(
+                range.descriptor.epoch == expected_epoch,
+                "range epoch mismatch: expected={}, actual={}",
+                expected_epoch,
+                range.descriptor.epoch
+            );
+        }
+        anyhow::ensure!(
+            range.descriptor.lifecycle == ServiceShardLifecycle::Serving,
+            "range lifecycle is not serving: {:?}",
+            range.descriptor.lifecycle
+        );
+        Ok(range)
     }
 
     fn push_pending(&self, pending: PendingOutbound) {
@@ -241,10 +319,15 @@ impl ReplicaRuntime {
             let snapshot = range.space.snapshot().await?;
             let applied_snapshot = AppliedRangeSnapshot {
                 snapshot: snapshot.clone(),
-                entries: range.space.reader().scan(range.space.boundary(), usize::MAX).await?,
+                entries: range
+                    .space
+                    .reader()
+                    .scan(range.space.boundary(), usize::MAX)
+                    .await?,
             };
             let payload = bincode::serialize(&applied_snapshot)?;
-            range.raft
+            range
+                .raft
                 .install_snapshot(RaftSnapshot {
                     range_id: status.descriptor.id.clone(),
                     term: status.raft.current_term,
@@ -279,6 +362,199 @@ impl ReplicaRuntime {
         Ok(compacted)
     }
 
+    pub async fn split_range(
+        &self,
+        range_id: &str,
+        split_key: Vec<u8>,
+    ) -> anyhow::Result<(String, String)> {
+        let lifecycle = self
+            .lifecycle
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("range lifecycle manager unavailable"))?;
+        let source = self.validate_serving_fence(range_id, None).await?;
+        anyhow::ensure!(
+            source.descriptor.boundary.contains(&split_key),
+            "split key outside range boundary"
+        );
+        anyhow::ensure!(
+            source.descriptor.boundary.start_key.as_deref() != Some(split_key.as_slice()),
+            "split key must advance lower boundary"
+        );
+        let left_id = format!("{range_id}-left");
+        let right_id = format!("{range_id}-right");
+        let source = self
+            .rewrite_descriptor(range_id, |descriptor| {
+                descriptor.epoch += 1;
+                descriptor.lifecycle = ServiceShardLifecycle::Draining;
+            })
+            .await?;
+        let child_epoch = source.descriptor.epoch + 1;
+        let left = lifecycle
+            .create_range(ReplicatedRangeDescriptor::new(
+                left_id.clone(),
+                source.descriptor.shard.clone(),
+                RangeBoundary::new(
+                    source.descriptor.boundary.start_key.clone(),
+                    Some(split_key.clone()),
+                ),
+                child_epoch,
+                source.descriptor.config_version,
+                source.descriptor.leader_node_id,
+                source.descriptor.replicas.clone(),
+                source.descriptor.commit_index,
+                source.descriptor.applied_index,
+                ServiceShardLifecycle::Bootstrapping,
+            ))
+            .await?;
+        let right = lifecycle
+            .create_range(ReplicatedRangeDescriptor::new(
+                right_id.clone(),
+                source.descriptor.shard.clone(),
+                RangeBoundary::new(
+                    Some(split_key.clone()),
+                    source.descriptor.boundary.end_key.clone(),
+                ),
+                child_epoch,
+                source.descriptor.config_version,
+                source.descriptor.leader_node_id,
+                source.descriptor.replicas.clone(),
+                source.descriptor.commit_index,
+                source.descriptor.applied_index,
+                ServiceShardLifecycle::Bootstrapping,
+            ))
+            .await?;
+        let left_entries: Vec<(Bytes, Bytes)> = source
+            .space
+            .reader()
+            .scan(&left.descriptor.boundary, usize::MAX)
+            .await?;
+        let right_entries: Vec<(Bytes, Bytes)> = source
+            .space
+            .reader()
+            .scan(&right.descriptor.boundary, usize::MAX)
+            .await?;
+        if !left_entries.is_empty() {
+            left.space
+                .writer()
+                .apply(
+                    left_entries
+                        .into_iter()
+                        .map(|(key, value)| KvMutation {
+                            key,
+                            value: Some(value),
+                        })
+                        .collect(),
+                )
+                .await?;
+        }
+        if !right_entries.is_empty() {
+            right.space
+                .writer()
+                .apply(
+                    right_entries
+                        .into_iter()
+                        .map(|(key, value)| KvMutation {
+                            key,
+                            value: Some(value),
+                        })
+                        .collect(),
+                )
+                .await?;
+        }
+        let mut left = left;
+        left.descriptor.lifecycle = ServiceShardLifecycle::Serving;
+        let mut right = right;
+        right.descriptor.lifecycle = ServiceShardLifecycle::Serving;
+        self.replace_range(left).await?;
+        self.replace_range(right).await?;
+        let _ = self.host.remove_range(range_id).await?;
+        lifecycle.retire_range(range_id).await?;
+        Ok((left_id, right_id))
+    }
+
+    pub async fn merge_ranges(
+        &self,
+        left_range_id: &str,
+        right_range_id: &str,
+    ) -> anyhow::Result<String> {
+        let lifecycle = self
+            .lifecycle
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("range lifecycle manager unavailable"))?;
+        let left = self.validate_serving_fence(left_range_id, None).await?;
+        let right = self.validate_serving_fence(right_range_id, None).await?;
+        anyhow::ensure!(
+            left.descriptor.shard == right.descriptor.shard
+                && left.descriptor.boundary.end_key == right.descriptor.boundary.start_key,
+            "ranges are not merge-adjacent siblings"
+        );
+        let left = self
+            .rewrite_descriptor(left_range_id, |descriptor| {
+                descriptor.epoch += 1;
+                descriptor.lifecycle = ServiceShardLifecycle::Draining;
+            })
+            .await?;
+        let right = self
+            .rewrite_descriptor(right_range_id, |descriptor| {
+                descriptor.epoch += 1;
+                descriptor.lifecycle = ServiceShardLifecycle::Draining;
+            })
+            .await?;
+        let merged_id = format!("merge-{left_range_id}-{right_range_id}");
+        let merged = lifecycle
+            .create_range(ReplicatedRangeDescriptor::new(
+                merged_id.clone(),
+                left.descriptor.shard.clone(),
+                RangeBoundary::new(
+                    left.descriptor.boundary.start_key.clone(),
+                    right.descriptor.boundary.end_key.clone(),
+                ),
+                left.descriptor.epoch.max(right.descriptor.epoch) + 1,
+                left.descriptor.config_version.max(right.descriptor.config_version),
+                left.descriptor.leader_node_id.or(right.descriptor.leader_node_id),
+                left.descriptor.replicas.clone(),
+                left.descriptor.commit_index.max(right.descriptor.commit_index),
+                left.descriptor.applied_index.max(right.descriptor.applied_index),
+                ServiceShardLifecycle::Bootstrapping,
+            ))
+            .await?;
+        let mut merged_mutations: Vec<KvMutation> = Vec::new();
+        merged_mutations.extend(
+            left.space
+                .reader()
+                .scan(left.space.boundary(), usize::MAX)
+                .await?
+                .into_iter()
+                .map(|(key, value)| KvMutation {
+                    key,
+                    value: Some(value),
+                }),
+        );
+        merged_mutations.extend(
+            right
+                .space
+                .reader()
+                .scan(right.space.boundary(), usize::MAX)
+                .await?
+                .into_iter()
+                .map(|(key, value)| KvMutation {
+                    key,
+                    value: Some(value),
+                }),
+        );
+        let mut merged = merged;
+        if !merged_mutations.is_empty() {
+            merged.space.writer().apply(merged_mutations).await?;
+        }
+        merged.descriptor.lifecycle = ServiceShardLifecycle::Serving;
+        self.replace_range(merged).await?;
+        let _ = self.host.remove_range(left_range_id).await?;
+        let _ = self.host.remove_range(right_range_id).await?;
+        lifecycle.retire_range(left_range_id).await?;
+        lifecycle.retire_range(right_range_id).await?;
+        Ok(merged_id)
+    }
+
     pub async fn change_replicas(
         &self,
         range_id: &str,
@@ -290,9 +566,50 @@ impl ReplicaRuntime {
             .open_range(range_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("range `{range_id}` not found"))?;
+        let status = range.raft.status().await?;
+        let current_voters = status.cluster_config.voters;
+        let current_learners = status.cluster_config.learners;
+
+        let mut desired_voters = voters;
+        desired_voters.sort_unstable();
+        desired_voters.dedup();
+        let mut desired_learners = learners;
+        desired_learners.sort_unstable();
+        desired_learners.dedup();
+
+        let mut staged_learners = current_learners.clone();
+        for node_id in desired_voters.iter().chain(desired_learners.iter()) {
+            if !current_voters.contains(node_id) && !staged_learners.contains(node_id) {
+                staged_learners.push(*node_id);
+            }
+        }
+        if staged_learners != current_learners {
+            return range
+                .raft
+                .change_cluster_config(RaftConfigChange::ReplaceCluster {
+                    voters: current_voters,
+                    learners: staged_learners,
+                })
+                .await;
+        }
+
+        if let Some(local_leader) = status.leader_node_id {
+            if current_voters.contains(&local_leader)
+                && !desired_voters.contains(&local_leader)
+                && local_leader == range.raft.local_node_id()
+            {
+                anyhow::bail!(
+                    "refusing to remove current local leader from voters before leadership transfer"
+                );
+            }
+        }
+
         range
             .raft
-            .change_cluster_config(RaftConfigChange::ReplaceCluster { voters, learners })
+            .change_cluster_config(RaftConfigChange::ReplaceCluster {
+                voters: desired_voters,
+                learners: desired_learners,
+            })
             .await
     }
 
@@ -378,7 +695,88 @@ impl ReplicaRuntime {
         let applied = self.apply_once().await?;
         let snapshotted = self.snapshot_once(self.snapshot_threshold).await?;
         let compacted = self.compact_once(self.compact_threshold).await?;
+        let _ = self.health_snapshot().await?;
         Ok((sent, applied, snapshotted, compacted))
+    }
+
+    pub async fn health_snapshot(&self) -> anyhow::Result<Vec<RangeHealthSnapshot>> {
+        let statuses = self.host.list_ranges().await?;
+        Ok(statuses
+            .into_iter()
+            .map(|status| {
+                let lag = status
+                    .raft
+                    .replica_progress
+                    .iter()
+                    .map(|progress| ReplicaLagSnapshot {
+                        node_id: progress.node_id,
+                        lag: status
+                            .raft
+                            .last_log_index
+                            .saturating_sub(progress.match_index),
+                        match_index: progress.match_index,
+                        next_index: progress.next_index,
+                    })
+                    .collect();
+                let health = RangeHealthSnapshot {
+                    range_id: status.descriptor.id,
+                    role: status.raft.role,
+                    current_term: status.raft.current_term,
+                    leader_node_id: status.raft.leader_node_id,
+                    commit_index: status.raft.commit_index,
+                    applied_index: status.raft.applied_index,
+                    latest_snapshot_index: status.raft.latest_snapshot_index,
+                    replica_lag: lag,
+                };
+                let role_value = match health.role {
+                    greenmqtt_kv_raft::RaftNodeRole::Follower => 0.0,
+                    greenmqtt_kv_raft::RaftNodeRole::Candidate => 1.0,
+                    greenmqtt_kv_raft::RaftNodeRole::Leader => 2.0,
+                };
+                gauge!("kv_raft_current_term", "range_id" => health.range_id.clone())
+                    .set(health.current_term as f64);
+                gauge!("kv_raft_role", "range_id" => health.range_id.clone()).set(role_value);
+                gauge!("kv_raft_leader_id", "range_id" => health.range_id.clone())
+                    .set(health.leader_node_id.unwrap_or_default() as f64);
+                gauge!("kv_raft_commit_index", "range_id" => health.range_id.clone())
+                    .set(health.commit_index as f64);
+                gauge!("kv_raft_applied_index", "range_id" => health.range_id.clone())
+                    .set(health.applied_index as f64);
+                for replica in &health.replica_lag {
+                    gauge!(
+                        "kv_raft_replication_lag",
+                        "range_id" => health.range_id.clone(),
+                        "replica_id" => replica.node_id.to_string()
+                    )
+                    .set(replica.lag as f64);
+                }
+                health
+            })
+            .collect())
+    }
+
+    pub async fn debug_dump(&self) -> anyhow::Result<String> {
+        let health = self.health_snapshot().await?;
+        let mut lines = Vec::new();
+        for range in health {
+            lines.push(format!(
+                "range={} role={:?} term={} leader={:?} commit={} applied={} snapshot={:?}",
+                range.range_id,
+                range.role,
+                range.current_term,
+                range.leader_node_id,
+                range.commit_index,
+                range.applied_index,
+                range.latest_snapshot_index
+            ));
+            for replica in range.replica_lag {
+                lines.push(format!(
+                    "  replica={} lag={} match={} next={}",
+                    replica.node_id, replica.lag, replica.match_index, replica.next_index
+                ));
+            }
+        }
+        Ok(lines.join("\n"))
     }
 
     pub fn spawn(self: Arc<Self>, interval: Duration) -> ReplicaRuntimeHandle {
@@ -510,20 +908,77 @@ impl KvRangeHost for MemoryKvRangeHost {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppliedRangeSnapshot, HostedRange, KvRangeHost, MemoryKvRangeHost, ReplicaRuntime,
-        ReplicaTransport,
+        AppliedRangeSnapshot, HostedRange, KvRangeHost, MemoryKvRangeHost, RangeLifecycleManager,
+        ReplicaRuntime, ReplicaTransport,
     };
     use async_trait::async_trait;
+    use bytes::Bytes;
     use greenmqtt_core::{
         RangeBoundary, RangeReplica, ReplicaRole, ReplicaSyncState, ReplicatedRangeDescriptor,
         ServiceShardKey, ServiceShardLifecycle,
     };
-    use greenmqtt_kv_balance::BalanceCommand;
+    use greenmqtt_kv_balance::{execute_balance_commands, BalanceCommand};
     use greenmqtt_kv_engine::{KvEngine, MemoryKvEngine};
     use greenmqtt_kv_raft::{MemoryRaftNode, RaftMessage, RaftNode};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    #[derive(Clone)]
+    struct TestRangeLifecycleManager {
+        engine: MemoryKvEngine,
+        retired: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl TestRangeLifecycleManager {
+        fn new(engine: MemoryKvEngine) -> Self {
+            Self {
+                engine,
+                retired: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn retired(&self) -> Vec<String> {
+            self.retired.lock().expect("retired poisoned").clone()
+        }
+    }
+
+    #[async_trait]
+    impl RangeLifecycleManager for TestRangeLifecycleManager {
+        async fn create_range(
+            &self,
+            descriptor: ReplicatedRangeDescriptor,
+        ) -> anyhow::Result<HostedRange> {
+            self.engine
+                .bootstrap(greenmqtt_kv_engine::KvRangeBootstrap {
+                    range_id: descriptor.id.clone(),
+                    boundary: descriptor.boundary.clone(),
+                })
+                .await?;
+            let space = Arc::<dyn greenmqtt_kv_engine::KvRangeSpace>::from(
+                self.engine.open_range(&descriptor.id).await?,
+            );
+            let raft = Arc::new(MemoryRaftNode::single_node(
+                descriptor.leader_node_id.unwrap_or(1),
+                &descriptor.id,
+            ));
+            raft.recover().await?;
+            Ok(HostedRange {
+                descriptor,
+                raft,
+                space,
+            })
+        }
+
+        async fn retire_range(&self, range_id: &str) -> anyhow::Result<()> {
+            self.engine.destroy_range(range_id).await?;
+            self.retired
+                .lock()
+                .expect("retired poisoned")
+                .push(range_id.to_string());
+            Ok(())
+        }
+    }
 
     #[tokio::test]
     async fn memory_range_host_tracks_ranges_and_reports_local_leaders() {
@@ -733,8 +1188,15 @@ mod tests {
         .await
         .unwrap();
         let transport = Arc::new(FlakyTransport::default());
-        let runtime =
-            ReplicaRuntime::with_config(host, transport.clone(), Duration::from_secs(1), 8, 64, 64);
+        let runtime = ReplicaRuntime::with_config(
+            host,
+            transport.clone(),
+            None,
+            Duration::from_secs(1),
+            8,
+            64,
+            64,
+        );
 
         let mut sent = 0usize;
         for _ in 0..8 {
@@ -981,7 +1443,11 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         handle.shutdown().await.unwrap();
 
-        assert!(!transport.sent.lock().expect("transport poisoned").is_empty());
+        assert!(!transport
+            .sent
+            .lock()
+            .expect("transport poisoned")
+            .is_empty());
     }
 
     #[tokio::test]
@@ -1027,9 +1493,61 @@ mod tests {
             .change_replicas("range-config", vec![1, 2, 3], vec![4])
             .await
             .unwrap();
+        runtime
+            .change_replicas("range-config", vec![1, 2, 3], vec![4])
+            .await
+            .unwrap();
         let status = raft.status().await.unwrap();
         assert_eq!(status.cluster_config.voters, vec![1, 2, 3]);
         assert_eq!(status.cluster_config.learners, vec![4]);
+    }
+
+    #[tokio::test]
+    async fn replica_runtime_change_replicas_stages_new_voter_as_learner_first() {
+        let engine = MemoryKvEngine::default();
+        engine
+            .bootstrap(greenmqtt_kv_engine::KvRangeBootstrap {
+                range_id: "range-stage".into(),
+                boundary: RangeBoundary::full(),
+            })
+            .await
+            .unwrap();
+        let space = Arc::<dyn greenmqtt_kv_engine::KvRangeSpace>::from(
+            engine.open_range("range-stage").await.unwrap(),
+        );
+        let raft = Arc::new(MemoryRaftNode::single_node(1, "range-stage"));
+        raft.recover().await.unwrap();
+        let host = Arc::new(MemoryKvRangeHost::default());
+        host.add_range(HostedRange {
+            descriptor: ReplicatedRangeDescriptor::new(
+                "range-stage",
+                ServiceShardKey::retain("tenant-a"),
+                RangeBoundary::full(),
+                1,
+                1,
+                Some(1),
+                vec![RangeReplica::new(
+                    1,
+                    ReplicaRole::Voter,
+                    ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ),
+            raft: raft.clone(),
+            space,
+        })
+        .await
+        .unwrap();
+        let runtime = ReplicaRuntime::new(host, Arc::new(RecordingTransport::default()));
+        runtime
+            .change_replicas("range-stage", vec![1, 2], Vec::new())
+            .await
+            .unwrap();
+        let status = raft.status().await.unwrap();
+        assert_eq!(status.cluster_config.voters, vec![1]);
+        assert_eq!(status.cluster_config.learners, vec![2]);
     }
 
     #[tokio::test]
@@ -1075,7 +1593,14 @@ mod tests {
             .change_replicas("range-leader", vec![1, 2], Vec::new())
             .await
             .unwrap();
-        runtime.transfer_leadership("range-leader", 2).await.unwrap();
+        runtime
+            .change_replicas("range-leader", vec![1, 2], Vec::new())
+            .await
+            .unwrap();
+        runtime
+            .transfer_leadership("range-leader", 2)
+            .await
+            .unwrap();
         let status = raft.status().await.unwrap();
         assert_eq!(status.leader_node_id, Some(2));
         assert_eq!(status.role, greenmqtt_kv_raft::RaftNodeRole::Follower);
@@ -1120,6 +1645,10 @@ mod tests {
         .await
         .unwrap();
         let runtime = ReplicaRuntime::new(host, Arc::new(RecordingTransport::default()));
+        runtime
+            .change_replicas("range-balance", vec![1, 2], Vec::new())
+            .await
+            .unwrap();
         runtime
             .change_replicas("range-balance", vec![1, 2], Vec::new())
             .await
@@ -1176,6 +1705,18 @@ mod tests {
         .await
         .unwrap();
         let runtime = ReplicaRuntime::new(host, Arc::new(RecordingTransport::default()));
+        let staged = runtime
+            .apply_balance_command(&BalanceCommand::ChangeReplicas {
+                range_id: "range-balance-replicas".into(),
+                voters: vec![1, 2, 3],
+                learners: vec![4],
+            })
+            .await
+            .unwrap();
+        assert!(staged);
+        let status = raft.status().await.unwrap();
+        assert_eq!(status.cluster_config.voters, vec![1]);
+        assert_eq!(status.cluster_config.learners, vec![2, 3, 4]);
         let applied = runtime
             .apply_balance_command(&BalanceCommand::ChangeReplicas {
                 range_id: "range-balance-replicas".into(),
@@ -1246,5 +1787,433 @@ mod tests {
         assert!(applied);
         let status = raft.status().await.unwrap();
         assert_eq!(status.leader_node_id, Some(2));
+    }
+
+    #[tokio::test]
+    async fn replica_runtime_blocks_removing_current_local_leader_from_voters() {
+        let engine = MemoryKvEngine::default();
+        engine
+            .bootstrap(greenmqtt_kv_engine::KvRangeBootstrap {
+                range_id: "range-block-remove".into(),
+                boundary: RangeBoundary::full(),
+            })
+            .await
+            .unwrap();
+        let space = Arc::<dyn greenmqtt_kv_engine::KvRangeSpace>::from(
+            engine.open_range("range-block-remove").await.unwrap(),
+        );
+        let raft = Arc::new(MemoryRaftNode::single_node(1, "range-block-remove"));
+        raft.recover().await.unwrap();
+        let host = Arc::new(MemoryKvRangeHost::default());
+        host.add_range(HostedRange {
+            descriptor: ReplicatedRangeDescriptor::new(
+                "range-block-remove",
+                ServiceShardKey::retain("tenant-a"),
+                RangeBoundary::full(),
+                1,
+                1,
+                Some(1),
+                vec![RangeReplica::new(
+                    1,
+                    ReplicaRole::Voter,
+                    ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ),
+            raft: raft.clone(),
+            space,
+        })
+        .await
+        .unwrap();
+        let runtime = ReplicaRuntime::new(host, Arc::new(RecordingTransport::default()));
+        runtime
+            .change_replicas("range-block-remove", vec![1, 2], Vec::new())
+            .await
+            .unwrap();
+        let error = runtime
+            .change_replicas("range-block-remove", vec![2], Vec::new())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("refusing to remove current local leader"));
+    }
+
+    #[tokio::test]
+    async fn replica_runtime_executes_balance_command_batches() {
+        let engine = MemoryKvEngine::default();
+        engine
+            .bootstrap(greenmqtt_kv_engine::KvRangeBootstrap {
+                range_id: "range-batch".into(),
+                boundary: RangeBoundary::full(),
+            })
+            .await
+            .unwrap();
+        let space = Arc::<dyn greenmqtt_kv_engine::KvRangeSpace>::from(
+            engine.open_range("range-batch").await.unwrap(),
+        );
+        let raft = Arc::new(MemoryRaftNode::single_node(1, "range-batch"));
+        raft.recover().await.unwrap();
+        let host = Arc::new(MemoryKvRangeHost::default());
+        host.add_range(HostedRange {
+            descriptor: ReplicatedRangeDescriptor::new(
+                "range-batch",
+                ServiceShardKey::retain("tenant-a"),
+                RangeBoundary::full(),
+                1,
+                1,
+                Some(1),
+                vec![RangeReplica::new(
+                    1,
+                    ReplicaRole::Voter,
+                    ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ),
+            raft: raft.clone(),
+            space,
+        })
+        .await
+        .unwrap();
+        let runtime = ReplicaRuntime::new(host, Arc::new(RecordingTransport::default()));
+        let applied = execute_balance_commands(
+            &runtime,
+            &[
+                BalanceCommand::ChangeReplicas {
+                    range_id: "range-batch".into(),
+                    voters: vec![1, 2],
+                    learners: vec![3],
+                },
+                BalanceCommand::ChangeReplicas {
+                    range_id: "range-batch".into(),
+                    voters: vec![1, 2],
+                    learners: vec![3],
+                },
+                BalanceCommand::TransferLeadership {
+                    range_id: "range-batch".into(),
+                    from_node_id: 1,
+                    to_node_id: 2,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(applied, 3);
+        let status = raft.status().await.unwrap();
+        assert_eq!(status.cluster_config.voters, vec![1, 2]);
+        assert_eq!(status.cluster_config.learners, vec![3]);
+        assert_eq!(status.leader_node_id, Some(2));
+    }
+
+    #[tokio::test]
+    async fn replica_runtime_health_snapshot_reports_replica_lag() {
+        let engine = MemoryKvEngine::default();
+        engine
+            .bootstrap(greenmqtt_kv_engine::KvRangeBootstrap {
+                range_id: "range-health".into(),
+                boundary: RangeBoundary::full(),
+            })
+            .await
+            .unwrap();
+        let space = Arc::<dyn greenmqtt_kv_engine::KvRangeSpace>::from(
+            engine.open_range("range-health").await.unwrap(),
+        );
+        let raft = Arc::new(MemoryRaftNode::new(
+            1,
+            "range-health",
+            greenmqtt_kv_raft::RaftClusterConfig {
+                voters: vec![1, 2, 3],
+                learners: Vec::new(),
+            },
+        ));
+        raft.recover().await.unwrap();
+        let host = Arc::new(MemoryKvRangeHost::default());
+        host.add_range(HostedRange {
+            descriptor: ReplicatedRangeDescriptor::new(
+                "range-health",
+                ServiceShardKey::retain("tenant-a"),
+                RangeBoundary::full(),
+                1,
+                1,
+                Some(1),
+                vec![RangeReplica::new(
+                    1,
+                    ReplicaRole::Voter,
+                    ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ),
+            raft: raft.clone(),
+            space,
+        })
+        .await
+        .unwrap();
+        let runtime = ReplicaRuntime::new(host, Arc::new(RecordingTransport::default()));
+        for _ in 0..8 {
+            raft.tick().await.unwrap();
+        }
+        raft.receive(
+            2,
+            RaftMessage::RequestVoteResponse(greenmqtt_kv_raft::RequestVoteResponse {
+                term: raft.status().await.unwrap().current_term,
+                vote_granted: true,
+            }),
+        )
+        .await
+        .unwrap();
+        raft.propose(
+            bincode::serialize(&Vec::<greenmqtt_kv_engine::KvMutation>::new())
+                .unwrap()
+                .into(),
+        )
+        .await
+        .unwrap();
+        raft.receive(
+            2,
+            RaftMessage::AppendEntriesResponse(greenmqtt_kv_raft::AppendEntriesResponse {
+                term: raft.status().await.unwrap().current_term,
+                success: true,
+                match_index: 1,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let health = runtime.health_snapshot().await.unwrap();
+        assert_eq!(health.len(), 1);
+        assert_eq!(health[0].range_id, "range-health");
+        assert!(health[0]
+            .replica_lag
+            .iter()
+            .any(|replica| replica.node_id == 3));
+    }
+
+    #[tokio::test]
+    async fn replica_runtime_debug_dump_includes_range_and_replica_progress() {
+        let engine = MemoryKvEngine::default();
+        engine
+            .bootstrap(greenmqtt_kv_engine::KvRangeBootstrap {
+                range_id: "range-dump".into(),
+                boundary: RangeBoundary::full(),
+            })
+            .await
+            .unwrap();
+        let space = Arc::<dyn greenmqtt_kv_engine::KvRangeSpace>::from(
+            engine.open_range("range-dump").await.unwrap(),
+        );
+        let raft = Arc::new(MemoryRaftNode::single_node(1, "range-dump"));
+        raft.recover().await.unwrap();
+        let host = Arc::new(MemoryKvRangeHost::default());
+        host.add_range(HostedRange {
+            descriptor: ReplicatedRangeDescriptor::new(
+                "range-dump",
+                ServiceShardKey::retain("tenant-a"),
+                RangeBoundary::full(),
+                1,
+                1,
+                Some(1),
+                vec![RangeReplica::new(
+                    1,
+                    ReplicaRole::Voter,
+                    ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ),
+            raft,
+            space,
+        })
+        .await
+        .unwrap();
+        let runtime = ReplicaRuntime::new(host, Arc::new(RecordingTransport::default()));
+        let dump = runtime.debug_dump().await.unwrap();
+        assert!(dump.contains("range=range-dump"));
+        assert!(dump.contains("replica=1"));
+    }
+
+    #[tokio::test]
+    async fn replica_runtime_split_range_moves_data_into_serving_children() {
+        let engine = MemoryKvEngine::default();
+        engine
+            .bootstrap(greenmqtt_kv_engine::KvRangeBootstrap {
+                range_id: "range-split".into(),
+                boundary: RangeBoundary::full(),
+            })
+            .await
+            .unwrap();
+        let source = Arc::<dyn greenmqtt_kv_engine::KvRangeSpace>::from(
+            engine.open_range("range-split").await.unwrap(),
+        );
+        source
+            .writer()
+            .apply(vec![
+                greenmqtt_kv_engine::KvMutation {
+                    key: Bytes::from_static(b"apple"),
+                    value: Some(Bytes::from_static(b"1")),
+                },
+                greenmqtt_kv_engine::KvMutation {
+                    key: Bytes::from_static(b"orange"),
+                    value: Some(Bytes::from_static(b"2")),
+                },
+            ])
+            .await
+            .unwrap();
+        let host = Arc::new(MemoryKvRangeHost::default());
+        host.add_range(HostedRange {
+            descriptor: ReplicatedRangeDescriptor::new(
+                "range-split",
+                ServiceShardKey::retain("tenant-a"),
+                RangeBoundary::full(),
+                1,
+                1,
+                Some(1),
+                vec![RangeReplica::new(1, ReplicaRole::Voter, ReplicaSyncState::Replicating)],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ),
+            raft: Arc::new(MemoryRaftNode::single_node(1, "range-split")),
+            space: source,
+        })
+        .await
+        .unwrap();
+        let lifecycle = Arc::new(TestRangeLifecycleManager::new(engine.clone()));
+        let runtime = ReplicaRuntime::with_config(
+            host.clone(),
+            Arc::new(RecordingTransport::default()),
+            Some(lifecycle.clone()),
+            Duration::from_secs(1),
+            64,
+            64,
+            64,
+        );
+
+        let (left_id, right_id) = runtime
+            .split_range("range-split", b"m".to_vec())
+            .await
+            .unwrap();
+
+        assert!(host.open_range("range-split").await.unwrap().is_none());
+        let left = host.open_range(&left_id).await.unwrap().unwrap();
+        let right = host.open_range(&right_id).await.unwrap().unwrap();
+        assert_eq!(left.descriptor.lifecycle, ServiceShardLifecycle::Serving);
+        assert_eq!(right.descriptor.lifecycle, ServiceShardLifecycle::Serving);
+        assert_eq!(left.descriptor.epoch, 3);
+        assert_eq!(right.descriptor.epoch, 3);
+        assert_eq!(
+            left.space.reader().get(b"apple").await.unwrap().unwrap(),
+            Bytes::from_static(b"1")
+        );
+        assert!(left.space.reader().get(b"orange").await.unwrap().is_none());
+        assert_eq!(
+            right.space.reader().get(b"orange").await.unwrap().unwrap(),
+            Bytes::from_static(b"2")
+        );
+        assert_eq!(lifecycle.retired(), vec!["range-split".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn replica_runtime_merge_ranges_moves_data_into_serving_merged_range() {
+        let engine = MemoryKvEngine::default();
+        for (range_id, boundary, key, value) in [
+            (
+                "range-left",
+                RangeBoundary::new(None, Some(b"m".to_vec())),
+                b"apple".as_slice(),
+                b"1".as_slice(),
+            ),
+            (
+                "range-right",
+                RangeBoundary::new(Some(b"m".to_vec()), None),
+                b"orange".as_slice(),
+                b"2".as_slice(),
+            ),
+        ] {
+            engine
+                .bootstrap(greenmqtt_kv_engine::KvRangeBootstrap {
+                    range_id: range_id.into(),
+                    boundary: boundary.clone(),
+                })
+                .await
+                .unwrap();
+            let space = engine.open_range(range_id).await.unwrap();
+            space.writer()
+                .apply(vec![greenmqtt_kv_engine::KvMutation {
+                    key: Bytes::copy_from_slice(key),
+                    value: Some(Bytes::copy_from_slice(value)),
+                }])
+                .await
+                .unwrap();
+        }
+
+        let host = Arc::new(MemoryKvRangeHost::default());
+        for (range_id, boundary) in [
+            ("range-left", RangeBoundary::new(None, Some(b"m".to_vec()))),
+            ("range-right", RangeBoundary::new(Some(b"m".to_vec()), None)),
+        ] {
+            host.add_range(HostedRange {
+                descriptor: ReplicatedRangeDescriptor::new(
+                    range_id,
+                    ServiceShardKey::retain("tenant-a"),
+                    boundary,
+                    2,
+                    1,
+                    Some(1),
+                    vec![RangeReplica::new(
+                        1,
+                        ReplicaRole::Voter,
+                        ReplicaSyncState::Replicating,
+                    )],
+                    0,
+                    0,
+                    ServiceShardLifecycle::Serving,
+                ),
+                raft: Arc::new(MemoryRaftNode::single_node(1, range_id)),
+                space: Arc::<dyn greenmqtt_kv_engine::KvRangeSpace>::from(
+                    engine.open_range(range_id).await.unwrap(),
+                ),
+            })
+            .await
+            .unwrap();
+        }
+        let lifecycle = Arc::new(TestRangeLifecycleManager::new(engine.clone()));
+        let runtime = ReplicaRuntime::with_config(
+            host.clone(),
+            Arc::new(RecordingTransport::default()),
+            Some(lifecycle.clone()),
+            Duration::from_secs(1),
+            64,
+            64,
+            64,
+        );
+
+        let merged_id = runtime
+            .merge_ranges("range-left", "range-right")
+            .await
+            .unwrap();
+
+        assert!(host.open_range("range-left").await.unwrap().is_none());
+        assert!(host.open_range("range-right").await.unwrap().is_none());
+        let merged = host.open_range(&merged_id).await.unwrap().unwrap();
+        assert_eq!(merged.descriptor.lifecycle, ServiceShardLifecycle::Serving);
+        assert_eq!(merged.descriptor.epoch, 4);
+        assert_eq!(
+            merged.space.reader().get(b"apple").await.unwrap().unwrap(),
+            Bytes::from_static(b"1")
+        );
+        assert_eq!(
+            merged.space.reader().get(b"orange").await.unwrap().unwrap(),
+            Bytes::from_static(b"2")
+        );
+        assert_eq!(
+            lifecycle.retired(),
+            vec!["range-left".to_string(), "range-right".to_string()]
+        );
     }
 }

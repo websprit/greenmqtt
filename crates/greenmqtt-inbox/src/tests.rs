@@ -2189,8 +2189,12 @@ async fn replicated_inbox_resumes_offline_sequence_after_restart() {
 
     let messages = reopened.peek(&"s1".into()).await.unwrap();
     assert_eq!(messages.len(), 2);
-    assert!(messages.iter().any(|message| message.payload.as_ref() == b"first"));
-    assert!(messages.iter().any(|message| message.payload.as_ref() == b"second"));
+    assert!(messages
+        .iter()
+        .any(|message| message.payload.as_ref() == b"first"));
+    assert!(messages
+        .iter()
+        .any(|message| message.payload.as_ref() == b"second"));
 }
 
 #[tokio::test]

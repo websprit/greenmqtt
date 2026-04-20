@@ -448,6 +448,7 @@ message KvMutationRecord {
 message KvRangeGetRequest {
   string range_id = 1;
   bytes key = 2;
+  uint64 expected_epoch = 3;
 }
 
 message KvRangeGetReply {
@@ -459,6 +460,7 @@ message KvRangeScanRequest {
   string range_id = 1;
   RangeBoundaryRecord boundary = 2;
   uint32 limit = 3;
+  uint64 expected_epoch = 4;
 }
 
 message KvRangeScanReply {
@@ -468,11 +470,13 @@ message KvRangeScanReply {
 message KvRangeApplyRequest {
   string range_id = 1;
   repeated KvMutationRecord mutations = 2;
+  uint64 expected_epoch = 3;
 }
 
 message KvRangeCheckpointRequest {
   string range_id = 1;
   string checkpoint_id = 2;
+  uint64 expected_epoch = 3;
 }
 
 message KvRangeCheckpointReply {
@@ -483,6 +487,7 @@ message KvRangeCheckpointReply {
 
 message KvRangeSnapshotRequest {
   string range_id = 1;
+  uint64 expected_epoch = 2;
 }
 
 message KvRangeSnapshotReply {
@@ -557,6 +562,42 @@ message RaftTransportRequest {
     RaftInstallSnapshotRequestRecord install_snapshot = 7;
     RaftInstallSnapshotResponseRecord install_snapshot_response = 8;
   }
+}
+
+message ReplicaLagRecord {
+  uint64 node_id = 1;
+  uint64 lag = 2;
+  uint64 match_index = 3;
+  uint64 next_index = 4;
+}
+
+message RangeHealthRecord {
+  string range_id = 1;
+  string role = 2;
+  uint64 current_term = 3;
+  uint64 leader_node_id = 4;
+  bool has_leader_node_id = 5;
+  uint64 commit_index = 6;
+  uint64 applied_index = 7;
+  uint64 latest_snapshot_index = 8;
+  bool has_latest_snapshot_index = 9;
+  repeated ReplicaLagRecord replica_lag = 10;
+}
+
+message RangeHealthRequest {
+  string range_id = 1;
+}
+
+message RangeHealthReply {
+  RangeHealthRecord health = 1;
+}
+
+message RangeHealthListReply {
+  repeated RangeHealthRecord entries = 1;
+}
+
+message RangeDebugReply {
+  string text = 1;
 }
 
 service SessionDictService {
@@ -640,4 +681,10 @@ service KvRangeService {
 
 service RaftTransportService {
   rpc Send(RaftTransportRequest) returns (.google.protobuf.Empty);
+}
+
+service RangeAdminService {
+  rpc ListRangeHealth(.google.protobuf.Empty) returns (RangeHealthListReply);
+  rpc GetRangeHealth(RangeHealthRequest) returns (RangeHealthReply);
+  rpc DebugDump(.google.protobuf.Empty) returns (RangeDebugReply);
 }

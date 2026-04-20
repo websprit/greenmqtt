@@ -917,6 +917,7 @@ dependencies = [
  "bincode",
  "bytes",
  "greenmqtt-core",
+ "metrics",
  "rocksdb",
  "serde",
  "tempfile",
@@ -935,6 +936,7 @@ dependencies = [
  "greenmqtt-kv-balance",
  "greenmqtt-kv-engine",
  "greenmqtt-kv-raft",
+ "metrics",
  "serde",
  "tokio",
 ]

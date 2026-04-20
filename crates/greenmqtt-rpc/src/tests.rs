@@ -1,7 +1,7 @@
 use crate::{
     DistGrpcClient, InboxGrpcClient, KvRangeGrpcClient, MetadataGrpcClient, NoopDeliverySink,
     PeriodicAntiEntropyReconciler, PersistentMetadataRegistry, RaftTransportGrpcClient,
-    RetainGrpcClient, RpcRuntime, SessionDictGrpcClient, StaticPeerForwarder,
+    RangeAdminGrpcClient, RetainGrpcClient, RpcRuntime, SessionDictGrpcClient, StaticPeerForwarder,
     StaticServiceEndpointRegistry,
 };
 use greenmqtt_broker::{BrokerConfig, BrokerRuntime, DefaultBroker, PeerRegistry};
@@ -851,6 +851,150 @@ async fn kv_range_service_requires_leader_lease_for_reads() {
 }
 
 #[tokio::test]
+async fn kv_range_service_rejects_stale_epoch_requests() {
+    let bind = "127.0.0.1:50103".parse().unwrap();
+    let engine = MemoryKvEngine::default();
+    engine
+        .bootstrap(KvRangeBootstrap {
+            range_id: "range-epoch".into(),
+            boundary: RangeBoundary::full(),
+        })
+        .await
+        .unwrap();
+    let host = Arc::new(MemoryKvRangeHost::default());
+    let range = engine.open_range("range-epoch").await.unwrap();
+    range
+        .writer()
+        .apply(vec![KvMutation {
+            key: b"alpha".as_slice().into(),
+            value: Some(b"one".as_slice().into()),
+        }])
+        .await
+        .unwrap();
+    let raft: Arc<dyn RaftNode> = Arc::new(MemoryRaftNode::single_node(1, "range-epoch"));
+    raft.recover().await.unwrap();
+    host.add_range(HostedRange {
+        descriptor: ReplicatedRangeDescriptor::new(
+            "range-epoch",
+            ServiceShardKey::retain("t1"),
+            RangeBoundary::full(),
+            3,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ),
+        raft,
+        space: Arc::from(range),
+    })
+    .await
+    .unwrap();
+    let server = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: None,
+            range_host: Some(host),
+        }
+        .serve(bind),
+    );
+    sleep(Duration::from_millis(50)).await;
+
+    let client = KvRangeGrpcClient::connect("http://127.0.0.1:50103")
+        .await
+        .unwrap();
+    let error = client
+        .get_fenced("range-epoch", b"alpha", Some(2))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("kv/epoch-mismatch"));
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn kv_range_service_rejects_non_serving_range_requests() {
+    let bind = "127.0.0.1:50104".parse().unwrap();
+    let engine = MemoryKvEngine::default();
+    engine
+        .bootstrap(KvRangeBootstrap {
+            range_id: "range-draining".into(),
+            boundary: RangeBoundary::full(),
+        })
+        .await
+        .unwrap();
+    let host = Arc::new(MemoryKvRangeHost::default());
+    let range = engine.open_range("range-draining").await.unwrap();
+    range
+        .writer()
+        .apply(vec![KvMutation {
+            key: b"alpha".as_slice().into(),
+            value: Some(b"one".as_slice().into()),
+        }])
+        .await
+        .unwrap();
+    let raft: Arc<dyn RaftNode> = Arc::new(MemoryRaftNode::single_node(1, "range-draining"));
+    raft.recover().await.unwrap();
+    host.add_range(HostedRange {
+        descriptor: ReplicatedRangeDescriptor::new(
+            "range-draining",
+            ServiceShardKey::retain("t1"),
+            RangeBoundary::full(),
+            4,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Draining,
+        ),
+        raft,
+        space: Arc::from(range),
+    })
+    .await
+    .unwrap();
+    let server = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: None,
+            range_host: Some(host),
+        }
+        .serve(bind),
+    );
+    sleep(Duration::from_millis(50)).await;
+
+    let client = KvRangeGrpcClient::connect("http://127.0.0.1:50104")
+        .await
+        .unwrap();
+    let error = client
+        .get_fenced("range-draining", b"alpha", Some(4))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("kv/config-changing"));
+
+    server.abort();
+}
+
+#[tokio::test]
 async fn grpc_round_trip_for_raft_transport_service() {
     let bind = "127.0.0.1:50103".parse().unwrap();
     let engine = MemoryKvEngine::default();
@@ -1042,6 +1186,72 @@ async fn raft_transport_service_delivers_install_snapshot_messages() {
     assert_eq!(persisted.commit_index, 7);
     assert_eq!(persisted.applied_index, 7);
     assert!(persisted.latest_snapshot.is_some());
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn range_admin_service_reports_health_and_debug_dump() {
+    let bind = "127.0.0.1:50105".parse().unwrap();
+    let engine = MemoryKvEngine::default();
+    engine
+        .bootstrap(KvRangeBootstrap {
+            range_id: "range-admin".into(),
+            boundary: RangeBoundary::full(),
+        })
+        .await
+        .unwrap();
+    let range = engine.open_range("range-admin").await.unwrap();
+    let host = Arc::new(MemoryKvRangeHost::default());
+    let raft_impl = Arc::new(MemoryRaftNode::single_node(1, "range-admin"));
+    raft_impl.recover().await.unwrap();
+    let raft: Arc<dyn RaftNode> = raft_impl;
+    host.add_range(HostedRange {
+        descriptor: ReplicatedRangeDescriptor::new(
+            "range-admin",
+            ServiceShardKey::retain("t1"),
+            RangeBoundary::full(),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ),
+        raft,
+        space: Arc::from(range),
+    })
+    .await
+    .unwrap();
+    let server = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: None,
+            range_host: Some(host),
+        }
+        .serve(bind),
+    );
+    sleep(Duration::from_millis(50)).await;
+
+    let client = RangeAdminGrpcClient::connect("http://127.0.0.1:50105")
+        .await
+        .unwrap();
+    let listed = client.list_range_health().await.unwrap();
+    assert_eq!(listed.entries.len(), 1);
+    assert_eq!(listed.entries[0].range_id, "range-admin");
+    let fetched = client.get_range_health("range-admin").await.unwrap();
+    assert_eq!(fetched.health.unwrap().range_id, "range-admin");
+    let dump = client.debug_dump().await.unwrap();
+    assert!(dump.contains("range=range-admin"));
 
     server.abort();
 }

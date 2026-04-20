@@ -64,6 +64,43 @@ fault-tolerant production raft layer.
 - `ReplicaRuntime` now also exposes direct raft control helpers (`change_replicas`,
   `transfer_leadership`, `recover_range`) that execute against hosted raft nodes, which lays the
   groundwork for wiring balancer commands into real replica state transitions.
+- `greenmqtt-kv-balance` now has a generic `BalanceCommandExecutor` surface, and
+  `ReplicaRuntime` can execute batches of balancer commands against hosted raft nodes, so
+  `ChangeReplicas`, `TransferLeadership`, and `RecoverRange` are no longer metadata-only ideas.
+- `ReplicaRuntime.change_replicas` now stages new target replicas as learners before final
+  promotion, and raft-level safety checks now block transferring leadership to an uncaught-up node
+  or removing the current local leader from the voter set in one unsafe step.
+- `ReplicaRuntime.snapshot_once()` now serializes applied range state into `RaftSnapshot.payload`
+  through `AppliedRangeSnapshot`, so snapshot generation is no longer only an engine-level
+  filesystem copy. `BalanceCoordinator` now executes controller output through a runtime executor,
+  so balancer-issued commands can affect real raft state instead of stopping in metadata alone.
+- `RaftStatusSnapshot` now exposes per-replica progress, and `ReplicaRuntime` now produces range
+  health snapshots plus debug dumps that include current term, role, leader id, commit/applied
+  progress, snapshot index, and replication lag per replica.
+- `greenmqtt-kv-client` now classifies raft-aware errors (`NotLeader`, `EpochMismatch`,
+  `RangeNotFound`, `ConfigChanging`, `SnapshotInProgress`) from RPC responses and uses bounded
+  retry paths for leader redirect, route refresh, and transient config/snapshot conditions.
+- `greenmqtt-rpc` now exposes a `RangeAdminService` that serves range health snapshots and debug
+  dumps from `ReplicaRuntime`, so external callers can inspect current term, role, leader,
+  commit/applied progress, snapshot index, and replica lag without attaching directly to the
+  process.
+- per-range raft metrics are now emitted for current term, role, leader id, commit/applied index,
+  replication lag per replica, snapshot send/install activity, and election/stepdown events.
+- deterministic reference failure tests now cover leader crash before commit, leader crash after
+  quorum commit before apply, follower restart during catch-up, partitioned leader stepdown, and
+  snapshot install after log truncation.
+- `ReplicaRuntime` now executes split and merge as data-moving operations: source ranges are fenced
+  by epoch/lifecycle, child/merged ranges are created in bootstrapping state, data is copied into
+  the new ranges, and only then are the new ranges switched to `Serving` and the old ranges
+  retired.
+- `KvRangeService` requests now carry `expected_epoch`, and the RPC data path rejects stale-epoch
+  or non-serving ranges before reads, writes, checkpoint, or snapshot requests proceed.
+- deterministic tests now also cover split-brain prevention after higher-term leadership changes
+  and safe staged membership transitions before final voter promotion.
+- a long-running three-replica reference soak test now exercises repeated replication together
+  with follower restarts.
+- operator-facing migration and rollout guidance now lives in
+  `docs/production-multi-raft-migration.md`.
 
 ## Phase 1: Durable Raft Local State
 
@@ -102,7 +139,7 @@ fault-tolerant production raft layer.
   - [x] vote RPC
   - [x] install snapshot RPC
   - [x] backpressure / retry / timeout handling
-- [ ] Add a replica runtime that drives:
+- [x] Add a replica runtime that drives:
   - [x] raft ticks
   - [x] outbound replication
   - [x] apply loop
@@ -111,7 +148,7 @@ fault-tolerant production raft layer.
 
 ## Phase 4: Apply Pipeline and Deterministic State Machine
 
-- [ ] Split raft log replication from state machine apply:
+- [x] Split raft log replication from state machine apply:
   - [x] committed log queue
   - [x] ordered apply worker
   - [x] persisted applied index
@@ -121,7 +158,7 @@ fault-tolerant production raft layer.
 
 ## Phase 5: Snapshot and Log Compaction
 
-- [ ] Implement snapshot generation from applied state, not only engine-level filesystem copies.
+- [x] Implement snapshot generation from applied state, not only engine-level filesystem copies.
 - [x] Define a snapshot manifest format:
   - [x] range id
   - [x] term
@@ -135,75 +172,75 @@ fault-tolerant production raft layer.
 
 ## Phase 6: Replica Membership and Reconfiguration
 
-- [ ] Make replica changes go through raft joint-consensus style transitions or equivalent safe staging.
-- [ ] Prevent balancer-issued replica changes from taking effect only in metadata.
-- [ ] Ensure `greenmqtt-kv-balance` commands translate into real raft config change operations.
-- [ ] Block unsafe leader transfers and replica removals while catch-up is incomplete.
+- [x] Make replica changes go through raft joint-consensus style transitions or equivalent safe staging.
+- [x] Prevent balancer-issued replica changes from taking effect only in metadata.
+- [x] Ensure `greenmqtt-kv-balance` commands translate into real raft config change operations.
+- [x] Block unsafe leader transfers and replica removals while catch-up is incomplete.
 
 ## Phase 7: Range Lifecycle and Sharding
 
-- [ ] Turn `split` and `merge` from metadata-only edits into data-moving range operations.
-- [ ] Implement split workflow:
-  - [ ] fence source range
-  - [ ] create child ranges
-  - [ ] copy / snapshot data into children
-  - [ ] switch routing atomically
-- [ ] Implement merge workflow:
-  - [ ] fence source siblings
-  - [ ] produce merged snapshot
-  - [ ] install merged range
-  - [ ] retire source ranges
-- [ ] Persist range epoch / fencing semantics in the data path, not only metadata.
+- [x] Turn `split` and `merge` from metadata-only edits into data-moving range operations.
+- [x] Implement split workflow:
+  - [x] fence source range
+  - [x] create child ranges
+  - [x] copy / snapshot data into children
+  - [x] switch routing atomically
+- [x] Implement merge workflow:
+  - [x] fence source siblings
+  - [x] produce merged snapshot
+  - [x] install merged range
+  - [x] retire source ranges
+- [x] Persist range epoch / fencing semantics in the data path, not only metadata.
 
 ## Phase 8: Client Routing and Request Safety
 
-- [ ] Make `greenmqtt-kv-client` refresh and retry against raft-specific redirect errors.
-- [ ] Distinguish:
-  - [ ] `NotLeader`
-  - [ ] `EpochMismatch`
-  - [ ] `RangeNotFound`
-  - [ ] `ConfigChanging`
-  - [ ] `SnapshotInProgress`
-- [ ] Add bounded retry policy and caller-visible error categories.
-- [ ] Ensure broker-facing service facades never silently succeed against stale leaders.
+- [x] Make `greenmqtt-kv-client` refresh and retry against raft-specific redirect errors.
+- [x] Distinguish:
+  - [x] `NotLeader`
+  - [x] `EpochMismatch`
+  - [x] `RangeNotFound`
+  - [x] `ConfigChanging`
+  - [x] `SnapshotInProgress`
+- [x] Add bounded retry policy and caller-visible error categories.
+- [x] Ensure broker-facing service facades never silently succeed against stale leaders.
 
 ## Phase 9: Observability and Operations
 
-- [ ] Add per-range raft metrics:
-  - [ ] current term
-  - [ ] role
-  - [ ] leader id
-  - [ ] commit index
-  - [ ] applied index
-  - [ ] replication lag per follower
-  - [ ] snapshot send/install counters
-  - [ ] election / stepdown counters
-- [ ] Expose admin APIs for replica/range health.
-- [ ] Add debug dumps for stuck ranges and replication progress.
+- [x] Add per-range raft metrics:
+  - [x] current term
+  - [x] role
+  - [x] leader id
+  - [x] commit index
+  - [x] applied index
+  - [x] replication lag per follower
+  - [x] snapshot send/install counters
+  - [x] election / stepdown counters
+- [x] Expose admin APIs for replica/range health.
+- [x] Add debug dumps for stuck ranges and replication progress.
 
 ## Phase 10: Failure Testing
 
-- [ ] Add deterministic tests for:
-  - [ ] leader crash before commit
-  - [ ] leader crash after quorum commit but before apply
-  - [ ] follower restart during catch-up
-  - [ ] partitioned leader stepdown
-  - [ ] split-brain prevention
-  - [ ] joint-consensus membership changes
-  - [ ] snapshot install after log truncation
-- [ ] Add long-running chaos / soak coverage with 3+ store replicas.
+- [x] Add deterministic tests for:
+  - [x] leader crash before commit
+  - [x] leader crash after quorum commit but before apply
+  - [x] follower restart during catch-up
+  - [x] partitioned leader stepdown
+  - [x] split-brain prevention
+  - [x] joint-consensus membership changes
+  - [x] snapshot install after log truncation
+- [x] Add long-running chaos / soak coverage with 3+ store replicas.
 
 ## Phase 11: Rollout and Migration
 
-- [ ] Add a migration plan from:
-  - [ ] legacy local sled
-  - [ ] legacy local rocksdb
-  - [ ] redis-backed shared state
-- [ ] Define mixed-mode rollout:
-  - [ ] old broker + new store
-  - [ ] new broker + old store
-  - [ ] cluster upgrade sequencing
-- [ ] Add explicit incompatibility guards where safe live migration is not possible.
+- [x] Add a migration plan from:
+  - [x] legacy local sled
+  - [x] legacy local rocksdb
+  - [x] redis-backed shared state
+- [x] Define mixed-mode rollout:
+  - [x] old broker + new store
+  - [x] new broker + old store
+  - [x] cluster upgrade sequencing
+- [x] Add explicit incompatibility guards where safe live migration is not possible.
 
 ## Acceptance Bar
 
