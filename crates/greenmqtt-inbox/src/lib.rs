@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use greenmqtt_core::{
-    InflightMessage, InflightPhase, OfflineMessage, PublishProperties, PublishRequest, RangeBoundary,
-    ServiceShardKey, ServiceShardKind, SessionId, Subscription,
+    InflightMessage, InflightPhase, OfflineMessage, PublishProperties, PublishRequest,
+    RangeBoundary, ServiceShardKey, ServiceShardKind, SessionId, Subscription,
 };
 use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter};
 use greenmqtt_kv_engine::KvMutation;
@@ -388,6 +388,13 @@ impl InboxExpiryStats {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InboxTenantGcPreview {
+    pub subscriptions: usize,
+    pub offline_messages: usize,
+    pub inflight_messages: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DelayedLwtPublish {
     pub tenant_id: String,
@@ -409,11 +416,8 @@ pub trait InboxDelayedTaskHandler: Send + Sync {
         session_id: &SessionId,
         now_ms: u64,
     ) -> anyhow::Result<InboxExpiryStats>;
-    async fn expire_tenant(
-        &self,
-        tenant_id: &str,
-        now_ms: u64,
-    ) -> anyhow::Result<InboxExpiryStats>;
+    async fn expire_tenant(&self, tenant_id: &str, now_ms: u64)
+        -> anyhow::Result<InboxExpiryStats>;
     async fn send_lwt(&self, publish: &DelayedLwtPublish) -> anyhow::Result<()>;
 }
 
@@ -467,7 +471,11 @@ impl InboxDelayTaskRunner {
         }
     }
 
-    pub fn schedule(&self, task: InboxDelayedTask, delay: Duration) -> JoinHandle<anyhow::Result<()>> {
+    pub fn schedule(
+        &self,
+        task: InboxDelayedTask,
+        delay: Duration,
+    ) -> JoinHandle<anyhow::Result<()>> {
         let runner = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(delay).await;
@@ -517,6 +525,40 @@ pub trait DelayedLwtSink: Send + Sync {
     async fn send_lwt(&self, publish: &DelayedLwtPublish) -> anyhow::Result<()>;
 }
 
+pub async fn inbox_send_lwt(
+    sink: &dyn DelayedLwtSink,
+    publish: &DelayedLwtPublish,
+) -> anyhow::Result<()> {
+    sink.send_lwt(publish).await
+}
+
+pub async fn inbox_expire_all(
+    inbox: &dyn InboxService,
+    tenant_id: &str,
+    now_ms: u64,
+) -> anyhow::Result<InboxExpiryStats> {
+    inbox.expire_tenant_messages(tenant_id, now_ms).await
+}
+
+pub async fn inbox_tenant_gc_preview(
+    inbox: &dyn InboxService,
+    tenant_id: &str,
+) -> anyhow::Result<InboxTenantGcPreview> {
+    Ok(InboxTenantGcPreview {
+        subscriptions: inbox.count_tenant_subscriptions(tenant_id).await?,
+        offline_messages: inbox.count_tenant_offline(tenant_id).await?,
+        inflight_messages: inbox.count_tenant_inflight(tenant_id).await?,
+    })
+}
+
+pub async fn inbox_tenant_gc_run(
+    inbox: &dyn InboxService,
+    tenant_id: &str,
+    now_ms: u64,
+) -> anyhow::Result<InboxExpiryStats> {
+    inbox.expire_tenant_messages(tenant_id, now_ms).await
+}
+
 #[derive(Clone)]
 pub struct TenantInboxGcRunner {
     inbox: Arc<dyn InboxService>,
@@ -527,7 +569,11 @@ impl TenantInboxGcRunner {
         Self { inbox }
     }
 
-    pub async fn run_tenant(&self, tenant_id: &str, now_ms: u64) -> anyhow::Result<InboxExpiryStats> {
+    pub async fn run_tenant(
+        &self,
+        tenant_id: &str,
+        now_ms: u64,
+    ) -> anyhow::Result<InboxExpiryStats> {
         self.inbox.expire_tenant_messages(tenant_id, now_ms).await
     }
 
@@ -620,7 +666,10 @@ impl InboxBatchScheduler {
         Ok(())
     }
 
-    pub async fn unsubscribe_all(&self, requests: &[InboxUnsubscribeSpec]) -> anyhow::Result<usize> {
+    pub async fn unsubscribe_all(
+        &self,
+        requests: &[InboxUnsubscribeSpec],
+    ) -> anyhow::Result<usize> {
         let mut removed = 0usize;
         for request in requests {
             if self
@@ -649,13 +698,17 @@ pub struct InboxTenantStats {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InboxBalanceAction {
-    SplitTenantRange { tenant_id: String },
+    SplitTenantRange {
+        tenant_id: String,
+    },
     ScaleTenantReplicas {
         tenant_id: String,
         voters: usize,
         learners: usize,
     },
-    RunTenantMaintenance { tenant_id: String },
+    RunTenantMaintenance {
+        tenant_id: String,
+    },
 }
 
 pub trait InboxBalancePolicy: Send + Sync {
@@ -762,10 +815,7 @@ impl ReplicatedInboxHandle {
         }
     }
 
-    async fn remove_offline_messages(
-        &self,
-        messages: &[OfflineMessage],
-    ) -> anyhow::Result<usize> {
+    async fn remove_offline_messages(&self, messages: &[OfflineMessage]) -> anyhow::Result<usize> {
         let mut removed = 0usize;
         for message in messages {
             let range_id = self.inbox_range_id_for_tenant(&message.tenant_id).await?;
@@ -800,7 +850,9 @@ impl ReplicatedInboxHandle {
         let mut removed = 0usize;
         let mut grouped: BTreeMap<String, Vec<KvMutation>> = BTreeMap::new();
         for message in messages {
-            let range_id = self.inflight_range_id_for_tenant(&message.tenant_id).await?;
+            let range_id = self
+                .inflight_range_id_for_tenant(&message.tenant_id)
+                .await?;
             grouped.entry(range_id).or_default().push(KvMutation {
                 key: inflight_key(&message.session_id, message.packet_id),
                 value: None,
@@ -1206,7 +1258,10 @@ impl InboxService for ReplicatedInboxHandle {
     ) -> anyhow::Result<Vec<Subscription>> {
         let mut subscriptions = Vec::new();
         for (_, value) in self
-            .scan_kind_prefix(ServiceShardKind::Inbox, &subscription_session_prefix(session_id))
+            .scan_kind_prefix(
+                ServiceShardKind::Inbox,
+                &subscription_session_prefix(session_id),
+            )
             .await?
         {
             if let Ok(subscription) = decode_subscription(&value) {
@@ -1340,7 +1395,10 @@ impl InboxService for ReplicatedInboxHandle {
     async fn fetch_inflight(&self, session_id: &SessionId) -> anyhow::Result<Vec<InflightMessage>> {
         let mut messages = Vec::new();
         for (_, value) in self
-            .scan_kind_prefix(ServiceShardKind::Inflight, &inflight_session_prefix(session_id))
+            .scan_kind_prefix(
+                ServiceShardKind::Inflight,
+                &inflight_session_prefix(session_id),
+            )
             .await?
         {
             if let Ok(message) = decode_inflight(&value) {

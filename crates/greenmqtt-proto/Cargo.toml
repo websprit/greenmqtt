@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+bincode = "1.3.3"
 greenmqtt-core = { path = "../greenmqtt-core" }
 greenmqtt-kv-engine = { path = "../greenmqtt-kv-engine" }
 greenmqtt-kv-raft = { path = "../greenmqtt-kv-raft" }

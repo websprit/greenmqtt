@@ -1,17 +1,28 @@
 use axum::{
     extract::{Path, Query, State},
+    Extension,
     Json,
 };
 use greenmqtt_broker::{AdminAuditEntry, BrokerRuntime};
 use greenmqtt_core::{
-    InflightMessage, OfflineMessage, RetainedMessage, RouteRecord, TenantQuota, TenantUsageSnapshot,
+    ControlCommandExecutionState, ControlCommandRecord, ControlCommandReflectionState,
+    InflightMessage, OfflineMessage, PublishRequest, RetainedMessage, RouteRecord, TenantQuota,
+    TenantUsageSnapshot,
 };
 use greenmqtt_plugin_api::{AclProvider, AuthProvider, EventHook};
+use metrics::counter;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::{ApiError, MessageListQuery, PurgeReply, RouteListQuery};
+
+pub(crate) fn current_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock went backwards")
+        .as_millis() as u64
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RetainDeleteQuery {
@@ -19,6 +30,11 @@ pub struct RetainDeleteQuery {
     pub topic: String,
     #[serde(default)]
     pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TenantOnlyQuery {
+    pub tenant_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -40,6 +56,44 @@ pub struct TenantQuotaResponse {
     pub tenant_id: String,
     pub quota: Option<TenantQuota>,
     pub usage: Option<TenantUsageSnapshot>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InboxSendLwtBody {
+    pub tenant_id: String,
+    pub session_id: String,
+    pub publish: PublishRequest,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InboxTenantOperationBody {
+    pub tenant_id: String,
+    pub now_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct InboxMaintenanceResponse {
+    pub subscriptions: usize,
+    pub offline_messages: usize,
+    pub inflight_messages: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct ControlCommandQuery {
+    pub execution_state: Option<String>,
+    pub reflection_state: Option<String>,
+    pub issued_by: Option<String>,
+    pub target_range_or_shard: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ControlCommandFailBody {
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ControlCommandPruneQuery {
+    pub older_than_ms: u64,
 }
 
 pub(crate) async fn list_admin_audit<A, C, H>(
@@ -65,6 +119,179 @@ where
         entries.retain(|entry| entry.action.starts_with("shard_"));
     }
     Ok(Json(entries))
+}
+
+fn matches_control_command_query(
+    record: &ControlCommandRecord,
+    query: &ControlCommandQuery,
+) -> bool {
+    if let Some(execution_state) = query.execution_state.as_deref() {
+        if !format!("{:?}", record.execution_state).eq_ignore_ascii_case(execution_state) {
+            return false;
+        }
+    }
+    if let Some(reflection_state) = query.reflection_state.as_deref() {
+        if !format!("{:?}", record.reflection_state).eq_ignore_ascii_case(reflection_state) {
+            return false;
+        }
+    }
+    if let Some(issued_by) = query.issued_by.as_deref() {
+        if record.issued_by != issued_by {
+            return false;
+        }
+    }
+    if let Some(target) = query.target_range_or_shard.as_deref() {
+        if record.target_range_or_shard != target {
+            return false;
+        }
+    }
+    true
+}
+
+pub(crate) async fn list_control_commands<A, C, H>(
+    Extension(range_routing): Extension<Option<Arc<dyn greenmqtt_core::ControlPlaneRegistry>>>,
+    Query(query): Query<ControlCommandQuery>,
+    State(_broker): State<Arc<BrokerRuntime<A, C, H>>>,
+) -> Result<Json<Vec<ControlCommandRecord>>, ApiError>
+where
+    A: AuthProvider + 'static,
+    C: AclProvider + 'static,
+    H: EventHook + 'static,
+{
+    let Some(registry) = range_routing else {
+        return Ok(Json(Vec::new()));
+    };
+    let mut commands = registry.list_control_commands().await.map_err(ApiError::from)?;
+    commands.retain(|record| matches_control_command_query(record, &query));
+    Ok(Json(commands))
+}
+
+pub(crate) async fn get_control_command<A, C, H>(
+    Extension(range_routing): Extension<Option<Arc<dyn greenmqtt_core::ControlPlaneRegistry>>>,
+    Path(command_id): Path<String>,
+    State(_broker): State<Arc<BrokerRuntime<A, C, H>>>,
+) -> Result<Json<Option<ControlCommandRecord>>, ApiError>
+where
+    A: AuthProvider + 'static,
+    C: AclProvider + 'static,
+    H: EventHook + 'static,
+{
+    let Some(registry) = range_routing else {
+        return Ok(Json(None));
+    };
+    Ok(Json(
+        registry
+            .resolve_control_command(&command_id)
+            .await
+            .map_err(ApiError::from)?,
+    ))
+}
+
+pub(crate) async fn retry_control_command<A, C, H>(
+    Extension(range_routing): Extension<Option<Arc<dyn greenmqtt_core::ControlPlaneRegistry>>>,
+    Path(command_id): Path<String>,
+    State(broker): State<Arc<BrokerRuntime<A, C, H>>>,
+) -> Result<Json<Option<ControlCommandRecord>>, ApiError>
+where
+    A: AuthProvider + 'static,
+    C: AclProvider + 'static,
+    H: EventHook + 'static,
+{
+    let Some(registry) = range_routing else {
+        return Ok(Json(None));
+    };
+    let Some(mut record) = registry
+        .resolve_control_command(&command_id)
+        .await
+        .map_err(ApiError::from)?
+    else {
+        return Ok(Json(None));
+    };
+    record.execution_state = ControlCommandExecutionState::Issued;
+    record.reflection_state = ControlCommandReflectionState::Pending;
+    record.last_error = None;
+    registry
+        .upsert_control_command(record.clone())
+        .await
+        .map_err(ApiError::from)?;
+    broker.record_admin_audit(
+        "control_command_retry",
+        "control_commands",
+        BTreeMap::from([("command_id".into(), command_id)]),
+    );
+    Ok(Json(Some(record)))
+}
+
+pub(crate) async fn fail_control_command<A, C, H>(
+    Extension(range_routing): Extension<Option<Arc<dyn greenmqtt_core::ControlPlaneRegistry>>>,
+    Path(command_id): Path<String>,
+    State(broker): State<Arc<BrokerRuntime<A, C, H>>>,
+    Json(body): Json<ControlCommandFailBody>,
+) -> Result<Json<Option<ControlCommandRecord>>, ApiError>
+where
+    A: AuthProvider + 'static,
+    C: AclProvider + 'static,
+    H: EventHook + 'static,
+{
+    let Some(registry) = range_routing else {
+        return Ok(Json(None));
+    };
+    let Some(mut record) = registry
+        .resolve_control_command(&command_id)
+        .await
+        .map_err(ApiError::from)?
+    else {
+        return Ok(Json(None));
+    };
+    record.execution_state = ControlCommandExecutionState::TerminalFailed;
+    record.reflection_state = ControlCommandReflectionState::Unreflected;
+    record.last_error = body.last_error.or_else(|| Some("manually marked terminal".into()));
+    registry
+        .upsert_control_command(record.clone())
+        .await
+        .map_err(ApiError::from)?;
+    broker.record_admin_audit(
+        "control_command_fail",
+        "control_commands",
+        BTreeMap::from([("command_id".into(), command_id)]),
+    );
+    Ok(Json(Some(record)))
+}
+
+pub(crate) async fn prune_control_commands<A, C, H>(
+    Extension(range_routing): Extension<Option<Arc<dyn greenmqtt_core::ControlPlaneRegistry>>>,
+    Query(query): Query<ControlCommandPruneQuery>,
+    State(broker): State<Arc<BrokerRuntime<A, C, H>>>,
+) -> Result<Json<PurgeReply>, ApiError>
+where
+    A: AuthProvider + 'static,
+    C: AclProvider + 'static,
+    H: EventHook + 'static,
+{
+    let Some(registry) = range_routing else {
+        return Ok(Json(PurgeReply { removed: 0 }));
+    };
+    let cutoff = current_time_ms().saturating_sub(query.older_than_ms);
+    let commands = registry.list_control_commands().await.map_err(ApiError::from)?;
+    let mut removed = 0usize;
+    for record in commands {
+        if record.issued_at_ms < cutoff {
+            let _ = registry
+                .remove_control_command(&record.command_id)
+                .await
+                .map_err(ApiError::from)?;
+            removed += 1;
+        }
+    }
+    broker.record_admin_audit(
+        "control_command_prune",
+        "control_commands",
+        BTreeMap::from([
+            ("removed".into(), removed.to_string()),
+            ("older_than_ms".into(), query.older_than_ms.to_string()),
+        ]),
+    );
+    Ok(Json(PurgeReply { removed }))
 }
 
 pub(crate) async fn get_tenant_quota<A, C, H>(
@@ -142,6 +369,197 @@ where
     Ok(Json(PurgeReply {
         removed: usize::from(existed),
     }))
+}
+
+pub(crate) async fn send_inbox_lwt<A, C, H>(
+    State(broker): State<Arc<BrokerRuntime<A, C, H>>>,
+    Json(body): Json<InboxSendLwtBody>,
+) -> Result<Json<PurgeReply>, ApiError>
+where
+    A: AuthProvider + 'static,
+    C: AclProvider + 'static,
+    H: EventHook + 'static,
+{
+    broker
+        .publish(&body.session_id, body.publish)
+        .await
+        .map_err(ApiError::from)?;
+    counter!("greenmqtt_inbox_delayed_lwt_dispatch_total").increment(1);
+    broker.record_admin_audit(
+        "inbox_send_lwt",
+        "inbox",
+        BTreeMap::from([
+            ("tenant_id".into(), body.tenant_id),
+            ("session_id".into(), body.session_id),
+        ]),
+    );
+    Ok(Json(PurgeReply { removed: 1 }))
+}
+
+pub(crate) async fn expire_inbox_tenant<A, C, H>(
+    State(broker): State<Arc<BrokerRuntime<A, C, H>>>,
+    Json(body): Json<InboxTenantOperationBody>,
+) -> Result<Json<InboxMaintenanceResponse>, ApiError>
+where
+    A: AuthProvider + 'static,
+    C: AclProvider + 'static,
+    H: EventHook + 'static,
+{
+    let stats = broker
+        .inbox
+        .expire_tenant_messages(&body.tenant_id, body.now_ms)
+        .await
+        .map_err(ApiError::from)?;
+    counter!("greenmqtt_inbox_tenant_gc_total", "action" => "expire_all").increment(1);
+    broker.record_admin_audit(
+        "inbox_expire_all",
+        "inbox",
+        BTreeMap::from([
+            ("tenant_id".into(), body.tenant_id),
+            (
+                "offline_messages".into(),
+                stats.offline_messages.to_string(),
+            ),
+            (
+                "inflight_messages".into(),
+                stats.inflight_messages.to_string(),
+            ),
+        ]),
+    );
+    Ok(Json(InboxMaintenanceResponse {
+        subscriptions: 0,
+        offline_messages: stats.offline_messages,
+        inflight_messages: stats.inflight_messages,
+    }))
+}
+
+pub(crate) async fn preview_inbox_tenant_gc<A, C, H>(
+    State(broker): State<Arc<BrokerRuntime<A, C, H>>>,
+    Json(body): Json<InboxTenantOperationBody>,
+) -> Result<Json<InboxMaintenanceResponse>, ApiError>
+where
+    A: AuthProvider + 'static,
+    C: AclProvider + 'static,
+    H: EventHook + 'static,
+{
+    Ok(Json(InboxMaintenanceResponse {
+        subscriptions: broker
+            .inbox
+            .count_tenant_subscriptions(&body.tenant_id)
+            .await
+            .map_err(ApiError::from)?,
+        offline_messages: broker
+            .inbox
+            .count_tenant_offline(&body.tenant_id)
+            .await
+            .map_err(ApiError::from)?,
+        inflight_messages: broker
+            .inbox
+            .count_tenant_inflight(&body.tenant_id)
+            .await
+            .map_err(ApiError::from)?,
+    }))
+}
+
+pub(crate) async fn run_inbox_tenant_gc<A, C, H>(
+    State(broker): State<Arc<BrokerRuntime<A, C, H>>>,
+    Json(body): Json<InboxTenantOperationBody>,
+) -> Result<Json<InboxMaintenanceResponse>, ApiError>
+where
+    A: AuthProvider + 'static,
+    C: AclProvider + 'static,
+    H: EventHook + 'static,
+{
+    let stats = broker
+        .inbox
+        .expire_tenant_messages(&body.tenant_id, body.now_ms)
+        .await
+        .map_err(ApiError::from)?;
+    counter!("greenmqtt_inbox_tenant_gc_total", "action" => "run").increment(1);
+    broker.record_admin_audit(
+        "inbox_tenant_gc",
+        "inbox",
+        BTreeMap::from([
+            ("tenant_id".into(), body.tenant_id),
+            (
+                "offline_messages".into(),
+                stats.offline_messages.to_string(),
+            ),
+            (
+                "inflight_messages".into(),
+                stats.inflight_messages.to_string(),
+            ),
+        ]),
+    );
+    Ok(Json(InboxMaintenanceResponse {
+        subscriptions: 0,
+        offline_messages: stats.offline_messages,
+        inflight_messages: stats.inflight_messages,
+    }))
+}
+
+pub(crate) async fn expire_retain_tenant<A, C, H>(
+    State(broker): State<Arc<BrokerRuntime<A, C, H>>>,
+    Query(query): Query<TenantOnlyQuery>,
+) -> Result<Json<PurgeReply>, ApiError>
+where
+    A: AuthProvider + 'static,
+    C: AclProvider + 'static,
+    H: EventHook + 'static,
+{
+    let removed = greenmqtt_retain::retain_expire_all(broker.retain.as_ref(), &query.tenant_id)
+        .await
+        .map_err(ApiError::from)?;
+    counter!("greenmqtt_retain_expire_sweep_total", "action" => "expire_all").increment(1);
+    broker.record_admin_audit(
+        "retain_expire_all",
+        "retain",
+        BTreeMap::from([
+            ("tenant_id".into(), query.tenant_id),
+            ("removed".into(), removed.to_string()),
+        ]),
+    );
+    Ok(Json(PurgeReply { removed }))
+}
+
+pub(crate) async fn preview_retain_tenant_gc<A, C, H>(
+    State(broker): State<Arc<BrokerRuntime<A, C, H>>>,
+    Query(query): Query<TenantOnlyQuery>,
+) -> Result<Json<PurgeReply>, ApiError>
+where
+    A: AuthProvider + 'static,
+    C: AclProvider + 'static,
+    H: EventHook + 'static,
+{
+    let removed =
+        greenmqtt_retain::retain_tenant_gc_preview(broker.retain.as_ref(), &query.tenant_id)
+            .await
+            .map_err(ApiError::from)?;
+    Ok(Json(PurgeReply { removed }))
+}
+
+pub(crate) async fn run_retain_tenant_gc<A, C, H>(
+    State(broker): State<Arc<BrokerRuntime<A, C, H>>>,
+    Query(query): Query<TenantOnlyQuery>,
+) -> Result<Json<PurgeReply>, ApiError>
+where
+    A: AuthProvider + 'static,
+    C: AclProvider + 'static,
+    H: EventHook + 'static,
+{
+    let removed = greenmqtt_retain::retain_tenant_gc_run(broker.retain.as_ref(), &query.tenant_id)
+        .await
+        .map_err(ApiError::from)?;
+    counter!("greenmqtt_retain_expire_sweep_total", "action" => "tenant_gc").increment(1);
+    broker.record_admin_audit(
+        "retain_tenant_gc",
+        "retain",
+        BTreeMap::from([
+            ("tenant_id".into(), query.tenant_id),
+            ("removed".into(), removed.to_string()),
+        ]),
+    );
+    Ok(Json(PurgeReply { removed }))
 }
 
 pub(crate) async fn purge_routes<A, C, H>(

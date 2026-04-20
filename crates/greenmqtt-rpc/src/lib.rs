@@ -3,8 +3,8 @@ use bytes::Bytes;
 use greenmqtt_broker::{DeliverySink, PeerRegistry};
 use greenmqtt_core::{
     BalancerState, BalancerStateRegistry, ClientIdentity, ClusterMembershipRegistry,
-    ClusterNodeMembership, ControlCommandRecord, ControlCommandRegistry, Delivery,
-    InflightMessage, MetadataRegistry, NodeId, OfflineMessage, RangeReconfigurationRegistry,
+    ClusterNodeMembership, ControlCommandRecord, ControlCommandRegistry, Delivery, InflightMessage,
+    MetadataRegistry, NodeId, OfflineMessage, RangeReconfigurationRegistry,
     RangeReconfigurationState, ReconfigurationPhase, ReplicatedRangeDescriptor,
     ReplicatedRangeRegistry, RetainedMessage, RouteRecord, ServiceEndpoint,
     ServiceEndpointRegistry, ServiceKind, ServiceShardAssignment, ServiceShardKey,
@@ -13,7 +13,9 @@ use greenmqtt_core::{
 };
 use greenmqtt_dist::{dist_tenant_shard, DistRouter};
 use greenmqtt_inbox::{
-    inbox_session_shard, inbox_tenant_scan_shard, inflight_tenant_scan_shard, InboxService,
+    inbox_expire_all, inbox_send_lwt, inbox_session_shard, inbox_tenant_gc_preview,
+    inbox_tenant_gc_run, inbox_tenant_scan_shard, inflight_tenant_scan_shard, DelayedLwtPublish,
+    DelayedLwtSink, InboxService, InboxTenantGcPreview,
 };
 use greenmqtt_kv_client::{KvRangeExecutor, KvRangeExecutorFactory, KvRangeRouter, RangeRoute};
 use greenmqtt_kv_engine::{
@@ -25,14 +27,10 @@ use greenmqtt_kv_server::{
 };
 use greenmqtt_proto::internal::{
     broker_peer_service_client::BrokerPeerServiceClient,
-    broker_peer_service_server::BrokerPeerServiceServer,
-    dist_service_client::DistServiceClient,
-    dist_service_server::DistServiceServer,
-    inbox_service_client::InboxServiceClient,
-    inbox_service_server::InboxServiceServer,
-    kv_range_service_client::KvRangeServiceClient,
-    kv_range_service_server::KvRangeServiceServer,
-    metadata_service_client::MetadataServiceClient,
+    broker_peer_service_server::BrokerPeerServiceServer, dist_service_client::DistServiceClient,
+    dist_service_server::DistServiceServer, inbox_service_client::InboxServiceClient,
+    inbox_service_server::InboxServiceServer, kv_range_service_client::KvRangeServiceClient,
+    kv_range_service_server::KvRangeServiceServer, metadata_service_client::MetadataServiceClient,
     metadata_service_server::MetadataServiceServer,
     raft_transport_service_client::RaftTransportServiceClient,
     raft_transport_service_server::RaftTransportServiceServer,
@@ -40,36 +38,35 @@ use greenmqtt_proto::internal::{
     range_admin_service_server::RangeAdminServiceServer,
     range_control_service_client::RangeControlServiceClient,
     range_control_service_server::RangeControlServiceServer,
-    retain_service_client::RetainServiceClient,
-    retain_service_server::RetainServiceServer,
+    retain_service_client::RetainServiceClient, retain_service_server::RetainServiceServer,
     session_dict_service_client::SessionDictServiceClient,
-    session_dict_service_server::SessionDictServiceServer,
-    AddRouteRequest, BalancerStateListReply, BalancerStateReply, BalancerStateRequest,
-    BalancerStateUpsertReply, BalancerStateUpsertRequest, CountReply, InboxAckInflightRequest,
-    InboxAttachRequest, InboxDetachRequest, InboxEnqueueRequest, InboxFetchInflightReply,
-    InboxFetchInflightRequest, InboxFetchReply, InboxFetchRequest,
-    InboxListAllSubscriptionsRequest, InboxListMessagesRequest, InboxListSubscriptionsReply,
-    InboxListSubscriptionsRequest, InboxLookupSubscriptionReply, InboxLookupSubscriptionRequest,
-    InboxPurgeSessionRequest, InboxStageInflightRequest, InboxStatsReply, InboxSubscribeRequest,
-    InboxUnsubscribeReply, InboxUnsubscribeRequest, KvRangeApplyRequest, KvRangeCheckpointReply,
-    KvRangeCheckpointRequest, KvRangeGetReply, KvRangeGetRequest, KvRangeScanReply,
-    KvRangeScanRequest, KvRangeSnapshotReply, KvRangeSnapshotRequest, ListRoutesReply,
-    ListRoutesRequest, ListSessionRoutesReply, ListSessionRoutesRequest, ListSessionsReply,
-    ListSessionsRequest, LookupSessionByIdRequest, LookupSessionReply, LookupSessionRequest,
-    MatchTopicReply, MatchTopicRequest, MemberListReply, MemberLookupRequest, MemberRecordReply,
-    NamedBalancerStateRecord, PushDeliveriesReply, PushDeliveriesRequest, PushDeliveryReply,
-    PushDeliveryRequest, RaftTransportRequest, RangeBootstrapReply, RangeBootstrapRequest,
-    RangeChangeReplicasRequest, RangeDebugReply, RangeHealthListReply, RangeHealthRecord,
-    RangeHealthReply, RangeHealthRequest, RangeListReply, RangeListRequest, RangeLookupRequest,
-    RangeDrainRequest, RangeMergeReply, RangeMergeRequest, RangeRecordReply, RangeRecoverRequest,
-    RangeReconfigurationRecord, RangeRetireRequest, RangeSplitReply, RangeSplitRequest,
-    RangeTransferLeadershipRequest, RangeUpsertRequest, RegisterSessionReply,
-    RegisterSessionRequest, RemoveRouteRequest, RemoveSessionRoutesReply,
-    RemoveSessionRoutesRequest, ReplicaLagRecord, RetainMatchReply, RetainMatchRequest,
-    RetainWriteRequest, RouteRangeRequest, SessionExistRecord,
-    SessionExistReply, SessionExistRequest, IdentityExistRecord, IdentityExistReply,
-    IdentityExistRequest, ShardSnapshotChunk, ShardSnapshotRequest, UnregisterSessionRequest,
-    ZombieRangeListReply, ZombieRangeRecord,
+    session_dict_service_server::SessionDictServiceServer, AddRouteRequest, BalancerStateListReply,
+    BalancerStateReply, BalancerStateRequest, BalancerStateUpsertReply, BalancerStateUpsertRequest,
+    CountReply, IdentityExistRecord, IdentityExistReply, IdentityExistRequest,
+    InboxAckInflightRequest, InboxAttachRequest, InboxDetachRequest, InboxEnqueueRequest,
+    InboxExpireAllRequest, InboxFetchInflightReply, InboxFetchInflightRequest, InboxFetchReply,
+    InboxFetchRequest, InboxListAllSubscriptionsRequest, InboxListMessagesRequest,
+    InboxListSubscriptionsReply, InboxListSubscriptionsRequest, InboxLookupSubscriptionReply,
+    InboxLookupSubscriptionRequest, InboxMaintenanceReply, InboxPurgeSessionRequest,
+    InboxSendLwtRequest, InboxStageInflightRequest, InboxStatsReply, InboxSubscribeRequest,
+    InboxTenantGcRequest, InboxUnsubscribeReply, InboxUnsubscribeRequest, KvRangeApplyRequest,
+    KvRangeCheckpointReply, KvRangeCheckpointRequest, KvRangeGetReply, KvRangeGetRequest,
+    KvRangeScanReply, KvRangeScanRequest, KvRangeSnapshotReply, KvRangeSnapshotRequest,
+    ListRoutesReply, ListRoutesRequest, ListSessionRoutesReply, ListSessionRoutesRequest,
+    ListSessionsReply, ListSessionsRequest, LookupSessionByIdRequest, LookupSessionReply,
+    LookupSessionRequest, MatchTopicReply, MatchTopicRequest, MemberListReply, MemberLookupRequest,
+    MemberRecordReply, NamedBalancerStateRecord, PushDeliveriesReply, PushDeliveriesRequest,
+    PushDeliveryReply, PushDeliveryRequest, RaftTransportRequest, RangeBootstrapReply,
+    RangeBootstrapRequest, RangeChangeReplicasRequest, RangeDebugReply, RangeDrainRequest,
+    RangeHealthListReply, RangeHealthRecord, RangeHealthReply, RangeHealthRequest, RangeListReply,
+    RangeListRequest, RangeLookupRequest, RangeMergeReply, RangeMergeRequest,
+    RangeReconfigurationRecord, RangeRecordReply, RangeRecoverRequest, RangeRetireRequest,
+    RangeSplitReply, RangeSplitRequest, RangeTransferLeadershipRequest, RangeUpsertRequest,
+    RegisterSessionReply, RegisterSessionRequest, RemoveRouteRequest, RemoveSessionRoutesReply,
+    RemoveSessionRoutesRequest, ReplicaLagRecord, RetainExpireAllRequest, RetainMatchReply,
+    RetainMatchRequest, RetainTenantGcRequest, RetainWriteRequest, RouteRangeRequest,
+    SessionExistRecord, SessionExistReply, SessionExistRequest, ShardSnapshotChunk,
+    ShardSnapshotRequest, UnregisterSessionRequest, ZombieRangeListReply, ZombieRangeRecord,
 };
 use greenmqtt_proto::{
     from_proto_balancer_state, from_proto_client_identity, from_proto_cluster_node_membership,
@@ -77,28 +74,159 @@ use greenmqtt_proto::{
     from_proto_kv_range_checkpoint, from_proto_kv_range_snapshot, from_proto_offline,
     from_proto_raft_transport_request, from_proto_replicated_range, from_proto_retain,
     from_proto_route, from_proto_session, from_proto_shard_kind, from_proto_subscription,
-    to_proto_balancer_state, to_proto_client_identity, to_proto_cluster_node_membership, to_proto_delivery,
-    to_proto_inflight, to_proto_kv_entry, to_proto_kv_range_checkpoint, to_proto_kv_range_snapshot,
-    to_proto_offline, to_proto_raft_transport_request, to_proto_replicated_range, to_proto_retain,
-    to_proto_route, to_proto_session, to_proto_shard_kind, to_proto_subscription,
+    to_proto_balancer_state, to_proto_client_identity, to_proto_cluster_node_membership,
+    to_proto_delivery, to_proto_inflight, to_proto_kv_entry, to_proto_kv_range_checkpoint,
+    to_proto_kv_range_snapshot, to_proto_offline, to_proto_raft_transport_request,
+    to_proto_replicated_range, to_proto_retain, to_proto_route, to_proto_session,
+    to_proto_shard_kind, to_proto_subscription,
 };
-use greenmqtt_retain::{retain_tenant_shard, RetainService as RetainStoreService};
-use greenmqtt_sessiondict::{session_identity_shard, SessionDirectory};
+use greenmqtt_retain::{
+    retain_expire_all, retain_tenant_gc_preview, retain_tenant_gc_run, retain_tenant_shard,
+    RetainService as RetainStoreService,
+};
 use greenmqtt_sessiondict::SessionOnlineCheckScheduler;
+use greenmqtt_sessiondict::{session_identity_shard, SessionDirectory};
 use metrics::counter;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::convert::Infallible;
+use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
-use tokio::sync::Mutex;
-use tokio::time::Duration;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::time::{Duration, Instant};
 use tonic::transport::{Channel, Server};
 use tonic::{Request, Response, Status};
+use tower::Service;
 
 const SNAPSHOT_CHUNK_BYTES: usize = 64 * 1024;
+const DEFAULT_RPC_MAX_IN_FLIGHT: usize = 128;
+const DEFAULT_RPC_RETRY_AFTER_MS: u64 = 200;
+
+fn current_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock went backwards")
+        .as_millis() as u64
+}
+
+fn env_override_limit(key: &str, default: usize) -> anyhow::Result<usize> {
+    match std::env::var(key) {
+        Ok(value) if !value.trim().is_empty() => {
+            value.parse().map_err(|_| anyhow::anyhow!("invalid {key}"))
+        }
+        _ => Ok(default),
+    }
+}
+
+type BoxGrpcFuture<T> = Pin<Box<dyn Future<Output = Result<T, Infallible>> + Send>>;
+
+#[derive(Clone)]
+pub struct RpcGovernedService<S> {
+    inner: S,
+    governor: Arc<ServiceTrafficGovernor>,
+}
+
+impl<S> RpcGovernedService<S> {
+    pub fn new(inner: S, governor: Arc<ServiceTrafficGovernor>) -> Self {
+        Self { inner, governor }
+    }
+}
+
+impl<S, ReqBody> Service<tonic::codegen::http::Request<ReqBody>> for RpcGovernedService<S>
+where
+    S: Service<
+            tonic::codegen::http::Request<ReqBody>,
+            Response = tonic::codegen::http::Response<tonic::body::Body>,
+            Error = Infallible,
+        > + Send
+        + 'static,
+    S::Future: Send + 'static,
+    ReqBody: Send + 'static,
+{
+    type Response = tonic::codegen::http::Response<tonic::body::Body>;
+    type Error = Infallible;
+    type Future = BoxGrpcFuture<Self::Response>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: tonic::codegen::http::Request<ReqBody>) -> Self::Future {
+        let governor = self.governor.clone();
+        if let Some(permit) = governor.try_acquire() {
+            let future = self.inner.call(request);
+            Box::pin(async move {
+                let _permit = permit;
+                future.await
+            })
+        } else {
+            governor.record_overload();
+            Box::pin(async move { Ok(overload_response(&governor)) })
+        }
+    }
+}
+
+impl<S> tonic::server::NamedService for RpcGovernedService<S>
+where
+    S: tonic::server::NamedService,
+{
+    const NAME: &'static str = S::NAME;
+}
+
+fn overload_response(
+    governor: &ServiceTrafficGovernor,
+) -> tonic::codegen::http::Response<tonic::body::Body> {
+    tonic::codegen::http::Response::builder()
+        .status(tonic::codegen::http::StatusCode::OK)
+        .header(
+            tonic::codegen::http::header::CONTENT_TYPE,
+            "application/grpc",
+        )
+        .header("grpc-status", tonic::Code::ResourceExhausted as i32)
+        .header(
+            "grpc-message",
+            format!(
+                "rpc/overloaded service={} retry_after_ms={}",
+                governor.service.as_str(),
+                governor.retry_after_ms
+            ),
+        )
+        .header("x-greenmqtt-service", governor.service.as_str())
+        .header(
+            "x-greenmqtt-retry-after-ms",
+            governor.retry_after_ms.to_string(),
+        )
+        .body(tonic::body::Body::empty())
+        .expect("valid overload response")
+}
+
+fn inbox_maintenance_reply(
+    subscriptions: usize,
+    offline_messages: usize,
+    inflight_messages: usize,
+) -> InboxMaintenanceReply {
+    InboxMaintenanceReply {
+        subscriptions: subscriptions as u64,
+        offline_messages: offline_messages as u64,
+        inflight_messages: inflight_messages as u64,
+    }
+}
+
+fn inbox_preview_reply(preview: InboxTenantGcPreview) -> InboxMaintenanceReply {
+    inbox_maintenance_reply(
+        preview.subscriptions,
+        preview.offline_messages,
+        preview.inflight_messages,
+    )
+}
 
 #[derive(Clone)]
 pub struct RpcRuntime {
@@ -110,6 +238,270 @@ pub struct RpcRuntime {
     pub assignment_registry: Option<Arc<dyn MetadataRegistry>>,
     pub range_host: Option<Arc<dyn KvRangeHost>>,
     pub range_runtime: Option<Arc<greenmqtt_kv_server::ReplicaRuntime>>,
+    pub inbox_lwt_sink: Option<Arc<dyn DelayedLwtSink>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RpcServiceKind {
+    SessionDict,
+    Dist,
+    Inbox,
+    Retain,
+    Metadata,
+    KvRange,
+    RangeControl,
+}
+
+impl RpcServiceKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RpcServiceKind::SessionDict => "sessiondict",
+            RpcServiceKind::Dist => "dist",
+            RpcServiceKind::Inbox => "inbox",
+            RpcServiceKind::Retain => "retain",
+            RpcServiceKind::Metadata => "metadata",
+            RpcServiceKind::KvRange => "kvrange",
+            RpcServiceKind::RangeControl => "rangecontrol",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpcServiceLoadSnapshot {
+    pub service: &'static str,
+    pub current_in_flight: usize,
+    pub max_in_flight: usize,
+    pub overload_count: u64,
+    pub retry_after_ms: u64,
+    pub last_overload_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpcTrafficGovernorConfig {
+    pub default_max_in_flight: usize,
+    pub sessiondict_max_in_flight: usize,
+    pub dist_max_in_flight: usize,
+    pub inbox_max_in_flight: usize,
+    pub retain_max_in_flight: usize,
+    pub metadata_max_in_flight: usize,
+    pub kvrange_max_in_flight: usize,
+    pub rangecontrol_max_in_flight: usize,
+    pub retry_after_ms: u64,
+}
+
+impl Default for RpcTrafficGovernorConfig {
+    fn default() -> Self {
+        Self {
+            default_max_in_flight: DEFAULT_RPC_MAX_IN_FLIGHT,
+            sessiondict_max_in_flight: DEFAULT_RPC_MAX_IN_FLIGHT,
+            dist_max_in_flight: DEFAULT_RPC_MAX_IN_FLIGHT,
+            inbox_max_in_flight: DEFAULT_RPC_MAX_IN_FLIGHT,
+            retain_max_in_flight: DEFAULT_RPC_MAX_IN_FLIGHT,
+            metadata_max_in_flight: DEFAULT_RPC_MAX_IN_FLIGHT,
+            kvrange_max_in_flight: DEFAULT_RPC_MAX_IN_FLIGHT,
+            rangecontrol_max_in_flight: DEFAULT_RPC_MAX_IN_FLIGHT,
+            retry_after_ms: DEFAULT_RPC_RETRY_AFTER_MS,
+        }
+    }
+}
+
+impl RpcTrafficGovernorConfig {
+    pub fn from_env() -> anyhow::Result<Self> {
+        let mut config = Self::default();
+        if let Ok(value) = std::env::var("GREENMQTT_RPC_MAX_INFLIGHT_DEFAULT") {
+            if !value.trim().is_empty() {
+                config.default_max_in_flight = value
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("invalid GREENMQTT_RPC_MAX_INFLIGHT_DEFAULT"))?;
+            }
+        }
+        config.sessiondict_max_in_flight = env_override_limit(
+            "GREENMQTT_RPC_SESSIONDICT_MAX_INFLIGHT",
+            config.default_max_in_flight,
+        )?;
+        config.dist_max_in_flight = env_override_limit(
+            "GREENMQTT_RPC_DIST_MAX_INFLIGHT",
+            config.default_max_in_flight,
+        )?;
+        config.inbox_max_in_flight = env_override_limit(
+            "GREENMQTT_RPC_INBOX_MAX_INFLIGHT",
+            config.default_max_in_flight,
+        )?;
+        config.retain_max_in_flight = env_override_limit(
+            "GREENMQTT_RPC_RETAIN_MAX_INFLIGHT",
+            config.default_max_in_flight,
+        )?;
+        config.metadata_max_in_flight = env_override_limit(
+            "GREENMQTT_RPC_METADATA_MAX_INFLIGHT",
+            config.default_max_in_flight,
+        )?;
+        config.kvrange_max_in_flight = env_override_limit(
+            "GREENMQTT_RPC_KVRANGE_MAX_INFLIGHT",
+            config.default_max_in_flight,
+        )?;
+        config.rangecontrol_max_in_flight = env_override_limit(
+            "GREENMQTT_RPC_RANGECONTROL_MAX_INFLIGHT",
+            config.default_max_in_flight,
+        )?;
+        if let Ok(value) = std::env::var("GREENMQTT_RPC_RETRY_AFTER_MS") {
+            if !value.trim().is_empty() {
+                config.retry_after_ms = value
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("invalid GREENMQTT_RPC_RETRY_AFTER_MS"))?;
+            }
+        }
+        Ok(config)
+    }
+}
+
+#[derive(Clone)]
+pub struct RpcTrafficGovernor {
+    sessiondict: Arc<ServiceTrafficGovernor>,
+    dist: Arc<ServiceTrafficGovernor>,
+    inbox: Arc<ServiceTrafficGovernor>,
+    retain: Arc<ServiceTrafficGovernor>,
+    metadata: Arc<ServiceTrafficGovernor>,
+    kvrange: Arc<ServiceTrafficGovernor>,
+    rangecontrol: Arc<ServiceTrafficGovernor>,
+}
+
+impl Default for RpcTrafficGovernor {
+    fn default() -> Self {
+        Self::new(RpcTrafficGovernorConfig::default())
+    }
+}
+
+impl RpcTrafficGovernor {
+    pub fn new(config: RpcTrafficGovernorConfig) -> Self {
+        Self {
+            sessiondict: Arc::new(ServiceTrafficGovernor::new(
+                RpcServiceKind::SessionDict,
+                config.sessiondict_max_in_flight,
+                config.retry_after_ms,
+            )),
+            dist: Arc::new(ServiceTrafficGovernor::new(
+                RpcServiceKind::Dist,
+                config.dist_max_in_flight,
+                config.retry_after_ms,
+            )),
+            inbox: Arc::new(ServiceTrafficGovernor::new(
+                RpcServiceKind::Inbox,
+                config.inbox_max_in_flight,
+                config.retry_after_ms,
+            )),
+            retain: Arc::new(ServiceTrafficGovernor::new(
+                RpcServiceKind::Retain,
+                config.retain_max_in_flight,
+                config.retry_after_ms,
+            )),
+            metadata: Arc::new(ServiceTrafficGovernor::new(
+                RpcServiceKind::Metadata,
+                config.metadata_max_in_flight,
+                config.retry_after_ms,
+            )),
+            kvrange: Arc::new(ServiceTrafficGovernor::new(
+                RpcServiceKind::KvRange,
+                config.kvrange_max_in_flight,
+                config.retry_after_ms,
+            )),
+            rangecontrol: Arc::new(ServiceTrafficGovernor::new(
+                RpcServiceKind::RangeControl,
+                config.rangecontrol_max_in_flight,
+                config.retry_after_ms,
+            )),
+        }
+    }
+
+    pub fn service(&self, kind: RpcServiceKind) -> Arc<ServiceTrafficGovernor> {
+        match kind {
+            RpcServiceKind::SessionDict => self.sessiondict.clone(),
+            RpcServiceKind::Dist => self.dist.clone(),
+            RpcServiceKind::Inbox => self.inbox.clone(),
+            RpcServiceKind::Retain => self.retain.clone(),
+            RpcServiceKind::Metadata => self.metadata.clone(),
+            RpcServiceKind::KvRange => self.kvrange.clone(),
+            RpcServiceKind::RangeControl => self.rangecontrol.clone(),
+        }
+    }
+
+    pub fn snapshots(&self) -> Vec<RpcServiceLoadSnapshot> {
+        [
+            self.sessiondict.snapshot(),
+            self.dist.snapshot(),
+            self.inbox.snapshot(),
+            self.retain.snapshot(),
+            self.metadata.snapshot(),
+            self.kvrange.snapshot(),
+            self.rangecontrol.snapshot(),
+        ]
+        .to_vec()
+    }
+}
+
+#[derive(Debug)]
+pub struct ServiceTrafficGovernor {
+    service: RpcServiceKind,
+    max_in_flight: usize,
+    retry_after_ms: u64,
+    permits: Arc<Semaphore>,
+    current_in_flight: AtomicUsize,
+    overload_count: AtomicU64,
+    last_overload_ms: AtomicU64,
+}
+
+impl ServiceTrafficGovernor {
+    fn new(service: RpcServiceKind, max_in_flight: usize, retry_after_ms: u64) -> Self {
+        Self {
+            service,
+            max_in_flight,
+            retry_after_ms,
+            permits: Arc::new(Semaphore::new(max_in_flight)),
+            current_in_flight: AtomicUsize::new(0),
+            overload_count: AtomicU64::new(0),
+            last_overload_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<ServiceTrafficPermit> {
+        let permit = self.permits.clone().try_acquire_owned().ok()?;
+        self.current_in_flight.fetch_add(1, Ordering::SeqCst);
+        Some(ServiceTrafficPermit {
+            governor: self.clone(),
+            permit,
+        })
+    }
+
+    fn record_overload(&self) {
+        self.overload_count.fetch_add(1, Ordering::SeqCst);
+        self.last_overload_ms
+            .store(current_time_ms(), Ordering::SeqCst);
+    }
+
+    fn snapshot(&self) -> RpcServiceLoadSnapshot {
+        let last_overload_ms = self.last_overload_ms.load(Ordering::SeqCst);
+        RpcServiceLoadSnapshot {
+            service: self.service.as_str(),
+            current_in_flight: self.current_in_flight.load(Ordering::SeqCst),
+            max_in_flight: self.max_in_flight,
+            overload_count: self.overload_count.load(Ordering::SeqCst),
+            retry_after_ms: self.retry_after_ms,
+            last_overload_ms: (last_overload_ms != 0).then_some(last_overload_ms),
+        }
+    }
+}
+
+struct ServiceTrafficPermit {
+    governor: Arc<ServiceTrafficGovernor>,
+    permit: OwnedSemaphorePermit,
+}
+
+impl Drop for ServiceTrafficPermit {
+    fn drop(&mut self) {
+        let _ = &self.permit;
+        self.governor
+            .current_in_flight
+            .fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 #[derive(Clone)]
@@ -168,6 +560,8 @@ pub struct RoutedRangeControlTarget {
 pub struct RoutedRangeControlGrpcClient {
     metadata: MetadataGrpcClient,
     fallback_endpoint: String,
+    endpoint_backoff: Arc<Mutex<HashMap<String, Instant>>>,
+    overload_backoff: Duration,
 }
 
 #[derive(Clone, Default)]
@@ -311,6 +705,7 @@ struct DistRpc {
 struct InboxRpc {
     inner: Arc<dyn InboxService>,
     assignment_registry: Option<Arc<dyn MetadataRegistry>>,
+    lwt_sink: Option<Arc<dyn DelayedLwtSink>>,
 }
 
 #[derive(Clone)]
@@ -388,9 +783,7 @@ fn to_proto_replica_lag(replica: &ReplicaLagSnapshot) -> ReplicaLagRecord {
     }
 }
 
-fn to_proto_reconfiguration(
-    state: &RangeReconfigurationState,
-) -> RangeReconfigurationRecord {
+fn to_proto_reconfiguration(state: &RangeReconfigurationState) -> RangeReconfigurationRecord {
     let (phase, has_phase) = match &state.phase {
         Some(ReconfigurationPhase::StagingLearners) => ("staging_learners".to_string(), true),
         Some(ReconfigurationPhase::JointConsensus) => ("joint_consensus".to_string(), true),
@@ -700,11 +1093,10 @@ async fn validate_snapshot_assignment(
     Ok(())
 }
 
-
-mod registry_impls;
-mod clients;
-mod runtime;
 mod client_traits;
+mod clients;
+mod registry_impls;
+mod runtime;
 mod service_impls;
 
 pub(crate) use service_impls::internal_status;

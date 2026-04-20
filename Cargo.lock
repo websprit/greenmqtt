@@ -774,6 +774,7 @@ dependencies = [
  "greenmqtt-dist",
  "greenmqtt-http-api",
  "greenmqtt-inbox",
+ "greenmqtt-kv-balance",
  "greenmqtt-kv-client",
  "greenmqtt-kv-engine",
  "greenmqtt-kv-raft",
@@ -962,6 +963,7 @@ name = "greenmqtt-proto"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bincode",
  "bytes",
  "greenmqtt-core",
  "greenmqtt-kv-engine",
@@ -1015,6 +1017,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tonic",
+ "tower",
 ]
 
 [[package]]

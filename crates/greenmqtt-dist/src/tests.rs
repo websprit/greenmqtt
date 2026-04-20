@@ -1,25 +1,24 @@
 use crate::dist::{
-    dist_route_shard, dist_tenant_shard, insert_tenant_route, DistBalanceAction,
-    DistBalancePolicy, DistDeliveryReport, DistDeliverySink, DistFanoutRequest, DistFanoutWorker,
-    DistHandle, DistMaintenanceWorker, DistRouter, DistTenantStats, PersistentDistHandle,
-    ReplicatedDistHandle, TenantRoutes, ThresholdDistBalancePolicy,
+    dist_route_shard, dist_tenant_shard, insert_tenant_route, DistBalanceAction, DistBalancePolicy,
+    DistDeliveryReport, DistDeliverySink, DistFanoutRequest, DistFanoutWorker, DistHandle,
+    DistMaintenanceWorker, DistRouter, DistTenantStats, PersistentDistHandle, ReplicatedDistHandle,
+    TenantRoutes, ThresholdDistBalancePolicy,
 };
 use crate::trie::select_routes;
 use async_trait::async_trait;
 use bytes::Bytes;
 use greenmqtt_core::{
-    PublishProperties, PublishRequest, RangeBoundary, RangeReplica, ReplicaRole,
-    ReplicaSyncState, ReplicatedRangeDescriptor, RouteRecord, ServiceShardKey,
-    ServiceShardLifecycle, SessionKind,
+    PublishProperties, PublishRequest, RangeBoundary, RangeReplica, ReplicaRole, ReplicaSyncState,
+    ReplicatedRangeDescriptor, RouteRecord, ServiceShardKey, ServiceShardLifecycle, SessionKind,
 };
 use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter, MemoryKvRangeRouter};
 use greenmqtt_kv_engine::{
     KvEngine, KvMutation, KvRangeBootstrap, KvRangeCheckpoint, KvRangeSnapshot, MemoryKvEngine,
 };
 use greenmqtt_storage::{MemoryRouteStore, RouteStore};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 #[derive(Clone)]
@@ -130,14 +129,11 @@ impl DistDeliverySink for RecordingDistSink {
         fanout: &DistFanoutRequest,
         routes: &[RouteRecord],
     ) -> anyhow::Result<DistDeliveryReport> {
-        self.deliveries
-            .lock()
-            .expect("sink poisoned")
-            .push((
-                tenant_id.to_string(),
-                fanout.request.topic.clone(),
-                routes.len(),
-            ));
+        self.deliveries.lock().expect("sink poisoned").push((
+            tenant_id.to_string(),
+            fanout.request.topic.clone(),
+            routes.len(),
+        ));
         Ok(DistDeliveryReport {
             online_deliveries: routes.len(),
             offline_enqueues: 0,
@@ -495,7 +491,7 @@ async fn dist_handle_session_topic_shared_lookup_and_remove_use_exact_index() {
         dist.list_session_topic_filter_routes("s1", "devices/+/state")
             .await
             .unwrap()
-        .len(),
+            .len(),
         1
     );
 }

@@ -3,7 +3,6 @@ use bytes::Bytes;
 use greenmqtt_core::{NodeId, RangeId, RangeReplica, ReplicaRole};
 use serde::{Deserialize, Serialize};
 
-
 pub type Term = u64;
 pub type LogIndex = u64;
 
@@ -45,6 +44,8 @@ impl RaftClusterConfig {
 pub struct RaftLogEntry {
     pub term: Term,
     pub index: LogIndex,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_change: Option<RaftConfigLogEntry>,
     pub command: Bytes,
 }
 
@@ -137,7 +138,26 @@ pub struct RaftConfigTransitionState {
     pub old_config: RaftClusterConfig,
     pub joint_config: RaftClusterConfig,
     pub final_config: RaftClusterConfig,
+    #[serde(default)]
+    pub joint_config_index: LogIndex,
+    #[serde(default)]
+    pub target_config_index: LogIndex,
     pub phase: RaftConfigTransitionPhase,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RaftConfigLogEntry {
+    JointConfig {
+        old_config: RaftClusterConfig,
+        joint_config: RaftClusterConfig,
+        final_config: RaftClusterConfig,
+    },
+    TargetConfig {
+        old_config: RaftClusterConfig,
+        joint_config: RaftClusterConfig,
+        final_config: RaftClusterConfig,
+        joint_config_index: LogIndex,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

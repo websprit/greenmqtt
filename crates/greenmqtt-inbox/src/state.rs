@@ -137,7 +137,8 @@ pub(crate) fn remove_cached_offline_message(
     message: &OfflineMessage,
 ) -> bool {
     let mut removed = false;
-    let remove_session = if let Some(messages) = state.offline_messages.get_mut(&message.session_id) {
+    let remove_session = if let Some(messages) = state.offline_messages.get_mut(&message.session_id)
+    {
         let before = messages.len();
         messages.retain(|current| !offline_message_matches(current, message));
         removed = messages.len() != before;
@@ -179,7 +180,10 @@ pub(crate) fn remove_cached_inflight_message(
     if remove_session {
         state.inflight_messages.remove(&message.session_id);
     }
-    let remove_tenant = if let Some(messages) = state.inflight_messages_by_tenant.get_mut(&message.tenant_id) {
+    let remove_tenant = if let Some(messages) = state
+        .inflight_messages_by_tenant
+        .get_mut(&message.tenant_id)
+    {
         messages.retain(|current| {
             !(current.session_id == message.session_id && current.packet_id == message.packet_id)
         });

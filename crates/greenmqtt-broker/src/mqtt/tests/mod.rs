@@ -14,8 +14,8 @@ pub(super) use crate::mqtt::{
 pub(super) use crate::{BrokerConfig, BrokerRuntime, DefaultBroker};
 pub(super) use futures_util::{SinkExt, StreamExt};
 pub(super) use greenmqtt_core::{
-    ClientIdentity, ConnectRequest, InflightMessage, PublishProperties, SessionKind,
-    SessionRecord, UserProperty,
+    ClientIdentity, ConnectRequest, InflightMessage, PublishProperties, SessionKind, SessionRecord,
+    UserProperty,
 };
 pub(super) use greenmqtt_dist::{DistHandle, PersistentDistHandle};
 pub(super) use greenmqtt_inbox::PersistentInboxHandle;

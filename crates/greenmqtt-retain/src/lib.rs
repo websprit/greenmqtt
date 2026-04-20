@@ -26,6 +26,39 @@ pub trait RetainService: Send + Sync {
     async fn retained_count(&self) -> anyhow::Result<usize>;
 }
 
+pub async fn retain_expire_all(
+    retain: &dyn RetainService,
+    tenant_id: &str,
+) -> anyhow::Result<usize> {
+    let retained = retain.list_tenant_retained(tenant_id).await?;
+    let removed = retained.len();
+    for message in retained {
+        retain
+            .retain(RetainedMessage {
+                tenant_id: message.tenant_id,
+                topic: message.topic,
+                payload: Vec::new().into(),
+                qos: 0,
+            })
+            .await?;
+    }
+    Ok(removed)
+}
+
+pub async fn retain_tenant_gc_preview(
+    retain: &dyn RetainService,
+    tenant_id: &str,
+) -> anyhow::Result<usize> {
+    Ok(retain.list_tenant_retained(tenant_id).await?.len())
+}
+
+pub async fn retain_tenant_gc_run(
+    retain: &dyn RetainService,
+    tenant_id: &str,
+) -> anyhow::Result<usize> {
+    retain_tenant_gc_preview(retain, tenant_id).await
+}
+
 #[derive(Clone, Default)]
 pub struct RetainHandle {
     inner: Arc<RwLock<RetainState>>,
@@ -542,7 +575,10 @@ impl RetainService for ReplicatedRetainHandle {
         self.filter_cache
             .write()
             .expect("retain cache poisoned")
-            .insert((tenant_id.to_string(), topic_filter.to_string()), matched.clone());
+            .insert(
+                (tenant_id.to_string(), topic_filter.to_string()),
+                matched.clone(),
+            );
         Ok(matched)
     }
 
@@ -569,13 +605,17 @@ pub struct RetainTenantStats {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RetainBalanceAction {
-    SplitTenantRange { tenant_id: String },
+    SplitTenantRange {
+        tenant_id: String,
+    },
     ScaleTenantReplicas {
         tenant_id: String,
         voters: usize,
         learners: usize,
     },
-    RunTenantCleanup { tenant_id: String },
+    RunTenantCleanup {
+        tenant_id: String,
+    },
 }
 
 pub trait RetainBalancePolicy: Send + Sync {
@@ -1848,7 +1888,10 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let matched = retain.match_topic("t-load", "devices/+/state").await.unwrap();
+        let matched = retain
+            .match_topic("t-load", "devices/+/state")
+            .await
+            .unwrap();
         assert_eq!(matched.len(), 256);
     }
 }

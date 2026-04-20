@@ -164,13 +164,22 @@ impl MemoryRaftNode {
             return;
         }
         let majority_index = if let Some(transition) = state.config_transition.as_ref() {
-            Self::joint_majority_commit_index(state, transition)
+            if state.commit_index < transition.joint_config_index {
+                Self::majority_match_index(state, &transition.old_config.voters)
+            } else if transition.target_config_index > 0
+                && state.commit_index >= transition.target_config_index
+            {
+                Self::majority_match_index(state, &transition.final_config.voters)
+            } else {
+                Self::joint_majority_commit_index(state, transition)
+            }
         } else {
             Self::majority_match_index(state, &state.cluster_config.voters)
         };
         if majority_index > state.commit_index {
             let previous_commit = state.commit_index;
             state.commit_index = majority_index;
+            Self::apply_committed_config_entries(state, previous_commit);
             Self::enqueue_newly_committed_entries(state, previous_commit);
         }
     }
@@ -261,6 +270,124 @@ impl MemoryRaftNode {
                 continue;
             }
             state.committed_queue.push_back(entry.clone());
+        }
+    }
+
+    fn apply_committed_config_entries(state: &mut MemoryRaftState, previous_commit: LogIndex) {
+        let committed_entries = state
+            .log
+            .iter()
+            .filter(|entry| entry.index > previous_commit && entry.index <= state.commit_index)
+            .cloned()
+            .collect::<Vec<_>>();
+        for entry in committed_entries {
+            let Some(config_change) = entry.config_change else {
+                continue;
+            };
+            match config_change {
+                RaftConfigLogEntry::JointConfig {
+                    old_config,
+                    joint_config,
+                    final_config,
+                } => {
+                    state.cluster_config = joint_config.clone();
+                    let target_config_index = state
+                        .config_transition
+                        .as_ref()
+                        .map(|transition| transition.target_config_index)
+                        .unwrap_or(0);
+                    let phase = if target_config_index > 0 {
+                        RaftConfigTransitionPhase::Finalizing
+                    } else {
+                        RaftConfigTransitionPhase::JointConsensus
+                    };
+                    state.config_transition = Some(RaftConfigTransitionState {
+                        old_config,
+                        joint_config,
+                        final_config,
+                        joint_config_index: entry.index,
+                        target_config_index,
+                        phase,
+                    });
+                }
+                RaftConfigLogEntry::TargetConfig {
+                    old_config,
+                    joint_config,
+                    final_config,
+                    joint_config_index,
+                } => {
+                    state.cluster_config = final_config.clone();
+                    state.config_transition = Some(RaftConfigTransitionState {
+                        old_config,
+                        joint_config,
+                        final_config: final_config.clone(),
+                        joint_config_index,
+                        target_config_index: entry.index,
+                        phase: RaftConfigTransitionPhase::Finalizing,
+                    });
+                    if state
+                        .leader_node_id
+                        .is_some_and(|leader| !final_config.voters.contains(&leader))
+                    {
+                        state.leader_node_id = None;
+                        state.role = RaftNodeRole::Follower;
+                    }
+                }
+            }
+        }
+    }
+
+    fn rebuild_config_state_from_log(state: &mut MemoryRaftState) {
+        let committed_index = state.commit_index;
+        let applied_index = state.applied_index;
+        state.config_transition = None;
+        Self::apply_committed_config_entries(state, 0);
+        let pending_entries = state
+            .log
+            .iter()
+            .filter(|entry| entry.index > committed_index)
+            .cloned()
+            .collect::<Vec<_>>();
+        for entry in pending_entries {
+            let Some(config_change) = entry.config_change else {
+                continue;
+            };
+            match config_change {
+                RaftConfigLogEntry::JointConfig {
+                    old_config,
+                    joint_config,
+                    final_config,
+                } => {
+                    state.config_transition = Some(RaftConfigTransitionState {
+                        old_config,
+                        joint_config,
+                        final_config,
+                        joint_config_index: entry.index,
+                        target_config_index: 0,
+                        phase: RaftConfigTransitionPhase::JointConsensus,
+                    });
+                }
+                RaftConfigLogEntry::TargetConfig {
+                    old_config,
+                    joint_config,
+                    final_config,
+                    joint_config_index,
+                } => {
+                    state.config_transition = Some(RaftConfigTransitionState {
+                        old_config,
+                        joint_config,
+                        final_config,
+                        joint_config_index,
+                        target_config_index: entry.index,
+                        phase: RaftConfigTransitionPhase::Finalizing,
+                    });
+                }
+            }
+        }
+        if state.config_transition.as_ref().is_some_and(|transition| {
+            transition.target_config_index > 0 && applied_index >= transition.target_config_index
+        }) {
+            state.config_transition = None;
         }
     }
 
@@ -591,6 +718,7 @@ impl RaftNode for MemoryRaftNode {
                             state.commit_index = state
                                 .commit_index
                                 .max(request.leader_commit.min(Self::last_log_index(&state)));
+                            Self::apply_committed_config_entries(&mut state, previous_commit);
                             Self::enqueue_newly_committed_entries(&mut state, previous_commit);
                             let local_node_id = state.local_node_id;
                             let local_match = Self::last_log_index(&state).max(state.commit_index);
@@ -760,6 +888,7 @@ impl RaftNode for MemoryRaftNode {
             state.log.push(RaftLogEntry {
                 term: entry_term,
                 index: next_index,
+                config_change: None,
                 command,
             });
             let local_node_id = state.local_node_id;
@@ -863,36 +992,71 @@ impl RaftNode for MemoryRaftNode {
                         Self::config_caught_up_to_commit(&state, &joint_config),
                         "joint config is not caught up to commit index"
                     );
-                    state.cluster_config = joint_config.clone();
+                    let next_index = Self::last_log_index(&state).saturating_add(1);
+                    let entry_term = state.current_term.max(1);
+                    state.log.push(RaftLogEntry {
+                        term: entry_term,
+                        index: next_index,
+                        config_change: Some(RaftConfigLogEntry::JointConfig {
+                            old_config: old_config.clone(),
+                            joint_config: joint_config.clone(),
+                            final_config: final_config.clone(),
+                        }),
+                        command: Bytes::new(),
+                    });
                     state.config_transition = Some(RaftConfigTransitionState {
                         old_config,
                         joint_config,
                         final_config,
+                        joint_config_index: next_index,
+                        target_config_index: 0,
                         phase: RaftConfigTransitionPhase::JointConsensus,
                     });
+                    let local_node_id = state.local_node_id;
+                    state.match_indexes.insert(local_node_id, next_index);
+                    if Self::quorum_size(&state) == 1 {
+                        let previous_commit = state.commit_index;
+                        state.commit_index = next_index;
+                        Self::apply_committed_config_entries(&mut state, previous_commit);
+                        Self::enqueue_newly_committed_entries(&mut state, previous_commit);
+                    } else {
+                        Self::enqueue_replication_round(&mut state);
+                    }
                 }
                 RaftConfigChange::FinalizeJointConsensus => {
                     let transition = state
                         .config_transition
                         .clone()
                         .ok_or_else(|| anyhow::anyhow!("no joint consensus change in progress"))?;
+                    anyhow::ensure!(
+                        transition.target_config_index == 0,
+                        "target config entry already proposed"
+                    );
+                    anyhow::ensure!(
+                        state.commit_index >= transition.joint_config_index,
+                        "joint config entry must commit before finalizing"
+                    );
                     let required_index = Self::last_log_index(&state);
-                    anyhow::ensure!(
-                        Self::voter_quorum_caught_up_to_index(
-                            &state,
-                            &transition.old_config.voters,
-                            required_index,
-                        ),
-                        "old config has not satisfied dual-majority catch-up"
-                    );
-                    anyhow::ensure!(
-                        Self::voter_quorum_caught_up_to_index(
-                            &state,
-                            &transition.final_config.voters,
-                            required_index,
-                        ),
-                        "final config has not satisfied dual-majority catch-up"
-                    );
+                    let single_node_old_config = transition.old_config.voters.len() == 1
+                        && transition.old_config.voters.contains(&state.local_node_id);
+                    if !single_node_old_config {
+                        anyhow::ensure!(
+                            Self::voter_quorum_caught_up_to_index(
+                                &state,
+                                &transition.old_config.voters,
+                                required_index,
+                            ),
+                            "old config has not satisfied dual-majority catch-up"
+                        );
+                        anyhow::ensure!(
+                            Self::voter_quorum_caught_up_to_index(
+                                &state,
+                                &transition.final_config.voters,
+                                required_index,
+                            ),
+                            "final config has not satisfied dual-majority catch-up"
+                        );
+                    }
                     if state
                         .leader_node_id
                         .is_some_and(|leader| !transition.final_config.voters.contains(&leader))
@@ -901,16 +1065,38 @@ impl RaftNode for MemoryRaftNode {
                             "current leader must transfer before leaving the finalized voter set"
                         );
                     }
-                    state.cluster_config = transition.final_config;
-                    state.config_transition = None;
+                    let next_index = Self::last_log_index(&state).saturating_add(1);
+                    let entry_term = state.current_term.max(1);
+                    state.log.push(RaftLogEntry {
+                        term: entry_term,
+                        index: next_index,
+                        config_change: Some(RaftConfigLogEntry::TargetConfig {
+                            old_config: transition.old_config.clone(),
+                            joint_config: transition.joint_config.clone(),
+                            final_config: transition.final_config.clone(),
+                            joint_config_index: transition.joint_config_index,
+                        }),
+                        command: Bytes::new(),
+                    });
+                    state.config_transition = Some(RaftConfigTransitionState {
+                        old_config: transition.old_config,
+                        joint_config: transition.joint_config,
+                        final_config: transition.final_config,
+                        joint_config_index: transition.joint_config_index,
+                        target_config_index: next_index,
+                        phase: RaftConfigTransitionPhase::Finalizing,
+                    });
+                    let local_node_id = state.local_node_id;
+                    state.match_indexes.insert(local_node_id, next_index);
+                    if Self::quorum_size(&state) == 1 {
+                        let previous_commit = state.commit_index;
+                        state.commit_index = next_index;
+                        Self::apply_committed_config_entries(&mut state, previous_commit);
+                        Self::enqueue_newly_committed_entries(&mut state, previous_commit);
+                    } else {
+                        Self::enqueue_replication_round(&mut state);
+                    }
                 }
-            }
-            if state
-                .leader_node_id
-                .is_some_and(|leader| !state.cluster_config.voters.contains(&leader))
-            {
-                state.leader_node_id = None;
-                state.role = RaftNodeRole::Follower;
             }
             state.votes_granted.clear();
             state.leader_lease_ticks_remaining = 0;
@@ -965,6 +1151,7 @@ impl RaftNode for MemoryRaftNode {
                 state.config_transition = restored.config_transition;
                 state.log = restored.log;
                 state.latest_snapshot = restored.latest_snapshot;
+                Self::rebuild_config_state_from_log(&mut state);
             } else if let Some((snapshot_term, snapshot_index)) = state
                 .latest_snapshot
                 .as_ref()
@@ -1012,6 +1199,12 @@ impl RaftNode for MemoryRaftNode {
         let persisted = {
             let mut state = self.inner.lock().expect("raft state poisoned");
             state.applied_index = state.applied_index.max(up_to_index.min(state.commit_index));
+            if state.config_transition.as_ref().is_some_and(|transition| {
+                transition.target_config_index > 0
+                    && state.applied_index >= transition.target_config_index
+            }) {
+                state.config_transition = None;
+            }
             while state
                 .committed_queue
                 .front()

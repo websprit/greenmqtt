@@ -2,8 +2,9 @@ use crate::{
     DistGrpcClient, InboxGrpcClient, KvRangeGrpcClient, MetadataGrpcClient, MetadataPlaneLayout,
     NoopDeliverySink, PeriodicAntiEntropyReconciler, PersistentMetadataRegistry,
     RaftTransportGrpcClient, RangeAdminGrpcClient, RangeControlGrpcClient,
-    ReplicatedMetadataRegistry, RetainGrpcClient, RoutedRangeControlGrpcClient, RpcRuntime, SessionDictGrpcClient,
-    StaticPeerForwarder, StaticServiceEndpointRegistry,
+    ReplicatedMetadataRegistry, RetainGrpcClient, RoutedRangeControlGrpcClient, RpcGovernedService,
+    RpcRuntime, RpcServiceKind, RpcTrafficGovernor, RpcTrafficGovernorConfig,
+    SessionDictGrpcClient, StaticPeerForwarder, StaticServiceEndpointRegistry,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -11,16 +12,16 @@ use greenmqtt_broker::{BrokerConfig, BrokerRuntime, DefaultBroker, PeerRegistry}
 use greenmqtt_core::{
     BalancerState, BalancerStateRegistry, ClientIdentity, ClusterMembershipRegistry,
     ClusterNodeLifecycle, ClusterNodeMembership, ConnectRequest, InflightMessage, OfflineMessage,
-    PublishProperties, PublishRequest, RangeBoundary, RangeReconfigurationRegistry,
-    RangeReplica, ReconfigurationPhase, ReplicaRole, ReplicaSyncState, ReplicatedRangeDescriptor,
+    PublishProperties, PublishRequest, RangeBoundary, RangeReconfigurationRegistry, RangeReplica,
+    ReconfigurationPhase, ReplicaRole, ReplicaSyncState, ReplicatedRangeDescriptor,
     ReplicatedRangeRegistry, RetainedMessage, RouteRecord, ServiceEndpoint,
     ServiceEndpointRegistry, ServiceKind, ServiceShardAssignment, ServiceShardKey,
-    ServiceShardKind, ServiceShardLifecycle, ServiceShardRecoveryControl,
-    ServiceShardTransition, SessionKind, SessionRecord, Subscription,
+    ServiceShardKind, ServiceShardLifecycle, ServiceShardRecoveryControl, ServiceShardTransition,
+    SessionKind, SessionRecord, Subscription,
 };
 use greenmqtt_dist::{DistHandle, DistRouter};
 use greenmqtt_inbox::PersistentInboxHandle;
-use greenmqtt_inbox::{InboxHandle, InboxService};
+use greenmqtt_inbox::{DelayedLwtPublish, DelayedLwtSink, InboxHandle, InboxService};
 use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter, MemoryKvRangeRouter};
 use greenmqtt_kv_engine::{
     KvEngine, KvMutation, KvRangeBootstrap, KvRangeSpace, MemoryKvEngine, RocksDbKvEngine,
@@ -51,13 +52,57 @@ use greenmqtt_storage::{
     MemoryInboxStore, MemoryInflightStore, MemorySessionStore, MemorySubscriptionStore,
 };
 use std::collections::BTreeMap;
-use std::sync::Arc;
-use tokio::sync::watch;
+use std::convert::Infallible;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use tokio::sync::{watch, Notify};
 use tokio::time::{sleep, Duration};
+use tower::Service;
 
 #[derive(Clone)]
 struct TestRangeLifecycleManager {
     engine: MemoryKvEngine,
+}
+
+fn tonic_status(error: &anyhow::Error) -> &tonic::Status {
+    error
+        .downcast_ref::<tonic::Status>()
+        .expect("expected tonic status")
+}
+
+#[derive(Clone)]
+struct BlockingGrpcService {
+    started: Arc<Notify>,
+    release: watch::Receiver<bool>,
+}
+
+impl Service<tonic::codegen::http::Request<()>> for BlockingGrpcService {
+    type Response = tonic::codegen::http::Response<tonic::body::Body>;
+    type Error = Infallible;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _req: tonic::codegen::http::Request<()>) -> Self::Future {
+        self.started.notify_one();
+        let mut release = self.release.clone();
+        Box::pin(async move {
+            while !*release.borrow() {
+                let _ = release.changed().await;
+            }
+            Ok(tonic::codegen::http::Response::builder()
+                .status(tonic::codegen::http::StatusCode::OK)
+                .body(tonic::body::Body::empty())
+                .unwrap())
+        })
+    }
 }
 
 #[async_trait]
@@ -98,6 +143,22 @@ struct ReconnectingDistClient {
     current: DistGrpcClient,
 }
 
+#[derive(Clone, Default)]
+struct RecordingLwtSink {
+    publishes: Arc<Mutex<Vec<DelayedLwtPublish>>>,
+}
+
+#[async_trait]
+impl DelayedLwtSink for RecordingLwtSink {
+    async fn send_lwt(&self, publish: &DelayedLwtPublish) -> anyhow::Result<()> {
+        self.publishes
+            .lock()
+            .expect("lwt sink poisoned")
+            .push(publish.clone());
+        Ok(())
+    }
+}
+
 impl ReconnectingDistClient {
     async fn connect(
         registry: Arc<StaticServiceEndpointRegistry>,
@@ -133,7 +194,201 @@ fn state_runtime() -> RpcRuntime {
         assignment_registry: None,
         range_host: None,
         range_runtime: None,
+        inbox_lwt_sink: None,
     }
+}
+
+#[tokio::test]
+async fn rpc_governor_caps_in_flight_dist_calls() {
+    let (release_tx, release_rx) = watch::channel(false);
+    let started = Arc::new(Notify::new());
+    let governor = Arc::new(RpcTrafficGovernor::new(RpcTrafficGovernorConfig {
+        dist_max_in_flight: 1,
+        retry_after_ms: 75,
+        ..RpcTrafficGovernorConfig::default()
+    }));
+    let service = RpcGovernedService::new(
+        BlockingGrpcService {
+            started: started.clone(),
+            release: release_rx,
+        },
+        governor.service(RpcServiceKind::Dist),
+    );
+    let first = {
+        let mut service = service.clone();
+        tokio::spawn(async move {
+            service
+                .call(tonic::codegen::http::Request::new(()))
+                .await
+                .unwrap()
+        })
+    };
+    started.notified().await;
+    sleep(Duration::from_millis(20)).await;
+
+    let snapshots = governor.snapshots();
+    let dist = snapshots
+        .into_iter()
+        .find(|snapshot| snapshot.service == "dist")
+        .unwrap();
+    assert_eq!(dist.current_in_flight, 1);
+    assert_eq!(dist.max_in_flight, 1);
+
+    let mut service = service;
+    let overloaded = service
+        .call(tonic::codegen::http::Request::new(()))
+        .await
+        .unwrap();
+    assert_eq!(
+        overloaded
+            .headers()
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok()),
+        Some("8")
+    );
+
+    release_tx.send(true).unwrap();
+    let _ = first.await.unwrap();
+}
+
+#[tokio::test]
+async fn rpc_governor_returns_structured_retryable_overload_status() {
+    let bind = "127.0.0.1:50121".parse().unwrap();
+    let governor = Arc::new(RpcTrafficGovernor::new(RpcTrafficGovernorConfig {
+        dist_max_in_flight: 0,
+        retry_after_ms: 123,
+        ..RpcTrafficGovernorConfig::default()
+    }));
+    let server = tokio::spawn(state_runtime().serve_with_governor(bind, governor.clone()));
+    sleep(Duration::from_millis(50)).await;
+
+    let client = DistGrpcClient::connect("http://127.0.0.1:50121")
+        .await
+        .unwrap();
+    let error = client.list_routes(Some("t1")).await.unwrap_err();
+    let status = tonic_status(&error);
+    assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+    assert!(status.message().contains("rpc/overloaded"));
+    assert_eq!(
+        status
+            .metadata()
+            .get("x-greenmqtt-service")
+            .and_then(|value| value.to_str().ok()),
+        Some("dist")
+    );
+    assert_eq!(
+        status
+            .metadata()
+            .get("x-greenmqtt-retry-after-ms")
+            .and_then(|value| value.to_str().ok()),
+        Some("123")
+    );
+    let dist = governor
+        .snapshots()
+        .into_iter()
+        .find(|snapshot| snapshot.service == "dist")
+        .unwrap();
+    assert_eq!(dist.overload_count, 1);
+    assert_eq!(dist.retry_after_ms, 123);
+    server.abort();
+}
+
+#[tokio::test]
+async fn routed_range_control_client_backs_off_from_overloaded_endpoint() {
+    let registry = Arc::new(StaticServiceEndpointRegistry::default());
+    let metadata_bind = "127.0.0.1:50122".parse().unwrap();
+    let node_bind = "127.0.0.1:50123".parse().unwrap();
+    let metadata_server = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: Some(registry.clone()),
+            range_host: None,
+            range_runtime: None,
+            inbox_lwt_sink: None,
+        }
+        .serve(metadata_bind),
+    );
+    let node_server = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: Some(registry.clone()),
+            range_host: None,
+            range_runtime: None,
+            inbox_lwt_sink: None,
+        }
+        .serve_with_governor(
+            node_bind,
+            Arc::new(RpcTrafficGovernor::new(RpcTrafficGovernorConfig {
+                rangecontrol_max_in_flight: 0,
+                retry_after_ms: 250,
+                ..RpcTrafficGovernorConfig::default()
+            })),
+        ),
+    );
+    sleep(Duration::from_millis(50)).await;
+
+    registry
+        .upsert_member(ClusterNodeMembership::new(
+            7,
+            1,
+            ClusterNodeLifecycle::Serving,
+            vec![ServiceEndpoint::new(
+                ServiceKind::Retain,
+                7,
+                "http://127.0.0.1:50123",
+            )],
+        ))
+        .await
+        .unwrap();
+    registry
+        .upsert_range(ReplicatedRangeDescriptor::new(
+            "range-overloaded",
+            ServiceShardKey::retain("t1"),
+            RangeBoundary::full(),
+            1,
+            1,
+            Some(7),
+            vec![RangeReplica::new(
+                7,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ))
+        .await
+        .unwrap();
+
+    let client = RoutedRangeControlGrpcClient::connect_with_backoff(
+        "http://127.0.0.1:50122",
+        "http://127.0.0.1:50123",
+        Duration::from_millis(250),
+    )
+    .await
+    .unwrap();
+    let first = client
+        .transfer_leadership("range-overloaded", 7)
+        .await
+        .unwrap_err();
+    assert_eq!(tonic_status(&first).code(), tonic::Code::ResourceExhausted);
+
+    let second = client
+        .transfer_leadership("range-overloaded", 7)
+        .await
+        .unwrap_err();
+    assert!(second.to_string().contains("rpc/endpoint-backed-off"));
+
+    metadata_server.abort();
+    node_server.abort();
 }
 
 #[tokio::test]
@@ -360,6 +615,154 @@ async fn grpc_round_trip_for_internal_services() {
 }
 
 #[tokio::test]
+async fn inbox_rpc_supports_delayed_lwt_dispatch() {
+    let bind = "127.0.0.1:50124".parse().unwrap();
+    let sink = Arc::new(RecordingLwtSink::default());
+    let server = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: None,
+            range_host: None,
+            range_runtime: None,
+            inbox_lwt_sink: Some(sink.clone()),
+        }
+        .serve(bind),
+    );
+    sleep(Duration::from_millis(50)).await;
+
+    let client = InboxGrpcClient::connect("http://127.0.0.1:50124")
+        .await
+        .unwrap();
+    client
+        .send_lwt(DelayedLwtPublish {
+            tenant_id: "demo".into(),
+            session_id: "s1".into(),
+            publish: PublishRequest {
+                topic: "devices/lwt".into(),
+                payload: b"bye".to_vec().into(),
+                qos: 1,
+                retain: false,
+                properties: PublishProperties::default(),
+            },
+        })
+        .await
+        .unwrap();
+
+    let publishes = sink.publishes.lock().expect("lwt sink poisoned");
+    assert_eq!(publishes.len(), 1);
+    assert_eq!(publishes[0].tenant_id, "demo");
+    assert_eq!(publishes[0].session_id, "s1");
+    server.abort();
+}
+
+#[tokio::test]
+async fn inbox_and_retain_rpc_support_tenant_expire_and_gc_operations() {
+    let bind = "127.0.0.1:50125".parse().unwrap();
+    let inbox = Arc::new(InboxHandle::default());
+    let retain = Arc::new(RetainHandle::default());
+    inbox
+        .subscribe(Subscription {
+            session_id: "s1".into(),
+            tenant_id: "demo".into(),
+            topic_filter: "devices/+/state".into(),
+            qos: 1,
+            subscription_identifier: None,
+            no_local: false,
+            retain_as_published: false,
+            retain_handling: 0,
+            shared_group: None,
+            kind: SessionKind::Persistent,
+        })
+        .await
+        .unwrap();
+    inbox
+        .enqueue(OfflineMessage {
+            tenant_id: "demo".into(),
+            session_id: "s1".into(),
+            topic: "devices/d1/state".into(),
+            payload: b"stale".to_vec().into(),
+            qos: 1,
+            retain: false,
+            from_session_id: "src".into(),
+            properties: PublishProperties {
+                message_expiry_interval_secs: Some(1),
+                stored_at_ms: Some(1),
+                ..PublishProperties::default()
+            },
+        })
+        .await
+        .unwrap();
+    inbox
+        .stage_inflight(InflightMessage {
+            tenant_id: "demo".into(),
+            session_id: "s1".into(),
+            packet_id: 1,
+            topic: "devices/d1/state".into(),
+            payload: b"stale".to_vec().into(),
+            qos: 1,
+            retain: false,
+            from_session_id: "src".into(),
+            properties: PublishProperties {
+                message_expiry_interval_secs: Some(1),
+                stored_at_ms: Some(1),
+                ..PublishProperties::default()
+            },
+            phase: greenmqtt_core::InflightPhase::Publish,
+        })
+        .await
+        .unwrap();
+    retain
+        .retain(RetainedMessage {
+            tenant_id: "demo".into(),
+            topic: "devices/d1/state".into(),
+            payload: b"retained".to_vec().into(),
+            qos: 1,
+        })
+        .await
+        .unwrap();
+
+    let server = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: inbox.clone(),
+            retain: retain.clone(),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: None,
+            range_host: None,
+            range_runtime: None,
+            inbox_lwt_sink: None,
+        }
+        .serve(bind),
+    );
+    sleep(Duration::from_millis(50)).await;
+
+    let inbox_client = InboxGrpcClient::connect("http://127.0.0.1:50125")
+        .await
+        .unwrap();
+    let preview = inbox_client.tenant_gc_preview("demo").await.unwrap();
+    assert_eq!(preview.subscriptions, 1);
+    assert_eq!(preview.offline_messages, 1);
+    assert_eq!(preview.inflight_messages, 1);
+
+    let expired = inbox_client.expire_all("demo", 5_000).await.unwrap();
+    assert_eq!(expired.offline_messages, 1);
+    assert_eq!(expired.inflight_messages, 1);
+
+    let retain_client = RetainGrpcClient::connect("http://127.0.0.1:50125")
+        .await
+        .unwrap();
+    assert_eq!(retain_client.tenant_gc_preview("demo").await.unwrap(), 1);
+    assert_eq!(retain_client.expire_all("demo").await.unwrap(), 1);
+    assert!(retain.match_topic("demo", "#").await.unwrap().is_empty());
+    server.abort();
+}
+
+#[tokio::test]
 async fn grpc_round_trip_for_session_online_check_surface() {
     let bind = "127.0.0.1:50111".parse().unwrap();
     let server = tokio::spawn(state_runtime().serve(bind));
@@ -426,6 +829,7 @@ async fn grpc_round_trip_for_metadata_service() {
             assignment_registry: Some(registry),
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind),
     );
@@ -551,12 +955,17 @@ async fn replicated_metadata_registry_round_trips_over_kv_range_service() {
             assignment_registry: None,
             range_host: Some(host),
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind),
     );
     sleep(Duration::from_millis(100)).await;
 
-    let executor = Arc::new(KvRangeGrpcClient::connect(format!("http://{bind}")).await.unwrap());
+    let executor = Arc::new(
+        KvRangeGrpcClient::connect(format!("http://{bind}"))
+            .await
+            .unwrap(),
+    );
     let registry = ReplicatedMetadataRegistry::new(executor, "__metadata");
     registry
         .upsert_member(ClusterNodeMembership::new(
@@ -602,7 +1011,11 @@ async fn replicated_metadata_registry_round_trips_over_kv_range_service() {
         .unwrap();
 
     assert!(registry.resolve_member(9).await.unwrap().is_some());
-    assert!(registry.resolve_range("meta-range-1").await.unwrap().is_some());
+    assert!(registry
+        .resolve_range("meta-range-1")
+        .await
+        .unwrap()
+        .is_some());
     assert!(registry
         .resolve_balancer_state("retain-balancer")
         .await
@@ -671,19 +1084,28 @@ async fn replicated_metadata_registry_shards_records_across_metadata_ranges() {
             assignment_registry: None,
             range_host: Some(host),
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind),
     );
     sleep(Duration::from_millis(100)).await;
 
-    let executor = Arc::new(KvRangeGrpcClient::connect(format!("http://{bind}")).await.unwrap());
+    let executor = Arc::new(
+        KvRangeGrpcClient::connect(format!("http://{bind}"))
+            .await
+            .unwrap(),
+    );
     let registry = ReplicatedMetadataRegistry::with_layout(executor, layout.clone());
     registry
         .upsert_member(ClusterNodeMembership::new(
             9,
             1,
             ClusterNodeLifecycle::Serving,
-            vec![ServiceEndpoint::new(ServiceKind::Retain, 9, format!("http://{bind}"))],
+            vec![ServiceEndpoint::new(
+                ServiceKind::Retain,
+                9,
+                format!("http://{bind}"),
+            )],
         ))
         .await
         .unwrap();
@@ -797,6 +1219,7 @@ async fn metadata_service_restores_members_and_ranges_after_restart() {
             )),
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind),
     );
@@ -855,6 +1278,7 @@ async fn metadata_service_restores_members_and_ranges_after_restart() {
             )),
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind),
     );
@@ -924,6 +1348,7 @@ async fn grpc_round_trip_for_kv_range_service() {
             assignment_registry: None,
             range_host: Some(host),
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind),
     );
@@ -1023,6 +1448,7 @@ async fn grpc_round_trip_for_kv_range_service_with_rocksdb_backend() {
             assignment_registry: None,
             range_host: Some(host),
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind),
     );
@@ -1114,6 +1540,7 @@ async fn kv_range_service_rejects_reads_from_follower_replica() {
             assignment_registry: None,
             range_host: Some(host),
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind),
     );
@@ -1204,6 +1631,7 @@ async fn kv_range_service_requires_leader_lease_for_reads() {
             assignment_registry: None,
             range_host: Some(host),
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind),
     );
@@ -1286,6 +1714,7 @@ async fn kv_range_service_rejects_stale_epoch_requests() {
             assignment_registry: None,
             range_host: Some(host),
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind),
     );
@@ -1359,6 +1788,7 @@ async fn kv_range_service_rejects_non_serving_range_requests() {
             assignment_registry: None,
             range_host: Some(host),
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind),
     );
@@ -1434,6 +1864,7 @@ async fn grpc_round_trip_for_raft_transport_service() {
             assignment_registry: None,
             range_host: Some(host),
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind),
     );
@@ -1454,6 +1885,7 @@ async fn grpc_round_trip_for_raft_transport_service() {
                 entries: vec![greenmqtt_kv_raft::RaftLogEntry {
                     term: 1,
                     index: 1,
+                    config_change: None,
                     command: b"put:a".as_slice().into(),
                 }],
                 leader_commit: 1,
@@ -1536,6 +1968,7 @@ async fn raft_transport_service_delivers_install_snapshot_messages() {
             assignment_registry: None,
             range_host: Some(host),
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind),
     );
@@ -1623,6 +2056,7 @@ async fn range_admin_service_reports_health_and_debug_dump() {
             assignment_registry: None,
             range_host: Some(host),
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind),
     );
@@ -1641,10 +2075,7 @@ async fn range_admin_service_reports_health_and_debug_dump() {
     let fetched = client.get_range_health("range-admin").await.unwrap();
     let fetched = fetched.health.unwrap();
     assert_eq!(fetched.range_id, "range-admin");
-    assert_eq!(
-        fetched.reconfiguration.unwrap().current_voters,
-        vec![1]
-    );
+    assert_eq!(fetched.reconfiguration.unwrap().current_voters, vec![1]);
     let dump = client.debug_dump().await.unwrap();
     assert!(dump.contains("range=range-admin"));
     assert!(dump.contains("current_voters=[1]"));
@@ -1680,6 +2111,7 @@ async fn grpc_round_trip_for_range_control_service() {
             assignment_registry: None,
             range_host: Some(host.clone()),
             range_runtime: Some(runtime.clone()),
+            inbox_lwt_sink: None,
         }
         .serve(bind),
     );
@@ -1765,6 +2197,7 @@ async fn range_control_service_is_idempotent_for_repeated_operator_commands() {
             assignment_registry: None,
             range_host: Some(host.clone()),
             range_runtime: Some(runtime.clone()),
+            inbox_lwt_sink: None,
         }
         .serve(bind),
     );
@@ -1799,8 +2232,14 @@ async fn range_control_service_is_idempotent_for_repeated_operator_commands() {
     client.recover_range("range-idem", 1).await.unwrap();
     client.recover_range("range-idem", 1).await.unwrap();
 
-    let (left, right) = client.split_range("range-idem", b"m".to_vec()).await.unwrap();
-    let (left_again, right_again) = client.split_range("range-idem", b"m".to_vec()).await.unwrap();
+    let (left, right) = client
+        .split_range("range-idem", b"m".to_vec())
+        .await
+        .unwrap();
+    let (left_again, right_again) = client
+        .split_range("range-idem", b"m".to_vec())
+        .await
+        .unwrap();
     assert_eq!((left_again, right_again), (left.clone(), right.clone()));
 
     let merged = client.merge_ranges(&left, &right).await.unwrap();
@@ -1878,6 +2317,7 @@ async fn range_control_service_persists_reconfiguration_state_into_metadata_regi
             assignment_registry: Some(registry.clone()),
             range_host: Some(host),
             range_runtime: Some(runtime.clone()),
+            inbox_lwt_sink: None,
         }
         .serve(bind),
     );
@@ -1969,13 +2409,18 @@ async fn multi_node_replicated_metadata_range_control_and_zombie_detection_work_
             assignment_registry: None,
             range_host: Some(metadata_host),
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(metadata_bind),
     );
     sleep(Duration::from_millis(50)).await;
 
     let metadata_registry = Arc::new(ReplicatedMetadataRegistry::with_layout(
-        Arc::new(KvRangeGrpcClient::connect(format!("http://{metadata_bind}")).await.unwrap()),
+        Arc::new(
+            KvRangeGrpcClient::connect(format!("http://{metadata_bind}"))
+                .await
+                .unwrap(),
+        ),
         layout.clone(),
     ));
 
@@ -2056,6 +2501,7 @@ async fn multi_node_replicated_metadata_range_control_and_zombie_detection_work_
             assignment_registry: Some(metadata_registry.clone()),
             range_host: Some(node1_host),
             range_runtime: Some(node1_runtime.clone()),
+            inbox_lwt_sink: None,
         }
         .serve(node1_bind),
     );
@@ -2071,9 +2517,8 @@ async fn multi_node_replicated_metadata_range_control_and_zombie_detection_work_
         })
         .await
         .unwrap();
-    let zombie_space = Arc::<dyn KvRangeSpace>::from(
-        node2_engine.open_range("range-zombie-node2").await.unwrap(),
-    );
+    let zombie_space =
+        Arc::<dyn KvRangeSpace>::from(node2_engine.open_range("range-zombie-node2").await.unwrap());
     let zombie_raft = Arc::new(MemoryRaftNode::new(
         2,
         "range-zombie-node2",
@@ -2130,6 +2575,7 @@ async fn multi_node_replicated_metadata_range_control_and_zombie_detection_work_
             assignment_registry: Some(metadata_registry.clone()),
             range_host: Some(node2_host),
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(node2_bind),
     );
@@ -2181,6 +2627,7 @@ async fn routed_range_control_client_resolves_the_correct_node_from_metadata() {
             assignment_registry: Some(registry.clone()),
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(metadata_bind),
     );
@@ -2199,6 +2646,7 @@ async fn routed_range_control_client_resolves_the_correct_node_from_metadata() {
             assignment_registry: Some(registry.clone()),
             range_host: Some(Arc::new(MemoryKvRangeHost::default())),
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(node1_bind),
     );
@@ -2293,6 +2741,7 @@ async fn routed_range_control_client_resolves_the_correct_node_from_metadata() {
             assignment_registry: Some(registry.clone()),
             range_host: Some(node2_host),
             range_runtime: Some(node2_runtime.clone()),
+            inbox_lwt_sink: None,
         }
         .serve(node2_bind),
     );
@@ -2304,7 +2753,10 @@ async fn routed_range_control_client_resolves_the_correct_node_from_metadata() {
     )
     .await
     .unwrap();
-    let target = routed.resolve_range_target("range-route-node2").await.unwrap();
+    let target = routed
+        .resolve_range_target("range-route-node2")
+        .await
+        .unwrap();
     assert_eq!(target.node_id, 2);
     assert_eq!(target.endpoint, format!("http://{node2_bind}"));
 
@@ -2372,6 +2824,7 @@ async fn replicated_retain_can_use_kv_range_grpc_executor() {
             assignment_registry: None,
             range_host: Some(host),
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind),
     );
@@ -2580,6 +3033,7 @@ async fn brokers_forward_cross_node_deliveries_over_grpc() {
             assignment_registry: None,
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(peer_bind_1),
     );
@@ -2593,6 +3047,7 @@ async fn brokers_forward_cross_node_deliveries_over_grpc() {
             assignment_registry: None,
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(peer_bind_2),
     );
@@ -3385,6 +3840,7 @@ async fn move_tenant_shard_via_registry_transfers_routes_and_updates_owner() {
             assignment_registry: None,
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind1),
     );
@@ -3398,6 +3854,7 @@ async fn move_tenant_shard_via_registry_transfers_routes_and_updates_owner() {
             assignment_registry: None,
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind2),
     );
@@ -3501,6 +3958,7 @@ async fn move_sessiondict_shard_via_registry_transfers_sessions_and_updates_owne
             assignment_registry: None,
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind1),
     );
@@ -3514,6 +3972,7 @@ async fn move_sessiondict_shard_via_registry_transfers_sessions_and_updates_owne
             assignment_registry: None,
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind2),
     );
@@ -3620,6 +4079,7 @@ async fn move_inbox_shard_via_registry_transfers_subscription_offline_and_inflig
             assignment_registry: None,
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind1),
     );
@@ -3633,6 +4093,7 @@ async fn move_inbox_shard_via_registry_transfers_subscription_offline_and_inflig
             assignment_registry: None,
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind2),
     );
@@ -3784,6 +4245,7 @@ async fn move_inbox_shard_preserves_messages_at_least_once_during_concurrent_enq
             assignment_registry: None,
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind1),
     );
@@ -3797,6 +4259,7 @@ async fn move_inbox_shard_preserves_messages_at_least_once_during_concurrent_enq
             assignment_registry: None,
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind2),
     );
@@ -3925,6 +4388,7 @@ async fn move_inbox_shard_survives_source_restart_mid_transfer() {
             assignment_registry: None,
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind1),
     );
@@ -3938,6 +4402,7 @@ async fn move_inbox_shard_survives_source_restart_mid_transfer() {
             assignment_registry: None,
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind2),
     );
@@ -4053,6 +4518,7 @@ async fn catch_up_inbox_shard_via_registry_restores_state_and_verifies_checksum(
             assignment_registry: None,
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind1),
     );
@@ -4066,6 +4532,7 @@ async fn catch_up_inbox_shard_via_registry_restores_state_and_verifies_checksum(
             assignment_registry: None,
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind2),
     );
@@ -4195,6 +4662,7 @@ async fn catch_up_sessiondict_shard_state_survives_restart_via_storage() {
             assignment_registry: None,
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind1),
     );
@@ -4212,6 +4680,7 @@ async fn catch_up_sessiondict_shard_state_survives_restart_via_storage() {
             assignment_registry: None,
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind2),
     );
@@ -4315,6 +4784,7 @@ async fn catch_up_inbox_shard_state_survives_restart_via_storage() {
             assignment_registry: None,
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind1),
     );
@@ -4332,6 +4802,7 @@ async fn catch_up_inbox_shard_state_survives_restart_via_storage() {
             assignment_registry: None,
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind2),
     );
@@ -4472,6 +4943,7 @@ async fn catch_up_inbox_shard_survives_target_restart_mid_recovery() {
             assignment_registry: None,
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind1),
     );
@@ -4489,6 +4961,7 @@ async fn catch_up_inbox_shard_survives_target_restart_mid_recovery() {
             assignment_registry: None,
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind2),
     );
@@ -4587,6 +5060,7 @@ async fn catch_up_inbox_shard_survives_target_restart_mid_recovery() {
             assignment_registry: None,
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind2),
     );
@@ -4631,6 +5105,7 @@ async fn anti_entropy_repair_tenant_shard_via_registry_reconciles_target_routes(
             assignment_registry: None,
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind1),
     );
@@ -4644,6 +5119,7 @@ async fn anti_entropy_repair_tenant_shard_via_registry_reconciles_target_routes(
             assignment_registry: None,
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind2),
     );
@@ -4843,6 +5319,7 @@ async fn stream_shard_snapshot_with_stale_fencing_is_rejected_by_service() {
             assignment_registry: Some(registry),
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind),
     );
@@ -4881,6 +5358,7 @@ async fn shard_fencing_reject_can_be_retried_with_current_assignment() {
             assignment_registry: Some(registry.clone()),
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind1),
     );
@@ -4894,6 +5372,7 @@ async fn shard_fencing_reject_can_be_retried_with_current_assignment() {
             assignment_registry: Some(registry.clone()),
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind2),
     );
@@ -5081,6 +5560,7 @@ async fn shard_aware_client_reconnects_to_new_owner_after_failover() {
             assignment_registry: Some(registry.clone()),
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind1),
     );
@@ -5094,6 +5574,7 @@ async fn shard_aware_client_reconnects_to_new_owner_after_failover() {
             assignment_registry: Some(registry.clone()),
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind2),
     );
@@ -5188,6 +5669,7 @@ async fn network_partition_does_not_allow_dual_shard_owner() {
             assignment_registry: Some(registry.clone()),
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind1),
     );
@@ -5201,6 +5683,7 @@ async fn network_partition_does_not_allow_dual_shard_owner() {
             assignment_registry: Some(registry.clone()),
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind2),
     );
@@ -5310,6 +5793,7 @@ async fn periodic_anti_entropy_reconciles_dist_replica_checksum() {
             assignment_registry: Some(registry.clone()),
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind1),
     );
@@ -5323,6 +5807,7 @@ async fn periodic_anti_entropy_reconciles_dist_replica_checksum() {
             assignment_registry: Some(registry.clone()),
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind2),
     );
@@ -5441,6 +5926,7 @@ async fn anti_entropy_dist_replica_converges_under_concurrent_write() {
             assignment_registry: Some(registry.clone()),
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind1),
     );
@@ -5454,6 +5940,7 @@ async fn anti_entropy_dist_replica_converges_under_concurrent_write() {
             assignment_registry: Some(registry.clone()),
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind2),
     );
@@ -5569,6 +6056,7 @@ async fn periodic_anti_entropy_reconciles_sessiondict_replica_checksum() {
             assignment_registry: Some(registry.clone()),
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind1),
     );
@@ -5582,6 +6070,7 @@ async fn periodic_anti_entropy_reconciles_sessiondict_replica_checksum() {
             assignment_registry: Some(registry.clone()),
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind2),
     );
@@ -5702,6 +6191,7 @@ async fn periodic_anti_entropy_reconciles_inbox_replica_checksum() {
             assignment_registry: Some(registry.clone()),
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind1),
     );
@@ -5715,6 +6205,7 @@ async fn periodic_anti_entropy_reconciles_inbox_replica_checksum() {
             assignment_registry: Some(registry.clone()),
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind2),
     );
@@ -5892,6 +6383,7 @@ async fn periodic_anti_entropy_reconciles_retain_replica_checksum() {
             assignment_registry: Some(registry.clone()),
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind1),
     );
@@ -5905,6 +6397,7 @@ async fn periodic_anti_entropy_reconciles_retain_replica_checksum() {
             assignment_registry: Some(registry.clone()),
             range_host: None,
             range_runtime: None,
+            inbox_lwt_sink: None,
         }
         .serve(bind2),
     );

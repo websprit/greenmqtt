@@ -1,11 +1,13 @@
 use super::*;
-use axum::http::Request;
 use async_trait::async_trait;
+use axum::http::Request;
 use greenmqtt_core::{
+    ControlCommandExecutionState, ControlCommandRecord, ControlCommandReflectionState,
     RangeBoundary, RangeReplica, ReplicaRole, ReplicaSyncState, ReplicatedRangeDescriptor,
 };
 use greenmqtt_kv_server::{KvRangeHost, ReplicaTransport};
 use serde_json::json;
+use std::collections::BTreeMap;
 
 #[derive(Clone, Default)]
 struct NoopTransport;
@@ -240,9 +242,11 @@ async fn http_range_control_can_change_replicas_split_merge_and_list_zombies() {
 
     let response = app
         .oneshot(
-            Request::get(format!("/v1/ranges?lifecycle=draining&range_id_prefix={merged_range_id}"))
-                .body(Body::empty())
-                .unwrap(),
+            Request::get(format!(
+                "/v1/ranges?lifecycle=draining&range_id_prefix={merged_range_id}"
+            ))
+            .body(Body::empty())
+            .unwrap(),
         )
         .await
         .unwrap();
@@ -250,7 +254,189 @@ async fn http_range_control_can_change_replicas_split_merge_and_list_zombies() {
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let draining: Vec<greenmqtt_kv_server::RangeHealthSnapshot> =
         serde_json::from_slice(&body).unwrap();
-    assert!(draining.iter().any(|entry| entry.range_id == merged_range_id));
+    assert!(draining
+        .iter()
+        .any(|entry| entry.range_id == merged_range_id));
+}
+
+#[tokio::test]
+async fn http_range_get_and_action_reply_include_mode_and_command_id() {
+    let broker = broker();
+    let engine = MemoryKvEngine::default();
+    let host = Arc::new(MemoryKvRangeHost::default());
+    let runtime = Arc::new(ReplicaRuntime::with_config(
+        host.clone(),
+        Arc::new(NoopTransport),
+        Some(Arc::new(TestRangeLifecycleManager { engine })),
+        std::time::Duration::from_secs(1),
+        64,
+        64,
+        64,
+    ));
+    let registry = Arc::new(TestShardRegistry::default());
+    let app = HttpApi::router_with_peers_shards_metrics_and_ranges(
+        broker.clone(),
+        None,
+        None,
+        Some(registry.clone()),
+        Some(runtime.clone()),
+        None,
+    );
+
+    runtime
+        .bootstrap_range(ReplicatedRangeDescriptor::new(
+            "range-http-get",
+            ServiceShardKey::retain("t1"),
+            RangeBoundary::full(),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ))
+        .await
+        .unwrap();
+    registry
+        .upsert_range(ReplicatedRangeDescriptor::new(
+            "range-http-get",
+            ServiceShardKey::retain("t1"),
+            RangeBoundary::full(),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ))
+        .await
+        .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/v1/ranges/range-http-get")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let reply: Option<greenmqtt_kv_server::RangeHealthSnapshot> =
+        serde_json::from_slice(&body).unwrap();
+    assert_eq!(reply.unwrap().range_id, "range-http-get");
+
+    let response = app
+        .oneshot(
+            Request::post("/v1/ranges/range-http-get/drain")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let reply: crate::range::RangeActionReply = serde_json::from_slice(&body).unwrap();
+    assert_eq!(reply.mode, "local");
+    assert_eq!(reply.audit_action.as_deref(), Some("range_drain"));
+    assert_eq!(reply.command_id.as_deref(), Some("manual:drain:range-http-get"));
+}
+
+#[tokio::test]
+async fn http_control_command_surfaces_support_filter_retry_fail_and_prune() {
+    let broker = broker();
+    let registry = Arc::new(TestShardRegistry::default());
+    registry
+        .upsert_control_command(ControlCommandRecord {
+            command_id: "cmd-1".into(),
+            command_type: "range_drain".into(),
+            target_range_or_shard: "range-a".into(),
+            issued_at_ms: 1,
+            issued_by: "http".into(),
+            attempt_count: 0,
+            payload: BTreeMap::new(),
+            execution_state: ControlCommandExecutionState::Issued,
+            reflection_state: ControlCommandReflectionState::Pending,
+            last_error: None,
+        })
+        .await
+        .unwrap();
+    let app = HttpApi::router_with_peers_shards_metrics_and_ranges(
+        broker.clone(),
+        None,
+        None,
+        Some(registry.clone()),
+        None,
+        None,
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/v1/control-commands?issued_by=http")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let listed: Vec<ControlCommandRecord> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(listed.len(), 1);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/control-commands/cmd-1/retry")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let retried: Option<ControlCommandRecord> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        retried.unwrap().execution_state,
+        ControlCommandExecutionState::Issued
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/control-commands/cmd-1/fail")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"last_error":"manual"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let failed: Option<ControlCommandRecord> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        failed.unwrap().execution_state,
+        ControlCommandExecutionState::TerminalFailed
+    );
+
+    let response = app
+        .oneshot(
+            Request::delete("/v1/control-commands?older_than_ms=1000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let pruned: PurgeReply = serde_json::from_slice(&body).unwrap();
+    assert_eq!(pruned.removed, 1);
 }
 
 #[tokio::test]
@@ -458,6 +644,7 @@ async fn http_range_control_forwards_to_remote_owner_when_local_runtime_is_wrong
             assignment_registry: Some(registry.clone()),
             range_host: Some(host.clone()),
             range_runtime: Some(runtime.clone()),
+            inbox_lwt_sink: None,
         }
         .serve(bind),
     );
@@ -486,9 +673,16 @@ async fn http_range_control_forwards_to_remote_owner_when_local_runtime_is_wrong
     assert_eq!(reply.status, "draining");
     assert!(reply.forwarded);
     assert_eq!(reply.target_node_id, Some(2));
-    assert_eq!(reply.target_endpoint.as_deref(), Some(format!("http://{bind}").as_str()));
+    assert_eq!(
+        reply.target_endpoint.as_deref(),
+        Some(format!("http://{bind}").as_str())
+    );
 
-    let hosted = host.open_range("range-http-forward").await.unwrap().unwrap();
+    let hosted = host
+        .open_range("range-http-forward")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(hosted.descriptor.lifecycle, ServiceShardLifecycle::Draining);
 
     rpc.abort();
@@ -534,7 +728,10 @@ async fn http_range_lists_aggregate_cluster_health_draining_pending_and_zombies(
         ))
         .await
         .unwrap();
-    runtime1.drain_range("range-draining-cluster").await.unwrap();
+    runtime1
+        .drain_range("range-draining-cluster")
+        .await
+        .unwrap();
 
     let node1_server = tokio::spawn(
         greenmqtt_rpc::RpcRuntime {
@@ -546,6 +743,7 @@ async fn http_range_lists_aggregate_cluster_health_draining_pending_and_zombies(
             assignment_registry: Some(registry.clone()),
             range_host: Some(host1.clone()),
             range_runtime: Some(runtime1.clone()),
+            inbox_lwt_sink: None,
         }
         .serve(node1_bind),
     );
@@ -609,28 +807,29 @@ async fn http_range_lists_aggregate_cluster_health_draining_pending_and_zombies(
         },
     ));
     zombie_raft.recover().await.unwrap();
-    host2.add_range(HostedRange {
-        descriptor: ReplicatedRangeDescriptor::new(
-            "range-zombie-cluster",
-            ServiceShardKey::retain("t3"),
-            RangeBoundary::full(),
-            1,
-            1,
-            None,
-            vec![RangeReplica::new(
-                2,
-                ReplicaRole::Voter,
-                ReplicaSyncState::Replicating,
-            )],
-            0,
-            0,
-            ServiceShardLifecycle::Recovering,
-        ),
-        raft: zombie_raft,
-        space: zombie_space,
-    })
-    .await
-    .unwrap();
+    host2
+        .add_range(HostedRange {
+            descriptor: ReplicatedRangeDescriptor::new(
+                "range-zombie-cluster",
+                ServiceShardKey::retain("t3"),
+                RangeBoundary::full(),
+                1,
+                1,
+                None,
+                vec![RangeReplica::new(
+                    2,
+                    ReplicaRole::Voter,
+                    ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Recovering,
+            ),
+            raft: zombie_raft,
+            space: zombie_space,
+        })
+        .await
+        .unwrap();
 
     let node2_server = tokio::spawn(
         greenmqtt_rpc::RpcRuntime {
@@ -642,6 +841,7 @@ async fn http_range_lists_aggregate_cluster_health_draining_pending_and_zombies(
             assignment_registry: Some(registry.clone()),
             range_host: Some(host2.clone()),
             range_runtime: Some(runtime2.clone()),
+            inbox_lwt_sink: None,
         }
         .serve(node2_bind),
     );
@@ -691,9 +891,15 @@ async fn http_range_lists_aggregate_cluster_health_draining_pending_and_zombies(
     assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let all: Vec<greenmqtt_kv_server::RangeHealthSnapshot> = serde_json::from_slice(&body).unwrap();
-    assert!(all.iter().any(|entry| entry.range_id == "range-draining-cluster"));
-    assert!(all.iter().any(|entry| entry.range_id == "range-pending-cluster"));
-    assert!(all.iter().any(|entry| entry.range_id == "range-zombie-cluster"));
+    assert!(all
+        .iter()
+        .any(|entry| entry.range_id == "range-draining-cluster"));
+    assert!(all
+        .iter()
+        .any(|entry| entry.range_id == "range-pending-cluster"));
+    assert!(all
+        .iter()
+        .any(|entry| entry.range_id == "range-zombie-cluster"));
 
     let response = app
         .clone()

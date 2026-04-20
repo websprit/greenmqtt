@@ -14,9 +14,7 @@ use greenmqtt_dist::{DistHandle, DistRouter};
 use greenmqtt_inbox::{InboxHandle, InboxService};
 use greenmqtt_plugin_api::{AllowAllAcl, AuthProvider, NoopEventHook};
 use greenmqtt_retain::{RetainHandle, RetainService};
-use greenmqtt_sessiondict::{
-    SessionDictHandle, SessionDirectory, SessionRegistrationHandle,
-};
+use greenmqtt_sessiondict::{SessionDictHandle, SessionDirectory, SessionRegistrationHandle};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};

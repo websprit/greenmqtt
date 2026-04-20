@@ -7,8 +7,8 @@ use greenmqtt_core::{
 };
 use greenmqtt_plugin_api::{AclProvider, AuthProvider, EventHook};
 use greenmqtt_sessiondict::{
-    SessionKillListener, SessionKillNotification, SessionOwnerResolver,
-    SessionRegistrationHandle, SessionRegistrationManager,
+    SessionKillListener, SessionKillNotification, SessionOwnerResolver, SessionRegistrationHandle,
+    SessionRegistrationManager,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, OpenOptions};
@@ -487,7 +487,11 @@ where
         let sessions = self.sessiondict.list_sessions(tenant_id).await?;
         let session_ids: BTreeSet<_> = sessions
             .into_iter()
-            .filter(|record| user_id.map(|value| record.identity.user_id == value).unwrap_or(true))
+            .filter(|record| {
+                user_id
+                    .map(|value| record.identity.user_id == value)
+                    .unwrap_or(true)
+            })
             .filter(|record| {
                 client_id
                     .map(|value| record.identity.client_id == value)

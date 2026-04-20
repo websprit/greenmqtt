@@ -1,14 +1,11 @@
 use super::*;
 use greenmqtt_proto::internal::{
-    broker_peer_service_server::BrokerPeerService,
-    dist_service_server::DistService,
+    broker_peer_service_server::BrokerPeerService, dist_service_server::DistService,
     inbox_service_server::InboxService as ProtoInboxService,
-    kv_range_service_server::KvRangeService,
-    metadata_service_server::MetadataService,
+    kv_range_service_server::KvRangeService, metadata_service_server::MetadataService,
     raft_transport_service_server::RaftTransportService,
     range_admin_service_server::RangeAdminService,
-    range_control_service_server::RangeControlService,
-    retain_service_server::RetainService,
+    range_control_service_server::RangeControlService, retain_service_server::RetainService,
     session_dict_service_server::SessionDictService,
 };
 
@@ -597,6 +594,79 @@ impl ProtoInboxService for InboxRpc {
         }))
     }
 
+    async fn send_lwt(
+        &self,
+        request: Request<InboxSendLwtRequest>,
+    ) -> Result<Response<()>, Status> {
+        let sink = self
+            .lwt_sink
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("delayed lwt sink unavailable"))?;
+        let request = request.into_inner();
+        inbox_send_lwt(
+            sink.as_ref(),
+            &DelayedLwtPublish {
+                tenant_id: request.tenant_id,
+                session_id: request.session_id,
+                publish: greenmqtt_core::PublishRequest {
+                    topic: request.topic,
+                    payload: request.payload.into(),
+                    qos: request.qos as u8,
+                    retain: request.retain,
+                    properties: greenmqtt_proto::from_proto_publish_properties(
+                        request.properties.unwrap_or_default(),
+                    ),
+                },
+            },
+        )
+        .await
+        .map_err(internal_status)?;
+        counter!("greenmqtt_inbox_delayed_lwt_dispatch_total").increment(1);
+        Ok(Response::new(()))
+    }
+
+    async fn expire_all(
+        &self,
+        request: Request<InboxExpireAllRequest>,
+    ) -> Result<Response<InboxMaintenanceReply>, Status> {
+        let request = request.into_inner();
+        let stats = inbox_expire_all(self.inner.as_ref(), &request.tenant_id, request.now_ms)
+            .await
+            .map_err(internal_status)?;
+        counter!("greenmqtt_inbox_tenant_gc_total", "action" => "expire_all").increment(1);
+        Ok(Response::new(inbox_maintenance_reply(
+            0,
+            stats.offline_messages,
+            stats.inflight_messages,
+        )))
+    }
+
+    async fn tenant_gc_preview(
+        &self,
+        request: Request<InboxTenantGcRequest>,
+    ) -> Result<Response<InboxMaintenanceReply>, Status> {
+        let preview = inbox_tenant_gc_preview(self.inner.as_ref(), &request.into_inner().tenant_id)
+            .await
+            .map_err(internal_status)?;
+        Ok(Response::new(inbox_preview_reply(preview)))
+    }
+
+    async fn tenant_gc_run(
+        &self,
+        request: Request<InboxTenantGcRequest>,
+    ) -> Result<Response<InboxMaintenanceReply>, Status> {
+        let request = request.into_inner();
+        let stats = inbox_tenant_gc_run(self.inner.as_ref(), &request.tenant_id, request.now_ms)
+            .await
+            .map_err(internal_status)?;
+        counter!("greenmqtt_inbox_tenant_gc_total", "action" => "run").increment(1);
+        Ok(Response::new(inbox_maintenance_reply(
+            0,
+            stats.offline_messages,
+            stats.inflight_messages,
+        )))
+    }
+
     async fn stream_shard_snapshot(
         &self,
         request: Request<ShardSnapshotRequest>,
@@ -687,6 +757,44 @@ impl RetainService for RetainRpc {
 
     async fn count_retained(&self, _request: Request<()>) -> Result<Response<CountReply>, Status> {
         let count = self.inner.retained_count().await.map_err(internal_status)?;
+        Ok(Response::new(CountReply {
+            count: count as u64,
+        }))
+    }
+
+    async fn expire_all(
+        &self,
+        request: Request<RetainExpireAllRequest>,
+    ) -> Result<Response<CountReply>, Status> {
+        let removed = retain_expire_all(self.inner.as_ref(), &request.into_inner().tenant_id)
+            .await
+            .map_err(internal_status)?;
+        counter!("greenmqtt_retain_expire_sweep_total", "action" => "expire_all").increment(1);
+        Ok(Response::new(CountReply {
+            count: removed as u64,
+        }))
+    }
+
+    async fn tenant_gc_preview(
+        &self,
+        request: Request<RetainTenantGcRequest>,
+    ) -> Result<Response<CountReply>, Status> {
+        let count = retain_tenant_gc_preview(self.inner.as_ref(), &request.into_inner().tenant_id)
+            .await
+            .map_err(internal_status)?;
+        Ok(Response::new(CountReply {
+            count: count as u64,
+        }))
+    }
+
+    async fn tenant_gc_run(
+        &self,
+        request: Request<RetainTenantGcRequest>,
+    ) -> Result<Response<CountReply>, Status> {
+        let count = retain_tenant_gc_run(self.inner.as_ref(), &request.into_inner().tenant_id)
+            .await
+            .map_err(internal_status)?;
+        counter!("greenmqtt_retain_expire_sweep_total", "action" => "tenant_gc").increment(1);
         Ok(Response::new(CountReply {
             count: count as u64,
         }))
@@ -1344,8 +1452,10 @@ impl RangeControlService for RangeControlRpc {
             .merge_ranges(&request.left_range_id, &request.right_range_id)
             .await
             .map_err(internal_status)?;
-        self.sync_reconfiguration_state(&request.left_range_id).await?;
-        self.sync_reconfiguration_state(&request.right_range_id).await?;
+        self.sync_reconfiguration_state(&request.left_range_id)
+            .await?;
+        self.sync_reconfiguration_state(&request.right_range_id)
+            .await?;
         self.sync_reconfiguration_state(&range_id).await?;
         Ok(Response::new(RangeMergeReply { range_id }))
     }

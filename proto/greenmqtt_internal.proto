@@ -332,6 +332,40 @@ message InboxStatsReply {
   uint64 inflight_messages = 3;
 }
 
+message InboxSendLwtRequest {
+  string tenant_id = 1;
+  string session_id = 2;
+  string topic = 3;
+  bytes payload = 4;
+  uint32 qos = 5;
+  bool retain = 6;
+  PublishProperties properties = 7;
+}
+
+message InboxExpireAllRequest {
+  string tenant_id = 1;
+  uint64 now_ms = 2;
+}
+
+message InboxTenantGcRequest {
+  string tenant_id = 1;
+  uint64 now_ms = 2;
+}
+
+message InboxMaintenanceReply {
+  uint64 subscriptions = 1;
+  uint64 offline_messages = 2;
+  uint64 inflight_messages = 3;
+}
+
+message RetainExpireAllRequest {
+  string tenant_id = 1;
+}
+
+message RetainTenantGcRequest {
+  string tenant_id = 1;
+}
+
 message ShardSnapshotRequest {
   string tenant_id = 1;
   string scope = 2;
@@ -745,6 +779,10 @@ service InboxService {
   rpc ListInflight(InboxListMessagesRequest) returns (InboxFetchInflightReply);
   rpc FetchInflight(InboxFetchInflightRequest) returns (InboxFetchInflightReply);
   rpc Stats(.google.protobuf.Empty) returns (InboxStatsReply);
+  rpc SendLwt(InboxSendLwtRequest) returns (.google.protobuf.Empty);
+  rpc ExpireAll(InboxExpireAllRequest) returns (InboxMaintenanceReply);
+  rpc TenantGcPreview(InboxTenantGcRequest) returns (InboxMaintenanceReply);
+  rpc TenantGcRun(InboxTenantGcRequest) returns (InboxMaintenanceReply);
   rpc StreamShardSnapshot(ShardSnapshotRequest) returns (stream ShardSnapshotChunk);
 }
 
@@ -752,6 +790,9 @@ service RetainService {
   rpc Write(RetainWriteRequest) returns (.google.protobuf.Empty);
   rpc Match(RetainMatchRequest) returns (RetainMatchReply);
   rpc CountRetained(.google.protobuf.Empty) returns (CountReply);
+  rpc ExpireAll(RetainExpireAllRequest) returns (CountReply);
+  rpc TenantGcPreview(RetainTenantGcRequest) returns (CountReply);
+  rpc TenantGcRun(RetainTenantGcRequest) returns (CountReply);
 }
 
 service BrokerPeerService {

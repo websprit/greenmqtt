@@ -1,8 +1,8 @@
 use crate::state::{
     offline_message_matches, remove_cached_inflight_message, remove_cached_offline_message,
     remove_cached_tenant_inflight, remove_cached_tenant_offline, remove_session_topic_subscription,
-    remove_tenant_subscription, subscription_index_key,
-    tenant_topic_shared_subscription_key, InboxState,
+    remove_tenant_subscription, subscription_index_key, tenant_topic_shared_subscription_key,
+    InboxState,
 };
 use crate::{publish_properties_expired_at, InboxExpiryStats, InboxService};
 use async_trait::async_trait;
@@ -76,9 +76,10 @@ impl PersistentInboxHandle {
                 .await?;
             stats.inflight_messages += expired_packets.len();
             let mut guard = self.inner.write().expect("inbox poisoned");
-            for message in inflight.iter().filter(|message| {
-                publish_properties_expired_at(&message.properties, now_ms)
-            }) {
+            for message in inflight
+                .iter()
+                .filter(|message| publish_properties_expired_at(&message.properties, now_ms))
+            {
                 let _ = remove_cached_inflight_message(&mut guard, message);
             }
         }
@@ -2052,7 +2053,9 @@ impl InboxService for PersistentInboxHandle {
 
         let mut stats = InboxExpiryStats::default();
         for session_id in session_ids {
-            let session_stats = self.expire_session_messages_inner(&session_id, now_ms).await?;
+            let session_stats = self
+                .expire_session_messages_inner(&session_id, now_ms)
+                .await?;
             stats.offline_messages += session_stats.offline_messages;
             stats.inflight_messages += session_stats.inflight_messages;
         }
@@ -2080,7 +2083,9 @@ impl InboxService for PersistentInboxHandle {
         };
         let mut stats = InboxExpiryStats::default();
         for session_id in session_ids {
-            let session_stats = self.expire_session_messages_inner(&session_id, now_ms).await?;
+            let session_stats = self
+                .expire_session_messages_inner(&session_id, now_ms)
+                .await?;
             stats.offline_messages += session_stats.offline_messages;
             stats.inflight_messages += session_stats.inflight_messages;
         }

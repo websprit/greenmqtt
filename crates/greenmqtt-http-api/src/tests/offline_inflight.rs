@@ -1238,4 +1238,3 @@ async fn http_dry_run_inflight_purge_uses_tenant_count_fast_path() {
     assert_eq!(inflight.list_tenant_inflight_calls(), 0);
     assert_eq!(inflight.load_inflight_calls(), 0);
 }
-

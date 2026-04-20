@@ -4,6 +4,7 @@ pub(crate) mod persistent;
 use crate::trie::tenant_routes_from_vec;
 use async_trait::async_trait;
 use bytes::Bytes;
+use greenmqtt_core::RangeBoundary;
 use greenmqtt_core::{dedupe_sessions, PublishOutcome, PublishRequest, RouteRecord, TopicName};
 use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter};
 pub use handle::{dist_route_shard, dist_tenant_shard, DistHandle};
@@ -13,10 +14,9 @@ pub(crate) use handle::{
     tenant_filter_shared_identity, TenantRoutes,
 };
 pub use persistent::PersistentDistHandle;
-use greenmqtt_core::RangeBoundary;
 use std::collections::HashMap;
-use std::sync::RwLock;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 
@@ -53,7 +53,11 @@ impl ReplicatedDistHandle {
         for descriptor in self.tenant_ranges(tenant_id).await? {
             for (_, value) in self
                 .executor
-                .scan(&descriptor.descriptor.id, Some(boundary.clone()), usize::MAX)
+                .scan(
+                    &descriptor.descriptor.id,
+                    Some(boundary.clone()),
+                    usize::MAX,
+                )
                 .await?
             {
                 routes.push(decode_route_record(&value)?);
@@ -148,7 +152,10 @@ fn exact_index_prefix(topic: &str) -> Bytes {
     Bytes::from(key)
 }
 
-fn route_mutations(route: &RouteRecord, value: Option<Bytes>) -> anyhow::Result<Vec<greenmqtt_kv_engine::KvMutation>> {
+fn route_mutations(
+    route: &RouteRecord,
+    value: Option<Bytes>,
+) -> anyhow::Result<Vec<greenmqtt_kv_engine::KvMutation>> {
     let mut mutations = vec![greenmqtt_kv_engine::KvMutation {
         key: route_record_key(route),
         value: value.clone(),
@@ -445,7 +452,10 @@ impl DistFanoutWorker {
         tenant_id: &str,
         fanout: &DistFanoutRequest,
     ) -> anyhow::Result<PublishOutcome> {
-        let routes = self.router.match_topic(tenant_id, &fanout.request.topic).await?;
+        let routes = self
+            .router
+            .match_topic(tenant_id, &fanout.request.topic)
+            .await?;
         let report = sink.deliver(tenant_id, fanout, &routes).await?;
         Ok(PublishOutcome {
             matched_routes: dedupe_sessions(&routes).len(),
@@ -477,13 +487,17 @@ pub struct DistTenantStats {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DistBalanceAction {
-    SplitTenantRange { tenant_id: String },
+    SplitTenantRange {
+        tenant_id: String,
+    },
     ScaleTenantReplicas {
         tenant_id: String,
         voters: usize,
         learners: usize,
     },
-    RunTenantCleanup { tenant_id: String },
+    RunTenantCleanup {
+        tenant_id: String,
+    },
 }
 
 pub trait DistBalancePolicy: Send + Sync {

@@ -80,6 +80,10 @@ pub struct RangeListQuery {
     #[serde(default)]
     pub zombie_only: bool,
     pub range_id_prefix: Option<String>,
+    pub owner_node_id: Option<u64>,
+    pub tenant_id: Option<String>,
+    pub service_kind: Option<String>,
+    pub command_id: Option<String>,
     #[serde(default)]
     pub blocked_on_catch_up: bool,
     #[serde(default)]

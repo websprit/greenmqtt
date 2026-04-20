@@ -178,7 +178,10 @@ impl SessionRegistrationHandle {
             .expect("session registration poisoned")
             .take();
         if self.state() == SessionRegistrationState::Registered {
-            let current = self.directory.lookup_identity(&self.record.identity).await?;
+            let current = self
+                .directory
+                .lookup_identity(&self.record.identity)
+                .await?;
             if current.as_ref().is_some_and(|current| {
                 current.session_id == self.record.session_id
                     && current.node_id == self.record.node_id
@@ -203,7 +206,12 @@ impl SessionRegistrationHandle {
 impl Drop for SessionRegistrationHandle {
     fn drop(&mut self) {
         let _ = self.stop_tx.send(true);
-        if let Some(task) = self.task.lock().expect("session registration poisoned").take() {
+        if let Some(task) = self
+            .task
+            .lock()
+            .expect("session registration poisoned")
+            .take()
+        {
             task.abort();
         }
     }
@@ -877,7 +885,10 @@ impl SessionDirectory for ReplicatedSessionDictHandle {
         }
         let range_id = self
             .router
-            .route_key(&session_scan_shard(&record.identity.tenant_id), &encoded_session_key(&record.session_id))
+            .route_key(
+                &session_scan_shard(&record.identity.tenant_id),
+                &encoded_session_key(&record.session_id),
+            )
             .await?
             .map(|route| route.descriptor.id);
         self.cache_record(record.clone(), range_id);
@@ -1703,7 +1714,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(notifications[0].server_reference.as_deref(), Some("http://127.0.0.1:50077"));
+        assert_eq!(
+            notifications[0].server_reference.as_deref(),
+            Some("http://127.0.0.1:50077")
+        );
         registration.stop().await.unwrap();
     }
 
@@ -1789,13 +1803,18 @@ mod tests {
     #[async_trait]
     impl SessionDirectory for CountingDirectory {
         async fn register(&self, record: SessionRecord) -> anyhow::Result<Option<SessionRecord>> {
-            self.records.write().expect("directory poisoned").push(record);
+            self.records
+                .write()
+                .expect("directory poisoned")
+                .push(record);
             Ok(None)
         }
 
         async fn unregister(&self, session_id: &str) -> anyhow::Result<Option<SessionRecord>> {
             let mut guard = self.records.write().expect("directory poisoned");
-            let index = guard.iter().position(|record| record.session_id == session_id);
+            let index = guard
+                .iter()
+                .position(|record| record.session_id == session_id);
             Ok(index.map(|index| guard.remove(index)))
         }
 
@@ -1822,7 +1841,10 @@ mod tests {
                 .cloned())
         }
 
-        async fn list_sessions(&self, tenant_id: Option<&str>) -> anyhow::Result<Vec<SessionRecord>> {
+        async fn list_sessions(
+            &self,
+            tenant_id: Option<&str>,
+        ) -> anyhow::Result<Vec<SessionRecord>> {
             match tenant_id {
                 Some(tenant_id) => {
                     self.list_tenant_calls.fetch_add(1, Ordering::SeqCst);

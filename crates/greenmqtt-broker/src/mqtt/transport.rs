@@ -1,4 +1,5 @@
 use greenmqtt_plugin_api::{with_listener_profile, AclProvider, AuthProvider, EventHook};
+use metrics::counter;
 use quinn::{Endpoint, RecvStream, SendStream};
 use std::io;
 use std::net::SocketAddr;
@@ -7,12 +8,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Once;
 use std::task::{Context, Poll};
-use metrics::counter;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::TcpListener;
+use tokio::time::{timeout, Duration};
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
-use tokio::time::{timeout, Duration};
 use tokio_tungstenite::{
     accept_hdr_async,
     tungstenite::handshake::server::{ErrorResponse, Request, Response},
@@ -237,7 +237,11 @@ where
             if let Err(error) = with_listener_profile(
                 listener_profile,
                 drive_session(
-                    TcpTransport::with_bandwidth(stream, ingress_limits.0.or(bandwidth.0), ingress_limits.1.or(bandwidth.1)),
+                    TcpTransport::with_bandwidth(
+                        stream,
+                        ingress_limits.0.or(bandwidth.0),
+                        ingress_limits.1.or(bandwidth.1),
+                    ),
                     broker,
                 ),
             )
@@ -315,7 +319,11 @@ where
                     if let Err(error) = with_listener_profile(
                         listener_profile,
                         drive_session(
-                            TcpTransport::with_bandwidth(stream, ingress_limits.0.or(bandwidth.0), ingress_limits.1.or(bandwidth.1)),
+                            TcpTransport::with_bandwidth(
+                                stream,
+                                ingress_limits.0.or(bandwidth.0),
+                                ingress_limits.1.or(bandwidth.1),
+                            ),
                             broker,
                         ),
                     )
@@ -401,36 +409,37 @@ where
                     } else {
                         let response: ErrorResponse = Response::builder()
                             .status(404)
-                            .body(Some(format!(
-                                "expected websocket path `{expected_path}`"
-                            )))
+                            .body(Some(format!("expected websocket path `{expected_path}`")))
                             .expect("valid websocket rejection response");
                         Err(response)
                     }
                 }),
             )
-            .await {
-                Ok(stream) => {
-                    match stream {
-                        Ok(stream) => {
-                            if let Err(error) = with_listener_profile(
-                                listener_profile,
-                                drive_session(
-                                    WsTransport::with_bandwidth(stream, ingress_limits.0.or(bandwidth.0), ingress_limits.1.or(bandwidth.1)),
-                                    broker,
+            .await
+            {
+                Ok(stream) => match stream {
+                    Ok(stream) => {
+                        if let Err(error) = with_listener_profile(
+                            listener_profile,
+                            drive_session(
+                                WsTransport::with_bandwidth(
+                                    stream,
+                                    ingress_limits.0.or(bandwidth.0),
+                                    ingress_limits.1.or(bandwidth.1),
                                 ),
-                            )
-                            .await
-                            {
-                                eprintln!("greenmqtt ws session error: {error:#}");
-                            }
-                        }
-                        Err(error) => {
-                            counter!("mqtt_ws_handshake_total", "result" => "error").increment(1);
-                            eprintln!("greenmqtt ws handshake error: {error:#}");
+                                broker,
+                            ),
+                        )
+                        .await
+                        {
+                            eprintln!("greenmqtt ws session error: {error:#}");
                         }
                     }
-                }
+                    Err(error) => {
+                        counter!("mqtt_ws_handshake_total", "result" => "error").increment(1);
+                        eprintln!("greenmqtt ws handshake error: {error:#}");
+                    }
+                },
                 Err(_) => {
                     counter!("mqtt_ws_handshake_total", "result" => "timeout").increment(1);
                     eprintln!("greenmqtt ws handshake timeout");
@@ -523,12 +532,17 @@ where
                         }
                     }),
                 )
-                .await {
+                .await
+                {
                     Ok(Ok(stream)) => {
                         if let Err(error) = with_listener_profile(
                             listener_profile,
                             drive_session(
-                                WsTransport::with_bandwidth(stream, ingress_limits.0.or(bandwidth.0), ingress_limits.1.or(bandwidth.1)),
+                                WsTransport::with_bandwidth(
+                                    stream,
+                                    ingress_limits.0.or(bandwidth.0),
+                                    ingress_limits.1.or(bandwidth.1),
+                                ),
                                 broker,
                             ),
                         )
@@ -601,69 +615,71 @@ where
         let bandwidth = broker.bandwidth_limits();
         tokio::spawn(async move {
             match timeout(timeout_window, incoming).await {
-                Ok(connection) => {
-                    match connection {
-                        Ok(connection) => {
-                            counter!("mqtt_quic_handshake_total", "result" => "ok").increment(1);
-                            if pre_session_reject_for_pressure(broker.as_ref()) {
-                                connection.close(0u32.into(), b"server busy");
-                                counter!("mqtt_quic_connection_close_total", "reason" => "pressure").increment(1);
+                Ok(connection) => match connection {
+                    Ok(connection) => {
+                        counter!("mqtt_quic_handshake_total", "result" => "ok").increment(1);
+                        if pre_session_reject_for_pressure(broker.as_ref()) {
+                            connection.close(0u32.into(), b"server busy");
+                            counter!("mqtt_quic_connection_close_total", "reason" => "pressure")
+                                .increment(1);
+                            return;
+                        }
+                        if !broker.allow_connection_attempt() {
+                            connection.close(0u32.into(), b"connection rate limit exceeded");
+                            counter!("mqtt_quic_connection_close_total", "reason" => "rate_limit")
+                                .increment(1);
+                            return;
+                        }
+                        let permit = match broker.try_acquire_connection_slot() {
+                            Ok(permit) => permit,
+                            Err(()) => {
+                                connection.close(0u32.into(), b"connection limit exceeded");
+                                counter!("mqtt_quic_connection_close_total", "reason" => "connection_limit").increment(1);
                                 return;
                             }
-                            if !broker.allow_connection_attempt() {
-                                connection.close(0u32.into(), b"connection rate limit exceeded");
-                                counter!("mqtt_quic_connection_close_total", "reason" => "rate_limit").increment(1);
-                                return;
-                            }
-                            let permit = match broker.try_acquire_connection_slot() {
-                                Ok(permit) => permit,
-                                Err(()) => {
-                                    connection.close(0u32.into(), b"connection limit exceeded");
-                                    counter!("mqtt_quic_connection_close_total", "reason" => "connection_limit").increment(1);
-                                    return;
-                                }
-                            };
-                            let permit_guard = permit;
-                            loop {
-                                match connection.accept_bi().await {
-                                    Ok((send, recv)) => {
-                                        counter!("mqtt_quic_stream_accept_total", "result" => "ok").increment(1);
-                                        let broker = broker.clone();
-                                        let listener_profile = listener_profile.clone();
-                                        tokio::spawn(async move {
-                                            if let Err(error) = with_listener_profile(
-                                                listener_profile,
-                                                drive_session(
-                                                    TcpTransport::with_bandwidth(
-                                                        QuicBiStream { send, recv },
-                                                        ingress_limits.0.or(bandwidth.0),
-                                                        ingress_limits.1.or(bandwidth.1),
-                                                    ),
-                                                    broker,
+                        };
+                        let permit_guard = permit;
+                        loop {
+                            match connection.accept_bi().await {
+                                Ok((send, recv)) => {
+                                    counter!("mqtt_quic_stream_accept_total", "result" => "ok")
+                                        .increment(1);
+                                    let broker = broker.clone();
+                                    let listener_profile = listener_profile.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(error) = with_listener_profile(
+                                            listener_profile,
+                                            drive_session(
+                                                TcpTransport::with_bandwidth(
+                                                    QuicBiStream { send, recv },
+                                                    ingress_limits.0.or(bandwidth.0),
+                                                    ingress_limits.1.or(bandwidth.1),
                                                 ),
-                                            )
-                                            .await
-                                            {
-                                                eprintln!("greenmqtt quic session error: {error:#}");
-                                            }
-                                        });
-                                    }
-                                    Err(error) => {
-                                        counter!("mqtt_quic_stream_accept_total", "result" => "error").increment(1);
-                                        counter!("mqtt_quic_connection_close_total", "reason" => "stream_accept_error").increment(1);
-                                        eprintln!("greenmqtt quic stream accept error: {error:#}");
-                                        break;
-                                    }
+                                                broker,
+                                            ),
+                                        )
+                                        .await
+                                        {
+                                            eprintln!("greenmqtt quic session error: {error:#}");
+                                        }
+                                    });
+                                }
+                                Err(error) => {
+                                    counter!("mqtt_quic_stream_accept_total", "result" => "error")
+                                        .increment(1);
+                                    counter!("mqtt_quic_connection_close_total", "reason" => "stream_accept_error").increment(1);
+                                    eprintln!("greenmqtt quic stream accept error: {error:#}");
+                                    break;
                                 }
                             }
-                            drop(permit_guard);
                         }
-                        Err(error) => {
-                            counter!("mqtt_quic_handshake_total", "result" => "error").increment(1);
-                            eprintln!("greenmqtt quic handshake error: {error:#}");
-                        }
+                        drop(permit_guard);
                     }
-                }
+                    Err(error) => {
+                        counter!("mqtt_quic_handshake_total", "result" => "error").increment(1);
+                        eprintln!("greenmqtt quic handshake error: {error:#}");
+                    }
+                },
                 Err(_) => {
                     counter!("mqtt_quic_handshake_total", "result" => "timeout").increment(1);
                     eprintln!("greenmqtt quic handshake timeout");
@@ -740,9 +756,7 @@ mod tests {
     fn parses_proxy_protocol_v2_header_length() {
         let mut header = Vec::from(&b"\r\n\r\n\0\r\nQUIT\n"[..]);
         header.extend_from_slice(&[0x21, 0x11, 0x00, 0x0c]);
-        header.extend_from_slice(&[
-            203, 0, 113, 1, 192, 0, 2, 1, 0xdb, 0x34, 0x07, 0x5b,
-        ]);
+        header.extend_from_slice(&[203, 0, 113, 1, 192, 0, 2, 1, 0xdb, 0x34, 0x07, 0x5b]);
         header.extend_from_slice(b"mqtt");
         let parsed = parse_proxy_protocol_v2_header(&header).unwrap();
         assert_eq!(parsed, Some(28));

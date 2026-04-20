@@ -9,7 +9,7 @@ anyhow.workspace = true
 async-trait.workspace = true
 greenmqtt-cluster = { path = "../greenmqtt-cluster" }
 greenmqtt-core = { path = "../greenmqtt-core" }
+tokio.workspace = true
 
 [dev-dependencies]
 greenmqtt-rpc = { path = "../greenmqtt-rpc" }
-tokio.workspace = true

@@ -1867,4 +1867,3 @@ async fn http_rejects_subscription_purge_without_filter() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
-

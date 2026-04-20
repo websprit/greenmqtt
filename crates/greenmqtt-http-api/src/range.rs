@@ -4,7 +4,9 @@ use axum::{
 };
 use greenmqtt_broker::BrokerRuntime;
 use greenmqtt_core::{
-    ClusterNodeMembership, MetadataRegistry, NodeId, ReplicatedRangeDescriptor, ServiceKind,
+    ClusterNodeMembership, ControlCommandExecutionState, ControlCommandRecord,
+    ControlCommandReflectionState, ControlPlaneRegistry, NodeId, ReplicatedRangeDescriptor,
+    ServiceKind,
 };
 use greenmqtt_kv_server::{RangeHealthSnapshot, ReplicaRuntime, ZombieRangeSnapshot};
 use greenmqtt_plugin_api::{AclProvider, AuthProvider, EventHook};
@@ -21,12 +23,17 @@ pub struct RangeActionReply {
     pub ok: bool,
     pub status: String,
     pub reason: String,
+    pub mode: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub forwarded: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_node_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_action: Option<String>,
     pub range_id: Option<String>,
     pub left_range_id: Option<String>,
     pub right_range_id: Option<String>,
@@ -82,7 +89,11 @@ fn operator_endpoint_for_member(
     preferred_kind: Option<ServiceKind>,
 ) -> anyhow::Result<String> {
     if let Some(kind) = preferred_kind {
-        if let Some(endpoint) = member.endpoints.iter().find(|endpoint| endpoint.kind == kind) {
+        if let Some(endpoint) = member
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.kind == kind)
+        {
             return Ok(endpoint.endpoint.clone());
         }
     }
@@ -108,7 +119,7 @@ fn prefer_range_health(current: &RangeHealthSnapshot, candidate: &RangeHealthSna
 
 async fn aggregate_range_health(
     range_runtime: Option<Arc<ReplicaRuntime>>,
-    range_routing: Option<Arc<dyn MetadataRegistry>>,
+    range_routing: Option<Arc<dyn ControlPlaneRegistry>>,
 ) -> Result<Vec<RangeHealthSnapshot>, ApiError> {
     if let Some(range_routing) = range_routing {
         let mut entries: BTreeMap<String, RangeHealthSnapshot> = BTreeMap::new();
@@ -140,7 +151,7 @@ async fn aggregate_range_health(
 async fn remote_range_control_client<A, C, H>(
     broker: &Arc<BrokerRuntime<A, C, H>>,
     range_runtime: Option<Arc<ReplicaRuntime>>,
-    range_routing: Option<Arc<dyn MetadataRegistry>>,
+    range_routing: Option<Arc<dyn ControlPlaneRegistry>>,
     range_id: &str,
 ) -> Result<Option<RemoteRangeControlTarget>, ApiError>
 where
@@ -183,7 +194,7 @@ where
 async fn remote_bootstrap_client<A, C, H>(
     broker: &Arc<BrokerRuntime<A, C, H>>,
     range_runtime: Option<Arc<ReplicaRuntime>>,
-    range_routing: Option<Arc<dyn MetadataRegistry>>,
+    range_routing: Option<Arc<dyn ControlPlaneRegistry>>,
     descriptor: &ReplicatedRangeDescriptor,
 ) -> Result<Option<RemoteRangeControlTarget>, ApiError>
 where
@@ -205,8 +216,8 @@ where
         .await
         .map_err(ApiError::from)?
         .ok_or_else(|| ApiError::from(anyhow::anyhow!("target node {target_node_id} not found")))?;
-    let endpoint =
-        operator_endpoint_for_member(&member, Some(descriptor.shard.service_kind())).map_err(ApiError::from)?;
+    let endpoint = operator_endpoint_for_member(&member, Some(descriptor.shard.service_kind()))
+        .map_err(ApiError::from)?;
     Ok(Some(RemoteRangeControlTarget {
         node_id: target_node_id,
         endpoint: endpoint.clone(),
@@ -218,9 +229,12 @@ where
 
 fn range_action_reply(
     operation: &str,
+    mode: &str,
     status: impl Into<String>,
     reason: impl Into<String>,
     target: Option<(u64, String)>,
+    command_id: Option<String>,
+    audit_action: Option<String>,
     range_id: Option<String>,
     left_range_id: Option<String>,
     right_range_id: Option<String>,
@@ -230,19 +244,19 @@ fn range_action_reply(
         ok: true,
         status: status.into(),
         reason: reason.into(),
+        mode: mode.to_string(),
         forwarded: target.is_some(),
         target_node_id: target.as_ref().map(|(node_id, _)| *node_id),
         target_endpoint: target.map(|(_, endpoint)| endpoint),
+        command_id,
+        audit_action,
         range_id,
         left_range_id,
         right_range_id,
     }
 }
 
-fn matches_range_filters(
-    health: &RangeHealthSnapshot,
-    query: &RangeListQuery,
-) -> bool {
+fn matches_range_filters(health: &RangeHealthSnapshot, query: &RangeListQuery) -> bool {
     if let Some(prefix) = query.range_id_prefix.as_deref() {
         if !health.range_id.starts_with(prefix) {
             return false;
@@ -268,11 +282,56 @@ fn matches_range_filters(
     if query.pending_only && health.reconfiguration.phase.is_none() {
         return false;
     }
+    if let Some(owner_node_id) = query.owner_node_id {
+        if health.leader_node_id != Some(owner_node_id) {
+            return false;
+        }
+    }
+    if let Some(tenant_id) = query.tenant_id.as_deref() {
+        if !health.range_id.contains(tenant_id) {
+            return false;
+        }
+    }
+    if let Some(service_kind) = query.service_kind.as_deref() {
+        if !format!("{:?}", health.lifecycle).to_ascii_lowercase().contains(&service_kind.to_ascii_lowercase())
+            && !health.range_id.to_ascii_lowercase().contains(&service_kind.to_ascii_lowercase())
+        {
+            return false;
+        }
+    }
     true
 }
 
+async fn record_manual_range_command(
+    registry: Option<&Arc<dyn ControlPlaneRegistry>>,
+    operation: &str,
+    range_id: &str,
+    issued_by: &str,
+) -> Result<Option<String>, ApiError> {
+    let Some(registry) = registry else {
+        return Ok(None);
+    };
+    let command_id = format!("manual:{operation}:{range_id}");
+    registry
+        .upsert_control_command(ControlCommandRecord {
+            command_id: command_id.clone(),
+            command_type: operation.to_string(),
+            target_range_or_shard: range_id.to_string(),
+            issued_at_ms: crate::admin::current_time_ms(),
+            issued_by: issued_by.to_string(),
+            attempt_count: 0,
+            payload: BTreeMap::new(),
+            execution_state: ControlCommandExecutionState::Applied,
+            reflection_state: ControlCommandReflectionState::Pending,
+            last_error: None,
+        })
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Some(command_id))
+}
+
 pub(crate) async fn list_ranges<A, C, H>(
-    Extension(range_routing): Extension<Option<Arc<dyn MetadataRegistry>>>,
+    Extension(range_routing): Extension<Option<Arc<dyn ControlPlaneRegistry>>>,
     Extension(range_runtime): Extension<Option<Arc<ReplicaRuntime>>>,
     State(_broker): State<Arc<BrokerRuntime<A, C, H>>>,
     Query(query): Query<RangeListQuery>,
@@ -282,17 +341,83 @@ where
     C: AclProvider + 'static,
     H: EventHook + 'static,
 {
+    let command_target = if let (Some(command_id), Some(registry)) =
+        (query.command_id.as_deref(), range_routing.as_ref())
+    {
+        registry
+            .resolve_control_command(command_id)
+            .await
+            .map_err(ApiError::from)?
+            .map(|record| record.target_range_or_shard)
+    } else {
+        None
+    };
     let entries = aggregate_range_health(range_runtime, range_routing)
         .await?
         .into_iter()
+        .filter(|health| {
+            command_target
+                .as_ref()
+                .map(|target| health.range_id == *target)
+                .unwrap_or(true)
+        })
         .filter(|health| matches_range_filters(health, &query))
         .collect();
     Ok(Json(entries))
 }
 
+pub(crate) async fn get_range<A, C, H>(
+    Extension(range_routing): Extension<Option<Arc<dyn ControlPlaneRegistry>>>,
+    Extension(range_runtime): Extension<Option<Arc<ReplicaRuntime>>>,
+    State(_broker): State<Arc<BrokerRuntime<A, C, H>>>,
+    Path(range_id): Path<String>,
+) -> Result<Json<Option<RangeHealthSnapshot>>, ApiError>
+where
+    A: AuthProvider + 'static,
+    C: AclProvider + 'static,
+    H: EventHook + 'static,
+{
+    let snapshot = aggregate_range_health(range_runtime, range_routing.clone())
+        .await?
+        .into_iter()
+        .find(|entry| entry.range_id == range_id);
+    if snapshot.is_some() {
+        return Ok(Json(snapshot));
+    }
+    let fallback = if let Some(registry) = range_routing {
+        if let Some(descriptor) = registry
+            .resolve_range(&range_id)
+            .await
+            .map_err(ApiError::from)?
+        {
+            Some(RangeHealthSnapshot {
+                range_id: descriptor.id,
+                lifecycle: descriptor.lifecycle,
+                role: greenmqtt_kv_raft::RaftNodeRole::Follower,
+                current_term: 0,
+                leader_node_id: descriptor.leader_node_id,
+                commit_index: descriptor.commit_index,
+                applied_index: descriptor.applied_index,
+                latest_snapshot_index: None,
+                replica_lag: Vec::new(),
+                reconfiguration: registry
+                    .resolve_reconfiguration_state(&range_id)
+                    .await
+                    .map_err(ApiError::from)?
+                    .unwrap_or_default(),
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    Ok(Json(fallback))
+}
+
 pub(crate) async fn bootstrap_range<A, C, H>(
     State(broker): State<Arc<BrokerRuntime<A, C, H>>>,
-    Extension(range_routing): Extension<Option<Arc<dyn MetadataRegistry>>>,
+    Extension(range_routing): Extension<Option<Arc<dyn ControlPlaneRegistry>>>,
     Extension(range_runtime): Extension<Option<Arc<ReplicaRuntime>>>,
     Json(request): Json<RangeBootstrapBody>,
 ) -> Result<Json<RangeActionReply>, ApiError>
@@ -304,7 +429,7 @@ where
     let (range_id, target) = if let Some(remote) = remote_bootstrap_client(
         &broker,
         range_runtime.clone(),
-        range_routing,
+        range_routing.clone(),
         &request.descriptor,
     )
     .await?
@@ -332,11 +457,16 @@ where
         "ranges",
         BTreeMap::from([("range_id".into(), range_id.clone())]),
     );
+    let command_id =
+        record_manual_range_command(range_routing.as_ref(), "bootstrap", &range_id, "http").await?;
     Ok(Json(range_action_reply(
         "bootstrap",
+        if target.is_some() { "forwarded" } else { "local" },
         "bootstrapped",
         "Range bootstrapped and marked serving.",
         target,
+        command_id,
+        Some("range_bootstrap".into()),
         Some(range_id),
         None,
         None,
@@ -345,7 +475,7 @@ where
 
 pub(crate) async fn change_replicas<A, C, H>(
     State(broker): State<Arc<BrokerRuntime<A, C, H>>>,
-    Extension(range_routing): Extension<Option<Arc<dyn MetadataRegistry>>>,
+    Extension(range_routing): Extension<Option<Arc<dyn ControlPlaneRegistry>>>,
     Extension(range_runtime): Extension<Option<Arc<ReplicaRuntime>>>,
     Path(range_id): Path<String>,
     Json(request): Json<RangeChangeReplicasBody>,
@@ -356,7 +486,8 @@ where
     H: EventHook + 'static,
 {
     let (status, reason, target) = if let Some(remote) =
-        remote_range_control_client(&broker, range_runtime.clone(), range_routing, &range_id).await?
+        remote_range_control_client(&broker, range_runtime.clone(), range_routing.clone(), &range_id)
+            .await?
     {
         remote
             .client
@@ -404,11 +535,21 @@ where
         "ranges",
         BTreeMap::from([("range_id".into(), range_id.clone())]),
     );
+    let command_id = record_manual_range_command(
+        range_routing.as_ref(),
+        "change_replicas",
+        &range_id,
+        "http",
+    )
+    .await?;
     Ok(Json(range_action_reply(
         "change-replicas",
+        if target.is_some() { "forwarded" } else { "local" },
         status,
         reason,
         target,
+        command_id,
+        Some("range_change_replicas".into()),
         Some(range_id),
         None,
         None,
@@ -417,7 +558,7 @@ where
 
 pub(crate) async fn transfer_leadership<A, C, H>(
     State(broker): State<Arc<BrokerRuntime<A, C, H>>>,
-    Extension(range_routing): Extension<Option<Arc<dyn MetadataRegistry>>>,
+    Extension(range_routing): Extension<Option<Arc<dyn ControlPlaneRegistry>>>,
     Extension(range_runtime): Extension<Option<Arc<ReplicaRuntime>>>,
     Path(range_id): Path<String>,
     Json(request): Json<RangeTransferLeadershipBody>,
@@ -428,7 +569,8 @@ where
     H: EventHook + 'static,
 {
     let target = if let Some(remote) =
-        remote_range_control_client(&broker, range_runtime.clone(), range_routing, &range_id).await?
+        remote_range_control_client(&broker, range_runtime.clone(), range_routing.clone(), &range_id)
+            .await?
     {
         remote
             .client
@@ -449,11 +591,21 @@ where
         "ranges",
         BTreeMap::from([("range_id".into(), range_id.clone())]),
     );
+    let command_id = record_manual_range_command(
+        range_routing.as_ref(),
+        "transfer_leadership",
+        &range_id,
+        "http",
+    )
+    .await?;
     Ok(Json(range_action_reply(
         "transfer-leadership",
+        if target.is_some() { "forwarded" } else { "local" },
         "leadership-updated",
         "Leadership transfer accepted; if the target already led the range this was a no-op.",
         target,
+        command_id,
+        Some("range_transfer_leadership".into()),
         Some(range_id),
         None,
         None,
@@ -462,7 +614,7 @@ where
 
 pub(crate) async fn recover_range<A, C, H>(
     State(broker): State<Arc<BrokerRuntime<A, C, H>>>,
-    Extension(range_routing): Extension<Option<Arc<dyn MetadataRegistry>>>,
+    Extension(range_routing): Extension<Option<Arc<dyn ControlPlaneRegistry>>>,
     Extension(range_runtime): Extension<Option<Arc<ReplicaRuntime>>>,
     Path(range_id): Path<String>,
     Json(request): Json<RangeRecoverBody>,
@@ -473,7 +625,8 @@ where
     H: EventHook + 'static,
 {
     let target = if let Some(remote) =
-        remote_range_control_client(&broker, range_runtime.clone(), range_routing, &range_id).await?
+        remote_range_control_client(&broker, range_runtime.clone(), range_routing.clone(), &range_id)
+            .await?
     {
         remote
             .client
@@ -494,11 +647,16 @@ where
         "ranges",
         BTreeMap::from([("range_id".into(), range_id.clone())]),
     );
+    let command_id =
+        record_manual_range_command(range_routing.as_ref(), "recover", &range_id, "http").await?;
     Ok(Json(range_action_reply(
         "recover",
+        if target.is_some() { "forwarded" } else { "local" },
         "recovered",
         "Recovery command accepted; the target leader is now authoritative or already was.",
         target,
+        command_id,
+        Some("range_recover".into()),
         Some(range_id),
         None,
         None,
@@ -507,7 +665,7 @@ where
 
 pub(crate) async fn split_range<A, C, H>(
     State(broker): State<Arc<BrokerRuntime<A, C, H>>>,
-    Extension(range_routing): Extension<Option<Arc<dyn MetadataRegistry>>>,
+    Extension(range_routing): Extension<Option<Arc<dyn ControlPlaneRegistry>>>,
     Extension(range_runtime): Extension<Option<Arc<ReplicaRuntime>>>,
     Path(range_id): Path<String>,
     Json(request): Json<RangeSplitBody>,
@@ -518,7 +676,8 @@ where
     H: EventHook + 'static,
 {
     let (left_range_id, right_range_id, target) = if let Some(remote) =
-        remote_range_control_client(&broker, range_runtime.clone(), range_routing, &range_id).await?
+        remote_range_control_client(&broker, range_runtime.clone(), range_routing.clone(), &range_id)
+            .await?
     {
         let (left, right) = remote
             .client
@@ -539,11 +698,16 @@ where
         "ranges",
         BTreeMap::from([("range_id".into(), range_id.clone())]),
     );
+    let command_id =
+        record_manual_range_command(range_routing.as_ref(), "split", &range_id, "http").await?;
     Ok(Json(range_action_reply(
         "split",
+        if target.is_some() { "forwarded" } else { "local" },
         "split",
         "Range split completed; child ranges are now available.",
         target,
+        command_id,
+        Some("range_split".into()),
         Some(range_id),
         Some(left_range_id),
         Some(right_range_id),
@@ -552,7 +716,7 @@ where
 
 pub(crate) async fn merge_ranges<A, C, H>(
     State(broker): State<Arc<BrokerRuntime<A, C, H>>>,
-    Extension(range_routing): Extension<Option<Arc<dyn MetadataRegistry>>>,
+    Extension(range_routing): Extension<Option<Arc<dyn ControlPlaneRegistry>>>,
     Extension(range_runtime): Extension<Option<Arc<ReplicaRuntime>>>,
     Json(request): Json<RangeMergeBody>,
 ) -> Result<Json<RangeActionReply>, ApiError>
@@ -564,7 +728,7 @@ where
     let (range_id, target) = if let Some(remote) = remote_range_control_client(
         &broker,
         range_runtime.clone(),
-        range_routing,
+        range_routing.clone(),
         &request.left_range_id,
     )
     .await?
@@ -592,11 +756,16 @@ where
         "ranges",
         BTreeMap::from([("range_id".into(), range_id.clone())]),
     );
+    let command_id =
+        record_manual_range_command(range_routing.as_ref(), "merge", &range_id, "http").await?;
     Ok(Json(range_action_reply(
         "merge",
+        if target.is_some() { "forwarded" } else { "local" },
         "merged",
         "Sibling ranges were merged into a single serving range.",
         target,
+        command_id,
+        Some("range_merge".into()),
         Some(range_id),
         Some(request.left_range_id),
         Some(request.right_range_id),
@@ -605,7 +774,7 @@ where
 
 pub(crate) async fn drain_range<A, C, H>(
     State(broker): State<Arc<BrokerRuntime<A, C, H>>>,
-    Extension(range_routing): Extension<Option<Arc<dyn MetadataRegistry>>>,
+    Extension(range_routing): Extension<Option<Arc<dyn ControlPlaneRegistry>>>,
     Extension(range_runtime): Extension<Option<Arc<ReplicaRuntime>>>,
     Path(range_id): Path<String>,
 ) -> Result<Json<RangeActionReply>, ApiError>
@@ -615,7 +784,8 @@ where
     H: EventHook + 'static,
 {
     let target = if let Some(remote) =
-        remote_range_control_client(&broker, range_runtime.clone(), range_routing, &range_id).await?
+        remote_range_control_client(&broker, range_runtime.clone(), range_routing.clone(), &range_id)
+            .await?
     {
         remote
             .client
@@ -625,7 +795,10 @@ where
         Some((remote.node_id, remote.endpoint))
     } else {
         let runtime = require_range_runtime(range_runtime)?;
-        runtime.drain_range(&range_id).await.map_err(ApiError::from)?;
+        runtime
+            .drain_range(&range_id)
+            .await
+            .map_err(ApiError::from)?;
         None
     };
     broker.record_admin_audit(
@@ -633,11 +806,16 @@ where
         "ranges",
         BTreeMap::from([("range_id".into(), range_id.clone())]),
     );
+    let command_id =
+        record_manual_range_command(range_routing.as_ref(), "drain", &range_id, "http").await?;
     Ok(Json(range_action_reply(
         "drain",
+        if target.is_some() { "forwarded" } else { "local" },
         "draining",
         "Range marked draining; writes should migrate away before retirement.",
         target,
+        command_id,
+        Some("range_drain".into()),
         Some(range_id),
         None,
         None,
@@ -646,7 +824,7 @@ where
 
 pub(crate) async fn retire_range<A, C, H>(
     State(broker): State<Arc<BrokerRuntime<A, C, H>>>,
-    Extension(range_routing): Extension<Option<Arc<dyn MetadataRegistry>>>,
+    Extension(range_routing): Extension<Option<Arc<dyn ControlPlaneRegistry>>>,
     Extension(range_runtime): Extension<Option<Arc<ReplicaRuntime>>>,
     Path(range_id): Path<String>,
 ) -> Result<Json<RangeActionReply>, ApiError>
@@ -656,7 +834,8 @@ where
     H: EventHook + 'static,
 {
     let target = if let Some(remote) =
-        remote_range_control_client(&broker, range_runtime.clone(), range_routing, &range_id).await?
+        remote_range_control_client(&broker, range_runtime.clone(), range_routing.clone(), &range_id)
+            .await?
     {
         remote
             .client
@@ -666,7 +845,10 @@ where
         Some((remote.node_id, remote.endpoint))
     } else {
         let runtime = require_range_runtime(range_runtime)?;
-        runtime.retire_range(&range_id).await.map_err(ApiError::from)?;
+        runtime
+            .retire_range(&range_id)
+            .await
+            .map_err(ApiError::from)?;
         None
     };
     broker.record_admin_audit(
@@ -674,11 +856,16 @@ where
         "ranges",
         BTreeMap::from([("range_id".into(), range_id.clone())]),
     );
+    let command_id =
+        record_manual_range_command(range_routing.as_ref(), "retire", &range_id, "http").await?;
     Ok(Json(range_action_reply(
         "retire",
+        if target.is_some() { "forwarded" } else { "local" },
         "retired",
         "Range retired; repeated retire requests are treated as already applied.",
         target,
+        command_id,
+        Some("range_retire".into()),
         Some(range_id),
         None,
         None,
@@ -686,7 +873,7 @@ where
 }
 
 pub(crate) async fn list_zombie_ranges<A, C, H>(
-    Extension(range_routing): Extension<Option<Arc<dyn MetadataRegistry>>>,
+    Extension(range_routing): Extension<Option<Arc<dyn ControlPlaneRegistry>>>,
     Extension(range_runtime): Extension<Option<Arc<ReplicaRuntime>>>,
     State(_broker): State<Arc<BrokerRuntime<A, C, H>>>,
     Query(mut query): Query<RangeListQuery>,

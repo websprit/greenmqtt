@@ -376,7 +376,13 @@ where
     }
 
     let removed = if query.dry_run {
-        usize::from(broker.session_record(&session_id).await.map_err(ApiError::from)?.is_some())
+        usize::from(
+            broker
+                .session_record(&session_id)
+                .await
+                .map_err(ApiError::from)?
+                .is_some(),
+        )
     } else {
         usize::from(
             broker
@@ -511,7 +517,11 @@ where
         .await
         .map_err(ApiError::from)?
         .is_some()
-        || broker.session_record(&session_id).await.map_err(ApiError::from)?.is_some();
+        || broker
+            .session_record(&session_id)
+            .await
+            .map_err(ApiError::from)?
+            .is_some();
     let subscriptions = broker
         .inbox
         .list_subscriptions(&session_id)

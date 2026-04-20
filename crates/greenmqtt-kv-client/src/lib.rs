@@ -350,7 +350,9 @@ impl KvRangeExecutor for LeaderRoutedKvRangeExecutor {
         let route = self.route_by_id(range_id).await?;
         let expected_epoch = route.descriptor.epoch;
         self.execute_query_with_retry(range_id, route, |executor| async move {
-            executor.get_fenced(range_id, key, Some(expected_epoch)).await
+            executor
+                .get_fenced(range_id, key, Some(expected_epoch))
+                .await
         })
         .await
     }
@@ -407,7 +409,9 @@ impl KvRangeExecutor for LeaderRoutedKvRangeExecutor {
         let route = self.route_by_id(range_id).await?;
         let expected_epoch = route.descriptor.epoch;
         self.execute_leader_with_retry(range_id, route, |executor| async move {
-            executor.snapshot_fenced(range_id, Some(expected_epoch)).await
+            executor
+                .snapshot_fenced(range_id, Some(expected_epoch))
+                .await
         })
         .await
     }

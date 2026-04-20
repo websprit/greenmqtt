@@ -1,6 +1,6 @@
 use super::pressure::{MemoryPressureGuard, PressureLevel};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::Duration;
 

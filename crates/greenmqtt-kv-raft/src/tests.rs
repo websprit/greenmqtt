@@ -1,8 +1,8 @@
 use super::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, MemoryRaftNode,
     MemoryRaftStateStore, RaftClusterConfig, RaftConfigChange, RaftConfigTransitionPhase,
-    RaftMessage, RaftNode, RaftNodeRole, RaftSnapshot, RaftStateStore, RequestVoteRequest, RequestVoteResponse,
-    RocksDbRaftStateStore,
+    RaftMessage, RaftNode, RaftNodeRole, RaftSnapshot, RaftStateStore, RequestVoteRequest,
+    RequestVoteResponse, RocksDbRaftStateStore,
 };
 use bytes::Bytes;
 use greenmqtt_core::{NodeId, ReplicaRole, ReplicaSyncState};
@@ -562,6 +562,7 @@ async fn memory_raft_node_rewinds_conflicting_follower_log_suffix() {
                 entries: vec![super::RaftLogEntry {
                     term: 9,
                     index: 1,
+                    config_change: None,
                     command: Bytes::from_static(b"old"),
                 }],
                 leader_commit: 1,
@@ -865,7 +866,10 @@ async fn memory_raft_node_prevents_split_brain_after_higher_term_leader_emerges(
             .await
             .unwrap();
     }
-    assert_eq!(replacement.status().await.unwrap().role, RaftNodeRole::Leader);
+    assert_eq!(
+        replacement.status().await.unwrap().role,
+        RaftNodeRole::Leader
+    );
     let new_term = replacement.status().await.unwrap().current_term;
 
     stale_leader
@@ -954,7 +958,7 @@ async fn joint_consensus_transition_survives_restart() {
     restarted.recover().await.unwrap();
     let status = restarted.status().await.unwrap();
     let transition = status.config_transition.expect("joint transition");
-    assert_eq!(status.cluster_config.voters, vec![1, 2, 3]);
+    assert_eq!(status.cluster_config.voters, vec![1, 2]);
     assert_eq!(transition.old_config.voters, vec![1, 2]);
     assert_eq!(transition.final_config.voters, vec![2, 3]);
     assert_eq!(transition.phase, RaftConfigTransitionPhase::JointConsensus);
@@ -1007,6 +1011,26 @@ async fn joint_consensus_blocks_finalizing_away_current_leader() {
     })
     .await
     .unwrap();
+    node.receive(
+        2,
+        RaftMessage::AppendEntriesResponse(AppendEntriesResponse {
+            term: node.status().await.unwrap().current_term,
+            success: true,
+            match_index: 1,
+        }),
+    )
+    .await
+    .unwrap();
+    node.receive(
+        3,
+        RaftMessage::AppendEntriesResponse(AppendEntriesResponse {
+            term: node.status().await.unwrap().current_term,
+            success: true,
+            match_index: 1,
+        }),
+    )
+    .await
+    .unwrap();
 
     let error = node
         .change_cluster_config(RaftConfigChange::FinalizeJointConsensus)
@@ -1036,7 +1060,9 @@ async fn joint_consensus_requires_dual_majority_before_commit_and_finalize() {
     .await
     .unwrap();
 
-    node.propose(Bytes::from_static(b"joint-cmd")).await.unwrap();
+    node.propose(Bytes::from_static(b"joint-cmd"))
+        .await
+        .unwrap();
     node.receive(
         2,
         RaftMessage::AppendEntriesResponse(AppendEntriesResponse {
@@ -1049,7 +1075,7 @@ async fn joint_consensus_requires_dual_majority_before_commit_and_finalize() {
     .unwrap();
 
     let status = node.status().await.unwrap();
-    assert_eq!(status.commit_index, 0);
+    assert_eq!(status.commit_index, 1);
 
     let error = node
         .change_cluster_config(RaftConfigChange::FinalizeJointConsensus)
@@ -1063,19 +1089,217 @@ async fn joint_consensus_requires_dual_majority_before_commit_and_finalize() {
         RaftMessage::AppendEntriesResponse(AppendEntriesResponse {
             term: node.status().await.unwrap().current_term,
             success: true,
-            match_index: 1,
+            match_index: 2,
+        }),
+    )
+    .await
+    .unwrap();
+    node.receive(
+        2,
+        RaftMessage::AppendEntriesResponse(AppendEntriesResponse {
+            term: node.status().await.unwrap().current_term,
+            success: true,
+            match_index: 2,
         }),
     )
     .await
     .unwrap();
 
-    assert_eq!(node.status().await.unwrap().commit_index, 1);
+    assert_eq!(node.status().await.unwrap().commit_index, 2);
     node.change_cluster_config(RaftConfigChange::FinalizeJointConsensus)
         .await
         .unwrap();
-    let final_status = node.status().await.unwrap();
-    assert_eq!(final_status.cluster_config.voters, vec![1, 3]);
-    assert!(final_status.config_transition.is_none());
+    let finalizing_status = node.status().await.unwrap();
+    let transition = finalizing_status
+        .config_transition
+        .clone()
+        .expect("finalizing transition");
+    assert_eq!(transition.phase, RaftConfigTransitionPhase::Finalizing);
+
+    node.receive(
+        2,
+        RaftMessage::AppendEntriesResponse(AppendEntriesResponse {
+            term: node.status().await.unwrap().current_term,
+            success: true,
+            match_index: 3,
+        }),
+    )
+    .await
+    .unwrap();
+    node.receive(
+        3,
+        RaftMessage::AppendEntriesResponse(AppendEntriesResponse {
+            term: node.status().await.unwrap().current_term,
+            success: true,
+            match_index: 3,
+        }),
+    )
+    .await
+    .unwrap();
+
+    let committed_status = node.status().await.unwrap();
+    assert_eq!(committed_status.cluster_config.voters, vec![1, 3]);
+    assert!(committed_status.config_transition.is_some());
+    node.mark_applied(3).await.unwrap();
+    assert!(node.status().await.unwrap().config_transition.is_none());
+}
+
+#[tokio::test]
+async fn joint_consensus_requires_joint_entry_commit_before_target_append() {
+    let node = MemoryRaftNode::new(
+        1,
+        "range-joint-before-target",
+        RaftClusterConfig {
+            voters: vec![1, 2],
+            learners: Vec::new(),
+        },
+    );
+    node.recover().await.unwrap();
+    elect_local_leader(&node).await;
+    node.change_cluster_config(RaftConfigChange::EnterJointConsensus {
+        voters: vec![1, 3],
+        learners: Vec::new(),
+    })
+    .await
+    .unwrap();
+
+    let error = node
+        .change_cluster_config(RaftConfigChange::FinalizeJointConsensus)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("joint config entry must commit"));
+    let transition = node
+        .status()
+        .await
+        .unwrap()
+        .config_transition
+        .expect("joint transition");
+    assert_eq!(transition.target_config_index, 0);
+}
+
+#[tokio::test]
+async fn joint_consensus_restart_between_joint_commit_and_target_commit_preserves_finalizing_state()
+{
+    let store = Arc::new(MemoryRaftStateStore::default());
+    let node = MemoryRaftNode::with_state_store(
+        1,
+        "range-joint-finalizing-restart",
+        RaftClusterConfig {
+            voters: vec![1, 2],
+            learners: Vec::new(),
+        },
+        store.clone(),
+    );
+    node.recover().await.unwrap();
+    elect_local_leader(&node).await;
+    node.change_cluster_config(RaftConfigChange::EnterJointConsensus {
+        voters: vec![1, 3],
+        learners: Vec::new(),
+    })
+    .await
+    .unwrap();
+    node.receive(
+        2,
+        RaftMessage::AppendEntriesResponse(AppendEntriesResponse {
+            term: node.status().await.unwrap().current_term,
+            success: true,
+            match_index: 1,
+        }),
+    )
+    .await
+    .unwrap();
+    node.receive(
+        3,
+        RaftMessage::AppendEntriesResponse(AppendEntriesResponse {
+            term: node.status().await.unwrap().current_term,
+            success: true,
+            match_index: 1,
+        }),
+    )
+    .await
+    .unwrap();
+    node.change_cluster_config(RaftConfigChange::FinalizeJointConsensus)
+        .await
+        .unwrap();
+
+    let restarted = MemoryRaftNode::with_state_store(
+        1,
+        "range-joint-finalizing-restart",
+        RaftClusterConfig::default(),
+        store,
+    );
+    restarted.recover().await.unwrap();
+    let status = restarted.status().await.unwrap();
+    let transition = status.config_transition.expect("finalizing transition");
+    assert_eq!(status.cluster_config.voters, vec![1, 2, 3]);
+    assert_eq!(transition.phase, RaftConfigTransitionPhase::Finalizing);
+    assert_eq!(transition.joint_config_index, 1);
+    assert_eq!(transition.target_config_index, 2);
+}
+
+#[tokio::test]
+async fn follower_replays_committed_joint_config_entries() {
+    let leader = MemoryRaftNode::new(
+        1,
+        "range-joint-follower-replay",
+        RaftClusterConfig {
+            voters: vec![1, 2],
+            learners: Vec::new(),
+        },
+    );
+    let follower = MemoryRaftNode::new(
+        2,
+        "range-joint-follower-replay",
+        RaftClusterConfig {
+            voters: vec![1, 2],
+            learners: Vec::new(),
+        },
+    );
+    leader.recover().await.unwrap();
+    follower.recover().await.unwrap();
+    elect_local_leader(&leader).await;
+
+    leader
+        .change_cluster_config(RaftConfigChange::EnterJointConsensus {
+            voters: vec![1, 3],
+            learners: Vec::new(),
+        })
+        .await
+        .unwrap();
+    deliver_outbox_once(1, &leader, &follower).await;
+    leader
+        .receive(
+            2,
+            RaftMessage::AppendEntriesResponse(AppendEntriesResponse {
+                term: leader.status().await.unwrap().current_term,
+                success: true,
+                match_index: 1,
+            }),
+        )
+        .await
+        .unwrap();
+    let leader_status = leader.status().await.unwrap();
+    follower
+        .receive(
+            1,
+            RaftMessage::AppendEntries(AppendEntriesRequest {
+                term: leader_status.current_term,
+                leader_id: 1,
+                prev_log_index: 1,
+                prev_log_term: 1,
+                entries: Vec::new(),
+                leader_commit: 1,
+            }),
+        )
+        .await
+        .unwrap();
+
+    let status = follower.status().await.unwrap();
+    let transition = status.config_transition.expect("joint transition");
+    assert_eq!(status.cluster_config.voters, vec![1, 2, 3]);
+    assert_eq!(transition.phase, RaftConfigTransitionPhase::JointConsensus);
+    assert_eq!(transition.joint_config_index, 1);
 }
 
 #[tokio::test]
@@ -1146,7 +1370,10 @@ async fn three_replica_reference_soak_survives_restarts_and_repeated_replication
         }
     }
 
-    leader.propose(Bytes::from_static(b"final-sync")).await.unwrap();
+    leader
+        .propose(Bytes::from_static(b"final-sync"))
+        .await
+        .unwrap();
     pump_cluster(&leader, &follower2, &follower3).await;
 
     let leader_status = leader.status().await.unwrap();
@@ -1273,12 +1500,8 @@ async fn memory_raft_node_persists_applied_index_after_mark_applied() {
     let index = node.propose(Bytes::from_static(b"put:z")).await.unwrap();
     node.mark_applied(index).await.unwrap();
 
-    let restored = MemoryRaftNode::with_state_store(
-        1,
-        "range-applied",
-        RaftClusterConfig::default(),
-        store,
-    );
+    let restored =
+        MemoryRaftNode::with_state_store(1, "range-applied", RaftClusterConfig::default(), store);
     restored.recover().await.unwrap();
     let status = restored.status().await.unwrap();
     assert_eq!(status.commit_index, 1);
@@ -1347,11 +1570,13 @@ async fn rocksdb_raft_state_store_splits_hard_progress_and_log_state() {
                     super::RaftLogEntry {
                         term: 2,
                         index: 10,
+                        config_change: None,
                         command: Bytes::from_static(b"a"),
                     },
                     super::RaftLogEntry {
                         term: 3,
                         index: 11,
+                        config_change: None,
                         command: Bytes::from_static(b"b"),
                     },
                 ],

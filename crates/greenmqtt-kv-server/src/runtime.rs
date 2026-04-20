@@ -75,31 +75,29 @@ impl ReplicaRuntime {
         voters: &[NodeId],
         learners: &[NodeId],
     ) -> bool {
-        voters
-            .iter()
-            .chain(learners.iter())
-            .all(|node_id| {
-                status
-                    .replica_progress
-                    .iter()
-                    .find(|replica| replica.node_id == *node_id)
-                    .map(|replica| replica.match_index >= status.commit_index)
-                    .unwrap_or(false)
-            })
+        voters.iter().chain(learners.iter()).all(|node_id| {
+            status
+                .replica_progress
+                .iter()
+                .find(|replica| replica.node_id == *node_id)
+                .map(|replica| replica.match_index >= status.commit_index)
+                .unwrap_or(false)
+        })
     }
 
-    fn config_caught_up(status: &RaftStatusSnapshot, voters: &[NodeId], learners: &[NodeId]) -> bool {
-        voters
-            .iter()
-            .chain(learners.iter())
-            .all(|node_id| {
-                status
-                    .replica_progress
-                    .iter()
-                    .find(|replica| replica.node_id == *node_id)
-                    .map(|replica| replica.match_index >= status.commit_index)
-                    .unwrap_or(false)
-            })
+    fn config_caught_up(
+        status: &RaftStatusSnapshot,
+        voters: &[NodeId],
+        learners: &[NodeId],
+    ) -> bool {
+        voters.iter().chain(learners.iter()).all(|node_id| {
+            status
+                .replica_progress
+                .iter()
+                .find(|replica| replica.node_id == *node_id)
+                .map(|replica| replica.match_index >= status.commit_index)
+                .unwrap_or(false)
+        })
     }
 
     fn voter_quorum_caught_up_to_index(
@@ -189,7 +187,9 @@ impl ReplicaRuntime {
             .clone();
         for status in self.host.list_ranges().await? {
             if let Some(derived) = Self::pending_from_status(&status.raft) {
-                pending.entry(status.descriptor.id.clone()).or_insert(derived);
+                pending
+                    .entry(status.descriptor.id.clone())
+                    .or_insert(derived);
             }
         }
         Ok(pending)
@@ -340,6 +340,9 @@ impl ReplicaRuntime {
     }
 
     async fn apply_entry(range: &HostedRange, entry: &RaftLogEntry) -> anyhow::Result<()> {
+        if entry.config_change.is_some() {
+            return Ok(());
+        }
         let mutations: Vec<KvMutation> = bincode::deserialize(&entry.command)?;
         range.space.writer().apply(mutations).await
     }
@@ -530,7 +533,8 @@ impl ReplicaRuntime {
                 .await?;
         }
         if !right_entries.is_empty() {
-            right.space
+            right
+                .space
                 .writer()
                 .apply(
                     right_entries
@@ -598,11 +602,19 @@ impl ReplicaRuntime {
                     right.descriptor.boundary.end_key.clone(),
                 ),
                 left.descriptor.epoch.max(right.descriptor.epoch) + 1,
-                left.descriptor.config_version.max(right.descriptor.config_version),
-                left.descriptor.leader_node_id.or(right.descriptor.leader_node_id),
+                left.descriptor
+                    .config_version
+                    .max(right.descriptor.config_version),
+                left.descriptor
+                    .leader_node_id
+                    .or(right.descriptor.leader_node_id),
                 left.descriptor.replicas.clone(),
-                left.descriptor.commit_index.max(right.descriptor.commit_index),
-                left.descriptor.applied_index.max(right.descriptor.applied_index),
+                left.descriptor
+                    .commit_index
+                    .max(right.descriptor.commit_index),
+                left.descriptor
+                    .applied_index
+                    .max(right.descriptor.applied_index),
                 ServiceShardLifecycle::Bootstrapping,
             ))
             .await?;
@@ -729,7 +741,10 @@ impl ReplicaRuntime {
             .cloned();
         if let Some(pending) = pending_target.as_ref() {
             anyhow::ensure!(
-                (pending.target_voters.clone(), pending.target_learners.clone()) == desired_target,
+                (
+                    pending.target_voters.clone(),
+                    pending.target_learners.clone()
+                ) == desired_target,
                 "config change already in progress for range `{range_id}`"
             );
         }
@@ -804,12 +819,24 @@ impl ReplicaRuntime {
                         target_learners: transition.final_config.learners.clone(),
                         current_voters: current_voters.clone(),
                         current_learners: current_learners.clone(),
-                        phase: ReconfigurationPhase::JointConsensus,
+                        phase: match transition.phase {
+                            greenmqtt_kv_raft::RaftConfigTransitionPhase::JointConsensus => {
+                                ReconfigurationPhase::JointConsensus
+                            }
+                            greenmqtt_kv_raft::RaftConfigTransitionPhase::Finalizing => {
+                                ReconfigurationPhase::Finalizing
+                            }
+                        },
                         blocked_on_catch_up,
                     },
                 );
+            if transition.phase == greenmqtt_kv_raft::RaftConfigTransitionPhase::Finalizing {
+                return Ok(());
+            }
             if blocked_on_catch_up {
-                anyhow::bail!("config change blocked on dual-majority catch-up for range `{range_id}`");
+                anyhow::bail!(
+                    "config change blocked on dual-majority catch-up for range `{range_id}`"
+                );
             }
             range
                 .raft
@@ -869,7 +896,9 @@ impl ReplicaRuntime {
                 },
             );
         if blocked_on_catch_up {
-            anyhow::bail!("config change blocked before entering joint config for range `{range_id}`");
+            anyhow::bail!(
+                "config change blocked before entering joint config for range `{range_id}`"
+            );
         }
         range
             .raft
@@ -1054,7 +1083,7 @@ impl ReplicaRuntime {
         let health = self.health_snapshot().await?;
         let mut lines = Vec::new();
         for range in health {
-                lines.push(format!(
+            lines.push(format!(
                 "range={} lifecycle={:?} role={:?} term={} leader={:?} commit={} applied={} snapshot={:?} current_voters={:?} current_learners={:?} pending_voters={:?} pending_learners={:?} phase={:?} blocked_on_catch_up={}",
                 range.range_id,
                 range.lifecycle,

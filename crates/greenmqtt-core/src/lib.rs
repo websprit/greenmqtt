@@ -476,9 +476,7 @@ pub trait RangeReconfigurationRegistry: Send + Sync {
         range_id: &str,
     ) -> anyhow::Result<Option<RangeReconfigurationState>>;
 
-    async fn list_reconfiguration_states(
-        &self,
-    ) -> anyhow::Result<Vec<RangeReconfigurationState>>;
+    async fn list_reconfiguration_states(&self) -> anyhow::Result<Vec<RangeReconfigurationState>>;
 }
 
 pub trait MetadataRegistry:

@@ -5,7 +5,10 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use crate::{LogIndex, RaftLogEntry, RaftSnapshot, StoredRaftHardState, StoredRaftProgressState, StoredRaftState};
+use crate::{
+    LogIndex, RaftLogEntry, RaftSnapshot, StoredRaftHardState, StoredRaftProgressState,
+    StoredRaftState,
+};
 
 pub(crate) const HARD_STATE_PREFIX: &[u8] = b"hard\0";
 pub(crate) const PROGRESS_STATE_PREFIX: &[u8] = b"progress\0";

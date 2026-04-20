@@ -2578,7 +2578,10 @@ async fn disconnect_stops_session_registration_handle_cleanly() {
         .await
         .unwrap();
 
-    broker.disconnect(&subscriber.session.session_id).await.unwrap();
+    broker
+        .disconnect(&subscriber.session.session_id)
+        .await
+        .unwrap();
     assert!(broker.list_local_sessions().await.unwrap().is_empty());
 
     broker

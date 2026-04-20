@@ -5,7 +5,7 @@ use super::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use greenmqtt_core::{
-    RangeBoundary, RangeReplica, ReplicaRole, ReplicaSyncState, ReconfigurationPhase,
+    RangeBoundary, RangeReplica, ReconfigurationPhase, ReplicaRole, ReplicaSyncState,
     ReplicatedRangeDescriptor, ServiceShardKey, ServiceShardLifecycle,
 };
 use greenmqtt_kv_balance::{execute_balance_commands, BalanceCommand};
@@ -595,6 +595,70 @@ async fn replica_runtime_change_replicas_updates_raft_config() {
 }
 
 #[tokio::test]
+async fn replica_runtime_accepts_repeated_request_while_final_config_is_committed_but_not_applied()
+{
+    let engine = MemoryKvEngine::default();
+    engine
+        .bootstrap(greenmqtt_kv_engine::KvRangeBootstrap {
+            range_id: "range-config-finalizing".into(),
+            boundary: RangeBoundary::full(),
+        })
+        .await
+        .unwrap();
+    let space = Arc::<dyn greenmqtt_kv_engine::KvRangeSpace>::from(
+        engine.open_range("range-config-finalizing").await.unwrap(),
+    );
+    let raft = Arc::new(MemoryRaftNode::single_node(1, "range-config-finalizing"));
+    raft.recover().await.unwrap();
+    let host = Arc::new(MemoryKvRangeHost::default());
+    host.add_range(HostedRange {
+        descriptor: ReplicatedRangeDescriptor::new(
+            "range-config-finalizing",
+            ServiceShardKey::retain("tenant-a"),
+            RangeBoundary::full(),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ),
+        raft: raft.clone(),
+        space,
+    })
+    .await
+    .unwrap();
+    let runtime = ReplicaRuntime::new(host, Arc::new(RecordingTransport::default()));
+    runtime
+        .change_replicas("range-config-finalizing", vec![1, 2], Vec::new())
+        .await
+        .unwrap();
+    runtime
+        .change_replicas("range-config-finalizing", vec![1, 2], Vec::new())
+        .await
+        .unwrap();
+
+    let status = raft.status().await.unwrap();
+    let transition = status
+        .config_transition
+        .clone()
+        .expect("finalizing transition");
+    assert_eq!(
+        transition.phase,
+        greenmqtt_kv_raft::RaftConfigTransitionPhase::Finalizing
+    );
+    runtime
+        .change_replicas("range-config-finalizing", vec![1, 2], Vec::new())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn replica_runtime_change_replicas_stages_new_voter_as_learner_first() {
     let engine = MemoryKvEngine::default();
     engine
@@ -740,6 +804,7 @@ async fn replica_runtime_allows_new_reconfig_target_after_finalize() {
         .change_replicas("range-stage-finalize", vec![1, 2], Vec::new())
         .await
         .unwrap();
+    runtime.apply_once().await.unwrap();
     runtime
         .change_replicas("range-stage-finalize", vec![1, 3], Vec::new())
         .await
@@ -1135,6 +1200,7 @@ async fn replica_runtime_survives_repeated_replica_reconfiguration_cycles() {
             .change_replicas("range-reconfig-loop", vec![1, target], Vec::new())
             .await
             .unwrap();
+        runtime.apply_once().await.unwrap();
         runtime
             .change_replicas("range-reconfig-loop", vec![1], Vec::new())
             .await
@@ -1143,6 +1209,7 @@ async fn replica_runtime_survives_repeated_replica_reconfiguration_cycles() {
             .change_replicas("range-reconfig-loop", vec![1], Vec::new())
             .await
             .unwrap();
+        runtime.apply_once().await.unwrap();
     }
 
     let final_status = raft.status().await.unwrap();
@@ -1681,7 +1748,11 @@ async fn replica_runtime_split_range_moves_data_into_serving_children() {
             1,
             1,
             Some(1),
-            vec![RangeReplica::new(1, ReplicaRole::Voter, ReplicaSyncState::Replicating)],
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
             0,
             0,
             ServiceShardLifecycle::Serving,
@@ -1751,7 +1822,8 @@ async fn replica_runtime_merge_ranges_moves_data_into_serving_merged_range() {
             .await
             .unwrap();
         let space = engine.open_range(range_id).await.unwrap();
-        space.writer()
+        space
+            .writer()
             .apply(vec![greenmqtt_kv_engine::KvMutation {
                 key: Bytes::copy_from_slice(key),
                 value: Some(Bytes::copy_from_slice(value)),

@@ -910,9 +910,7 @@ impl RangeReconfigurationRegistry for DynamicServiceEndpointRegistry {
             .remove(range_id))
     }
 
-    async fn list_reconfiguration_states(
-        &self,
-    ) -> anyhow::Result<Vec<RangeReconfigurationState>> {
+    async fn list_reconfiguration_states(&self) -> anyhow::Result<Vec<RangeReconfigurationState>> {
         let mut states: Vec<_> = self
             .reconfiguration_states
             .read()
@@ -953,9 +951,7 @@ impl RangeReconfigurationRegistry for PersistentMetadataRegistry {
         self.delete_value(reconfiguration_key(range_id)).await
     }
 
-    async fn list_reconfiguration_states(
-        &self,
-    ) -> anyhow::Result<Vec<RangeReconfigurationState>> {
+    async fn list_reconfiguration_states(&self) -> anyhow::Result<Vec<RangeReconfigurationState>> {
         let mut states = self
             .scan_prefix::<RangeReconfigurationState>(RECONFIG_PREFIX)
             .await?;
@@ -992,9 +988,7 @@ impl RangeReconfigurationRegistry for ReplicatedMetadataRegistry {
         self.delete_value(reconfiguration_key(range_id)).await
     }
 
-    async fn list_reconfiguration_states(
-        &self,
-    ) -> anyhow::Result<Vec<RangeReconfigurationState>> {
+    async fn list_reconfiguration_states(&self) -> anyhow::Result<Vec<RangeReconfigurationState>> {
         let mut states = self
             .scan_prefix::<RangeReconfigurationState>(RECONFIG_PREFIX)
             .await?;
@@ -1215,7 +1209,9 @@ impl ClusterMembershipRegistry for ReplicatedMetadataRegistry {
         member: ClusterNodeMembership,
     ) -> anyhow::Result<Option<ClusterNodeMembership>> {
         let key = member_key(member.node_id);
-        let previous = self.read_value::<ClusterNodeMembership>(key.clone()).await?;
+        let previous = self
+            .read_value::<ClusterNodeMembership>(key.clone())
+            .await?;
         self.write_value(key, &member).await?;
         Ok(previous)
     }

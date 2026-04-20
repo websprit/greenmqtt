@@ -1,18 +1,18 @@
 use super::{
-    DelayedLwtPublish, InboxBatchScheduler,
-    InboxBalanceAction, InboxBalancePolicy, InboxDelayTaskRunner, InboxDelayedTaskHandler, InboxExpiryStats,
-    InboxInflightCommit, InboxDelayedTask, InboxMaintenanceWorker, InboxTenantStats,
-    InboxUnsubscribeSpec, TenantInboxGcRunner, ThresholdInboxBalancePolicy,
     inbox_session_shard, inbox_tenant_scan_shard, inflight_session_shard,
-    inflight_tenant_scan_shard, subscription_shard, InboxHandle, InboxService,
-    PersistentInboxHandle, ReplicatedInboxHandle, OFFLINE_KEY_PREFIX,
+    inflight_tenant_scan_shard, subscription_shard, DelayedLwtPublish, InboxBalanceAction,
+    InboxBalancePolicy, InboxBatchScheduler, InboxDelayTaskRunner, InboxDelayedTask,
+    InboxDelayedTaskHandler, InboxExpiryStats, InboxHandle, InboxInflightCommit,
+    InboxMaintenanceWorker, InboxService, InboxTenantStats, InboxUnsubscribeSpec,
+    PersistentInboxHandle, ReplicatedInboxHandle, TenantInboxGcRunner, ThresholdInboxBalancePolicy,
+    OFFLINE_KEY_PREFIX,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
 use greenmqtt_core::{
-    InflightMessage, InflightPhase, OfflineMessage, PublishProperties, PublishRequest, RangeBoundary,
-    RangeReplica, ReplicaRole, ReplicaSyncState, ReplicatedRangeDescriptor, ServiceShardKey,
-    ServiceShardLifecycle, SessionId, SessionKind, Subscription,
+    InflightMessage, InflightPhase, OfflineMessage, PublishProperties, PublishRequest,
+    RangeBoundary, RangeReplica, ReplicaRole, ReplicaSyncState, ReplicatedRangeDescriptor,
+    ServiceShardKey, ServiceShardLifecycle, SessionId, SessionKind, Subscription,
 };
 use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter, MemoryKvRangeRouter};
 use greenmqtt_kv_engine::{
@@ -2526,7 +2526,11 @@ async fn inbox_delay_task_runner_retries_then_completes() {
         .unwrap();
     assert_eq!(handler.attempts.load(Ordering::SeqCst), 2);
     assert_eq!(
-        handler.expired_tenants.lock().expect("handler poisoned").as_slice(),
+        handler
+            .expired_tenants
+            .lock()
+            .expect("handler poisoned")
+            .as_slice(),
         ["t1"]
     );
 }
@@ -2697,7 +2701,10 @@ async fn inbox_batch_scheduler_covers_attach_fetch_commit_insert_subscribe_and_u
         .unwrap();
     assert_eq!(removed, 1);
 
-    scheduler.detach_all(&["s1".into(), "s2".into()]).await.unwrap();
+    scheduler
+        .detach_all(&["s1".into(), "s2".into()])
+        .await
+        .unwrap();
 }
 
 #[test]
@@ -2789,7 +2796,10 @@ async fn inbox_maintenance_worker_runs_gc_and_delayed_lwt() {
         Duration::from_millis(1),
     );
     task.await.unwrap().unwrap();
-    assert_eq!(lwt_sink.sessions.lock().expect("sink poisoned").as_slice(), ["s1"]);
+    assert_eq!(
+        lwt_sink.sessions.lock().expect("sink poisoned").as_slice(),
+        ["s1"]
+    );
 }
 
 #[tokio::test]
@@ -2913,7 +2923,11 @@ async fn replicated_inbox_uses_prefix_scans_and_exact_gets_for_session_paths() {
     let _ = inbox.peek(&"s1".into()).await.unwrap();
     let _ = inbox.fetch_inflight(&"s1".into()).await.unwrap();
 
-    assert!(!executor.get_keys.lock().expect("executor poisoned").is_empty());
+    assert!(!executor
+        .get_keys
+        .lock()
+        .expect("executor poisoned")
+        .is_empty());
     let scan_boundaries = executor
         .scan_boundaries
         .lock()
@@ -2942,7 +2956,10 @@ async fn local_qos2_release_transition_updates_inflight_phase() {
         .await
         .unwrap();
 
-    assert!(inbox.promote_inflight_release(&"s1".into(), 7).await.unwrap());
+    assert!(inbox
+        .promote_inflight_release(&"s1".into(), 7)
+        .await
+        .unwrap());
     let inflight = inbox.fetch_inflight(&"s1".into()).await.unwrap();
     assert_eq!(inflight.len(), 1);
     assert_eq!(inflight[0].phase, InflightPhase::Release);
@@ -2953,7 +2970,8 @@ async fn persistent_qos2_release_transition_survives_restart() {
     let subscriptions = Arc::new(MemorySubscriptionStore::default());
     let messages = Arc::new(MemoryInboxStore::default());
     let inflight = Arc::new(MemoryInflightStore::default());
-    let inbox = PersistentInboxHandle::open(subscriptions.clone(), messages.clone(), inflight.clone());
+    let inbox =
+        PersistentInboxHandle::open(subscriptions.clone(), messages.clone(), inflight.clone());
 
     inbox
         .stage_inflight(InflightMessage {
@@ -2970,7 +2988,10 @@ async fn persistent_qos2_release_transition_survives_restart() {
         })
         .await
         .unwrap();
-    assert!(inbox.promote_inflight_release(&"s1".into(), 9).await.unwrap());
+    assert!(inbox
+        .promote_inflight_release(&"s1".into(), 9)
+        .await
+        .unwrap());
 
     let cold = PersistentInboxHandle::open(subscriptions, messages, inflight);
     let inflight = cold.fetch_inflight(&"s1".into()).await.unwrap();
@@ -3029,8 +3050,14 @@ async fn replicated_qos2_release_transition_is_idempotent() {
         .await
         .unwrap();
 
-    assert!(inbox.promote_inflight_release(&"s1".into(), 11).await.unwrap());
-    assert!(inbox.promote_inflight_release(&"s1".into(), 11).await.unwrap());
+    assert!(inbox
+        .promote_inflight_release(&"s1".into(), 11)
+        .await
+        .unwrap());
+    assert!(inbox
+        .promote_inflight_release(&"s1".into(), 11)
+        .await
+        .unwrap());
     let inflight = inbox.fetch_inflight(&"s1".into()).await.unwrap();
     assert_eq!(inflight.len(), 1);
     assert_eq!(inflight[0].phase, InflightPhase::Release);

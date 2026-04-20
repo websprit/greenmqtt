@@ -81,7 +81,10 @@ async fn mqtt_quic_ingress_shaping_settings_allow_connect_subscribe_publish_flow
 
     let subscriber_conn = connect_quic_with_retry(&endpoint, bind).await;
     let (mut subscriber_tx, mut subscriber_rx) = subscriber_conn.open_bi().await.unwrap();
-    subscriber_tx.write_all(&connect_packet("sub")).await.unwrap();
+    subscriber_tx
+        .write_all(&connect_packet("sub"))
+        .await
+        .unwrap();
     assert_eq!(
         subscriber_rx.read_u8().await.unwrap() >> 4,
         PACKET_TYPE_CONNACK
@@ -104,7 +107,10 @@ async fn mqtt_quic_ingress_shaping_settings_allow_connect_subscribe_publish_flow
 
     let publisher_conn = connect_quic_with_retry(&endpoint, bind).await;
     let (mut publisher_tx, mut publisher_rx) = publisher_conn.open_bi().await.unwrap();
-    publisher_tx.write_all(&connect_packet("pub")).await.unwrap();
+    publisher_tx
+        .write_all(&connect_packet("pub"))
+        .await
+        .unwrap();
     assert_eq!(
         publisher_rx.read_u8().await.unwrap() >> 4,
         PACKET_TYPE_CONNACK

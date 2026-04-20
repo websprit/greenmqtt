@@ -13,10 +13,12 @@ use greenmqtt_core::{
 use greenmqtt_kv_engine::{KvMutation, KvRangeCheckpoint, KvRangeSnapshot};
 use greenmqtt_kv_raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    OutboundRaftMessage, RaftLogEntry, RaftMessage, RaftSnapshot, RequestVoteRequest,
-    RequestVoteResponse,
+    OutboundRaftMessage, RaftConfigLogEntry, RaftLogEntry, RaftMessage, RaftSnapshot,
+    RequestVoteRequest, RequestVoteResponse,
 };
 use internal as proto;
+
+const CONFIG_CHANGE_PREFIX: &[u8] = b"__greenmqtt_cfg__";
 
 pub fn to_proto_client_identity(identity: &ClientIdentity) -> proto::ClientIdentity {
     proto::ClientIdentity {
@@ -452,15 +454,33 @@ pub fn to_proto_raft_log_entry(entry: &RaftLogEntry) -> proto::RaftLogEntryRecor
     proto::RaftLogEntryRecord {
         term: entry.term,
         index: entry.index,
-        command: entry.command.to_vec(),
+        command: if let Some(config_change) = &entry.config_change {
+            let mut encoded = CONFIG_CHANGE_PREFIX.to_vec();
+            encoded.extend(
+                bincode::serialize(config_change)
+                    .expect("config-change log entry should serialize"),
+            );
+            encoded
+        } else {
+            entry.command.to_vec()
+        },
     }
 }
 
 pub fn from_proto_raft_log_entry(entry: proto::RaftLogEntryRecord) -> RaftLogEntry {
+    let (config_change, command) = if entry.command.starts_with(CONFIG_CHANGE_PREFIX) {
+        let payload = &entry.command[CONFIG_CHANGE_PREFIX.len()..];
+        let decoded = bincode::deserialize::<RaftConfigLogEntry>(payload)
+            .expect("config-change log entry should deserialize");
+        (Some(decoded), Bytes::new())
+    } else {
+        (None, Bytes::from(entry.command))
+    };
     RaftLogEntry {
         term: entry.term,
         index: entry.index,
-        command: Bytes::from(entry.command),
+        config_change,
+        command,
     }
 }
 

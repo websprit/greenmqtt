@@ -187,7 +187,6 @@ impl SessionDictGrpcClient {
     }
 }
 
-
 impl DistGrpcClient {
     pub async fn connect(endpoint: impl Into<String>) -> anyhow::Result<Self> {
         Ok(Self {
@@ -685,6 +684,68 @@ impl InboxGrpcClient {
             + snapshot.inflight_messages.len())
     }
 
+    pub async fn send_lwt(&self, publish: DelayedLwtPublish) -> anyhow::Result<()> {
+        let mut client = self.inner.lock().await;
+        client
+            .send_lwt(InboxSendLwtRequest {
+                tenant_id: publish.tenant_id,
+                session_id: publish.session_id,
+                topic: publish.publish.topic,
+                payload: publish.publish.payload.to_vec(),
+                qos: publish.publish.qos as u32,
+                retain: publish.publish.retain,
+                properties: Some(greenmqtt_proto::to_proto_publish_properties(
+                    &publish.publish.properties,
+                )),
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn expire_all(
+        &self,
+        tenant_id: &str,
+        now_ms: u64,
+    ) -> anyhow::Result<InboxMaintenanceReply> {
+        let mut client = self.inner.lock().await;
+        Ok(client
+            .expire_all(InboxExpireAllRequest {
+                tenant_id: tenant_id.to_string(),
+                now_ms,
+            })
+            .await?
+            .into_inner())
+    }
+
+    pub async fn tenant_gc_preview(
+        &self,
+        tenant_id: &str,
+    ) -> anyhow::Result<InboxMaintenanceReply> {
+        let mut client = self.inner.lock().await;
+        Ok(client
+            .tenant_gc_preview(InboxTenantGcRequest {
+                tenant_id: tenant_id.to_string(),
+                now_ms: 0,
+            })
+            .await?
+            .into_inner())
+    }
+
+    pub async fn tenant_gc_run(
+        &self,
+        tenant_id: &str,
+        now_ms: u64,
+    ) -> anyhow::Result<InboxMaintenanceReply> {
+        let mut client = self.inner.lock().await;
+        Ok(client
+            .tenant_gc_run(InboxTenantGcRequest {
+                tenant_id: tenant_id.to_string(),
+                now_ms,
+            })
+            .await?
+            .into_inner())
+    }
+
     pub async fn move_shard_via_registry(
         registry: &DynamicServiceEndpointRegistry,
         shard: ServiceShardKey,
@@ -949,6 +1010,39 @@ impl RetainGrpcClient {
             );
         }
         Ok(source_checksum)
+    }
+
+    pub async fn expire_all(&self, tenant_id: &str) -> anyhow::Result<usize> {
+        let mut client = self.inner.lock().await;
+        let reply = client
+            .expire_all(RetainExpireAllRequest {
+                tenant_id: tenant_id.to_string(),
+            })
+            .await?
+            .into_inner();
+        Ok(reply.count as usize)
+    }
+
+    pub async fn tenant_gc_preview(&self, tenant_id: &str) -> anyhow::Result<usize> {
+        let mut client = self.inner.lock().await;
+        let reply = client
+            .tenant_gc_preview(RetainTenantGcRequest {
+                tenant_id: tenant_id.to_string(),
+            })
+            .await?
+            .into_inner();
+        Ok(reply.count as usize)
+    }
+
+    pub async fn tenant_gc_run(&self, tenant_id: &str) -> anyhow::Result<usize> {
+        let mut client = self.inner.lock().await;
+        let reply = client
+            .tenant_gc_run(RetainTenantGcRequest {
+                tenant_id: tenant_id.to_string(),
+            })
+            .await?
+            .into_inner();
+        Ok(reply.count as usize)
     }
 }
 
@@ -1590,9 +1684,24 @@ impl RoutedRangeControlGrpcClient {
         metadata_endpoint: impl Into<String>,
         fallback_endpoint: impl Into<String>,
     ) -> anyhow::Result<Self> {
+        Self::connect_with_backoff(
+            metadata_endpoint,
+            fallback_endpoint,
+            Duration::from_millis(DEFAULT_RPC_RETRY_AFTER_MS),
+        )
+        .await
+    }
+
+    pub async fn connect_with_backoff(
+        metadata_endpoint: impl Into<String>,
+        fallback_endpoint: impl Into<String>,
+        overload_backoff: Duration,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
             metadata: MetadataGrpcClient::connect(metadata_endpoint.into()).await?,
             fallback_endpoint: fallback_endpoint.into(),
+            endpoint_backoff: Arc::new(Mutex::new(HashMap::new())),
+            overload_backoff,
         })
     }
 
@@ -1613,7 +1722,9 @@ impl RoutedRangeControlGrpcClient {
             .endpoints
             .first()
             .map(|endpoint| endpoint.endpoint.clone())
-            .ok_or_else(|| anyhow::anyhow!("member {} has no registered RPC endpoints", member.node_id))
+            .ok_or_else(|| {
+                anyhow::anyhow!("member {} has no registered RPC endpoints", member.node_id)
+            })
     }
 
     fn target_node_for_descriptor(descriptor: &ReplicatedRangeDescriptor) -> Option<NodeId> {
@@ -1661,7 +1772,11 @@ impl RoutedRangeControlGrpcClient {
     ) -> anyhow::Result<RoutedRangeControlTarget> {
         let descriptors = self
             .metadata
-            .list_ranges(Some(shard.kind.clone()), Some(&shard.tenant_id), Some(&shard.scope))
+            .list_ranges(
+                Some(shard.kind.clone()),
+                Some(&shard.tenant_id),
+                Some(&shard.scope),
+            )
             .await?;
         anyhow::ensure!(
             !descriptors.is_empty(),
@@ -1677,14 +1792,6 @@ impl RoutedRangeControlGrpcClient {
         self.resolve_range_target(&descriptors[0].id).await
     }
 
-    async fn control_client_for_range(
-        &self,
-        range_id: &str,
-    ) -> anyhow::Result<RangeControlGrpcClient> {
-        let target = self.resolve_range_target(range_id).await?;
-        RangeControlGrpcClient::connect(target.endpoint).await
-    }
-
     async fn control_client_for_descriptor(
         &self,
         descriptor: &ReplicatedRangeDescriptor,
@@ -1695,10 +1802,43 @@ impl RoutedRangeControlGrpcClient {
                     &member,
                     Some(descriptor.shard.service_kind()),
                 )?;
+                self.ensure_endpoint_available(&endpoint).await?;
                 return RangeControlGrpcClient::connect(endpoint).await;
             }
         }
+        self.ensure_endpoint_available(&self.fallback_endpoint)
+            .await?;
         RangeControlGrpcClient::connect(self.fallback_endpoint.clone()).await
+    }
+
+    async fn ensure_endpoint_available(&self, endpoint: &str) -> anyhow::Result<()> {
+        let mut backoff = self.endpoint_backoff.lock().await;
+        if let Some(until) = backoff.get(endpoint).copied() {
+            if until > Instant::now() {
+                anyhow::bail!("rpc/endpoint-backed-off endpoint={endpoint}");
+            }
+            backoff.remove(endpoint);
+        }
+        Ok(())
+    }
+
+    async fn note_endpoint_overload(&self, endpoint: &str, error: &anyhow::Error) {
+        let Some(status) = error.downcast_ref::<tonic::Status>() else {
+            return;
+        };
+        if status.code() != tonic::Code::ResourceExhausted {
+            return;
+        }
+        let retry_after_ms = status
+            .metadata()
+            .get("x-greenmqtt-retry-after-ms")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(self.overload_backoff.as_millis() as u64);
+        self.endpoint_backoff.lock().await.insert(
+            endpoint.to_string(),
+            Instant::now() + Duration::from_millis(retry_after_ms),
+        );
     }
 
     pub async fn bootstrap_range(
@@ -1717,10 +1857,14 @@ impl RoutedRangeControlGrpcClient {
         voters: Vec<NodeId>,
         learners: Vec<NodeId>,
     ) -> anyhow::Result<()> {
-        self.control_client_for_range(range_id)
-            .await?
-            .change_replicas(range_id, voters, learners)
-            .await
+        let target = self.resolve_range_target(range_id).await?;
+        self.ensure_endpoint_available(&target.endpoint).await?;
+        let client = RangeControlGrpcClient::connect(target.endpoint.clone()).await?;
+        let result = client.change_replicas(range_id, voters, learners).await;
+        if let Err(error) = &result {
+            self.note_endpoint_overload(&target.endpoint, error).await;
+        }
+        result
     }
 
     pub async fn transfer_leadership(
@@ -1728,10 +1872,14 @@ impl RoutedRangeControlGrpcClient {
         range_id: &str,
         target_node_id: NodeId,
     ) -> anyhow::Result<()> {
-        self.control_client_for_range(range_id)
-            .await?
-            .transfer_leadership(range_id, target_node_id)
-            .await
+        let target = self.resolve_range_target(range_id).await?;
+        self.ensure_endpoint_available(&target.endpoint).await?;
+        let client = RangeControlGrpcClient::connect(target.endpoint.clone()).await?;
+        let result = client.transfer_leadership(range_id, target_node_id).await;
+        if let Err(error) = &result {
+            self.note_endpoint_overload(&target.endpoint, error).await;
+        }
+        result
     }
 
     pub async fn recover_range(
@@ -1739,10 +1887,14 @@ impl RoutedRangeControlGrpcClient {
         range_id: &str,
         new_leader_node_id: NodeId,
     ) -> anyhow::Result<()> {
-        self.control_client_for_range(range_id)
-            .await?
-            .recover_range(range_id, new_leader_node_id)
-            .await
+        let target = self.resolve_range_target(range_id).await?;
+        self.ensure_endpoint_available(&target.endpoint).await?;
+        let client = RangeControlGrpcClient::connect(target.endpoint.clone()).await?;
+        let result = client.recover_range(range_id, new_leader_node_id).await;
+        if let Err(error) = &result {
+            self.note_endpoint_overload(&target.endpoint, error).await;
+        }
+        result
     }
 
     pub async fn split_range(
@@ -1750,10 +1902,14 @@ impl RoutedRangeControlGrpcClient {
         range_id: &str,
         split_key: Vec<u8>,
     ) -> anyhow::Result<(String, String)> {
-        self.control_client_for_range(range_id)
-            .await?
-            .split_range(range_id, split_key)
-            .await
+        let target = self.resolve_range_target(range_id).await?;
+        self.ensure_endpoint_available(&target.endpoint).await?;
+        let client = RangeControlGrpcClient::connect(target.endpoint.clone()).await?;
+        let result = client.split_range(range_id, split_key).await;
+        if let Err(error) = &result {
+            self.note_endpoint_overload(&target.endpoint, error).await;
+        }
+        result
     }
 
     pub async fn merge_ranges(
@@ -1761,24 +1917,36 @@ impl RoutedRangeControlGrpcClient {
         left_range_id: &str,
         right_range_id: &str,
     ) -> anyhow::Result<String> {
-        self.control_client_for_range(left_range_id)
-            .await?
-            .merge_ranges(left_range_id, right_range_id)
-            .await
+        let target = self.resolve_range_target(left_range_id).await?;
+        self.ensure_endpoint_available(&target.endpoint).await?;
+        let client = RangeControlGrpcClient::connect(target.endpoint.clone()).await?;
+        let result = client.merge_ranges(left_range_id, right_range_id).await;
+        if let Err(error) = &result {
+            self.note_endpoint_overload(&target.endpoint, error).await;
+        }
+        result
     }
 
     pub async fn drain_range(&self, range_id: &str) -> anyhow::Result<()> {
-        self.control_client_for_range(range_id)
-            .await?
-            .drain_range(range_id)
-            .await
+        let target = self.resolve_range_target(range_id).await?;
+        self.ensure_endpoint_available(&target.endpoint).await?;
+        let client = RangeControlGrpcClient::connect(target.endpoint.clone()).await?;
+        let result = client.drain_range(range_id).await;
+        if let Err(error) = &result {
+            self.note_endpoint_overload(&target.endpoint, error).await;
+        }
+        result
     }
 
     pub async fn retire_range(&self, range_id: &str) -> anyhow::Result<()> {
-        self.control_client_for_range(range_id)
-            .await?
-            .retire_range(range_id)
-            .await
+        let target = self.resolve_range_target(range_id).await?;
+        self.ensure_endpoint_available(&target.endpoint).await?;
+        let client = RangeControlGrpcClient::connect(target.endpoint.clone()).await?;
+        let result = client.retire_range(range_id).await;
+        if let Err(error) = &result {
+            self.note_endpoint_overload(&target.endpoint, error).await;
+        }
+        result
     }
 }
 

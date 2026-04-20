@@ -6,10 +6,10 @@ use greenmqtt_broker::mqtt::{
 use greenmqtt_broker::{BrokerConfig, BrokerRuntime};
 use greenmqtt_core::{
     ClientIdentity, ClusterMembershipRegistry, ClusterNodeLifecycle, ClusterNodeMembership,
-    ConnectRequest, Lifecycle, MetadataRegistry, PublishProperties, PublishRequest, RangeBoundary,
-    RangeReplica, ReplicaRole, ReplicaSyncState, ReplicatedRangeDescriptor, ServiceEndpoint,
-    ServiceKind, ServiceShardKey, ServiceShardKind, ServiceShardLifecycle, SessionKind,
-    ShardControlRegistry,
+    ConnectRequest, ControlPlaneRegistry, Lifecycle, MetadataRegistry, PublishProperties,
+    PublishRequest, RangeBoundary, RangeReplica, ReplicaRole, ReplicaSyncState,
+    ReplicatedRangeDescriptor, ServiceEndpoint, ServiceKind, ServiceShardKey, ServiceShardKind,
+    ServiceShardLifecycle, SessionKind, ShardControlRegistry,
 };
 use greenmqtt_dist::{
     DistBalanceAction, DistBalancePolicy, DistHandle, DistMaintenanceWorker, DistRouter,
@@ -17,17 +17,22 @@ use greenmqtt_dist::{
 };
 use greenmqtt_http_api::HttpApi;
 use greenmqtt_inbox::{
-    DelayedLwtPublish, DelayedLwtSink, InboxBalanceAction, InboxBalancePolicy,
-    InboxDelayTaskRunner, InboxDelayedTask, InboxHandle, InboxMaintenanceWorker, InboxService,
-    InboxServiceDelayHandler, InboxTenantStats, PersistentInboxHandle, ReplicatedInboxHandle,
-    TenantInboxGcRunner, ThresholdInboxBalancePolicy,
+    inbox_tenant_gc_run, DelayedLwtPublish, DelayedLwtSink, InboxBalanceAction, InboxBalancePolicy,
+    InboxHandle, InboxService, InboxTenantStats, PersistentInboxHandle, ReplicatedInboxHandle,
+    ThresholdInboxBalancePolicy,
+};
+use greenmqtt_kv_balance::{
+    BalanceCommand, BalanceCommandExecutor, BalanceCoordinator, ControlPlaneRuntime,
+    ControlPlaneRuntimeConfig, MetadataBalanceController,
 };
 use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter, LeaderRoutedKvRangeExecutor};
 use greenmqtt_kv_engine::{
     KvEngine, KvMutation, KvRangeBootstrap, KvRangeCheckpoint, KvRangeSnapshot, RocksDbKvEngine,
 };
 use greenmqtt_kv_raft::{MemoryRaftNode, RaftNode};
-use greenmqtt_kv_server::{HostedRange, KvRangeHost, MemoryKvRangeHost, RangeLifecycleManager, ReplicaRuntime};
+use greenmqtt_kv_server::{
+    HostedRange, KvRangeHost, MemoryKvRangeHost, RangeLifecycleManager, ReplicaRuntime,
+};
 use greenmqtt_plugin_api::{
     current_listener_profile, AclAction, AclDecision, AclProvider, AclRule, AuthProvider,
     BridgeEventHook, BridgeRule, ConfiguredAcl, ConfiguredAuth, ConfiguredEventHook, EventHook,
@@ -36,16 +41,15 @@ use greenmqtt_plugin_api::{
     TopicRewriteRule, WebHookConfig, WebHookEventHook, BRIDGE_CLIENT_ID_PREFIX,
 };
 use greenmqtt_retain::{
-    PersistentRetainHandle, ReplicatedRetainHandle, RetainBalanceAction, RetainBalancePolicy,
-    RetainHandle, RetainMaintenanceWorker, RetainService, RetainTenantStats,
+    retain_tenant_gc_run, PersistentRetainHandle, ReplicatedRetainHandle, RetainBalanceAction,
+    RetainBalancePolicy, RetainHandle, RetainService, RetainTenantStats,
     ThresholdRetainBalancePolicy,
 };
 use greenmqtt_rpc::{
     DistGrpcClient, InboxGrpcClient, KvRangeGrpcClient, KvRangeGrpcExecutorFactory,
-    MetadataGrpcClient, MetadataPlaneLayout, PersistentMetadataRegistry,
-    NoopReplicaTransport, RangeControlGrpcClient, RoutedRangeControlGrpcClient,
-    ReplicatedMetadataRegistry,
-    RetainGrpcClient, RpcRuntime, SessionDictGrpcClient, StaticPeerForwarder,
+    MetadataGrpcClient, MetadataPlaneLayout, NoopReplicaTransport, PersistentMetadataRegistry,
+    RangeControlGrpcClient, ReplicatedMetadataRegistry, RetainGrpcClient,
+    RoutedRangeControlGrpcClient, RpcRuntime, SessionDictGrpcClient, StaticPeerForwarder,
     StaticServiceEndpointRegistry,
 };
 use greenmqtt_sessiondict::{
@@ -455,12 +459,17 @@ struct RangeCliReply {
     ok: bool,
     status: String,
     reason: String,
+    mode: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     forwarded: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     target_node_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     target_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audit_action: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     range_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -490,6 +499,84 @@ fn run_shard_command(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn run_control_command(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
+    let addr = std::env::var("GREENMQTT_HTTP_BIND")
+        .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
+        .parse::<SocketAddr>()?;
+    let mut args = args;
+    let subcommand = args
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing control-command subcommand"))?;
+    let (method, path, body) = match subcommand.as_str() {
+        "list" => {
+            let mut query = Vec::new();
+            while let Some(flag) = args.next() {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("missing value for {flag}"))?;
+                match flag.as_str() {
+                    "--execution-state" => query.push(format!("execution_state={value}")),
+                    "--reflection-state" => query.push(format!("reflection_state={value}")),
+                    "--issued-by" => query.push(format!("issued_by={value}")),
+                    "--target" => query.push(format!("target_range_or_shard={value}")),
+                    _ => anyhow::bail!("unknown control-command flag: {flag}"),
+                }
+            }
+            let path = if query.is_empty() {
+                "/v1/control-commands".to_string()
+            } else {
+                format!("/v1/control-commands?{}", query.join("&"))
+            };
+            ("GET".to_string(), path, None)
+        }
+        "get" => {
+            let command_id = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("missing command_id"))?;
+            ("GET".to_string(), format!("/v1/control-commands/{command_id}"), None)
+        }
+        "retry" => {
+            let command_id = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("missing command_id"))?;
+            (
+                "POST".to_string(),
+                format!("/v1/control-commands/{command_id}/retry"),
+                Some("{}".to_string()),
+            )
+        }
+        "fail" => {
+            let command_id = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("missing command_id"))?;
+            let last_error = args.next();
+            (
+                "POST".to_string(),
+                format!("/v1/control-commands/{command_id}/fail"),
+                Some(
+                    serde_json::json!({
+                        "last_error": last_error,
+                    })
+                    .to_string(),
+                ),
+            )
+        }
+        "prune" => {
+            let older_than_ms = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("missing older_than_ms"))?;
+            (
+                "DELETE".to_string(),
+                format!("/v1/control-commands?older_than_ms={older_than_ms}"),
+                None,
+            )
+        }
+        other => anyhow::bail!("unknown control-command subcommand: {other}"),
+    };
+    println!("{}", http_request_body(addr, &method, &path, body.as_deref())?);
+    Ok(())
+}
+
 async fn run_range_command(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let endpoint = range_control_endpoint()?;
     let response = execute_range_command_with_endpoint(args, &endpoint).await?;
@@ -503,18 +590,23 @@ async fn execute_range_command_with_endpoint(
 ) -> anyhow::Result<String> {
     let (command, output_mode) = range_command_request(args)?;
     let client = RangeControlGrpcClient::connect(endpoint.to_string()).await?;
-    let routed_client =
-        RoutedRangeControlGrpcClient::connect(range_metadata_endpoint(endpoint)?, endpoint.to_string())
-            .await?;
+    let routed_client = RoutedRangeControlGrpcClient::connect(
+        range_metadata_endpoint(endpoint)?,
+        endpoint.to_string(),
+    )
+    .await?;
     let reply = match command {
         RangeCliCommand::Bootstrap { descriptor } => RangeCliReply {
             operation: "bootstrap".into(),
             ok: true,
             status: "bootstrapped".into(),
             reason: "Range bootstrapped and marked serving.".into(),
+            mode: "local".into(),
             forwarded: false,
             target_node_id: None,
             target_endpoint: None,
+            command_id: None,
+            audit_action: None,
             range_id: Some(client.bootstrap_range(descriptor).await?),
             left_range_id: None,
             right_range_id: None,
@@ -533,9 +625,12 @@ async fn execute_range_command_with_endpoint(
                 ok: true,
                 status: "split".into(),
                 reason: "Range split completed; child ranges are now available.".into(),
+                mode: if resolved.forwarded { "forwarded".into() } else { "local".into() },
                 forwarded: resolved.forwarded,
                 target_node_id: resolved.target_node_id,
                 target_endpoint: resolved.target_endpoint,
+                command_id: None,
+                audit_action: None,
                 range_id: Some(resolved.range_id),
                 left_range_id: Some(left_range_id),
                 right_range_id: Some(right_range_id),
@@ -549,9 +644,12 @@ async fn execute_range_command_with_endpoint(
             ok: true,
             status: "merged".into(),
             reason: "Sibling ranges were merged into a single serving range.".into(),
+            mode: "local".into(),
             forwarded: false,
             target_node_id: None,
             target_endpoint: None,
+            command_id: None,
+            audit_action: None,
             range_id: Some(client.merge_ranges(&left_range_id, &right_range_id).await?),
             left_range_id: Some(left_range_id),
             right_range_id: Some(right_range_id),
@@ -567,10 +665,14 @@ async fn execute_range_command_with_endpoint(
                 operation: "drain".into(),
                 ok: true,
                 status: "draining".into(),
-                reason: "Range marked draining; writes should migrate away before retirement.".into(),
+                reason: "Range marked draining; writes should migrate away before retirement."
+                    .into(),
+                mode: if resolved.forwarded { "forwarded".into() } else { "local".into() },
                 forwarded: resolved.forwarded,
                 target_node_id: resolved.target_node_id,
                 target_endpoint: resolved.target_endpoint,
+                command_id: None,
+                audit_action: None,
                 range_id: Some(resolved.range_id),
                 left_range_id: None,
                 right_range_id: None,
@@ -587,10 +689,14 @@ async fn execute_range_command_with_endpoint(
                 operation: "retire".into(),
                 ok: true,
                 status: "retired".into(),
-                reason: "Range retired; repeated retire requests are treated as already applied.".into(),
+                reason: "Range retired; repeated retire requests are treated as already applied."
+                    .into(),
+                mode: if resolved.forwarded { "forwarded".into() } else { "local".into() },
                 forwarded: resolved.forwarded,
                 target_node_id: resolved.target_node_id,
                 target_endpoint: resolved.target_endpoint,
+                command_id: None,
+                audit_action: None,
                 range_id: Some(resolved.range_id),
                 left_range_id: None,
                 right_range_id: None,
@@ -615,9 +721,12 @@ async fn execute_range_command_with_endpoint(
                 ok: true,
                 status: "recovered".into(),
                 reason: "Recovery command accepted; the target leader is now authoritative or already was.".into(),
+                mode: if resolved.forwarded { "forwarded".into() } else { "local".into() },
                 forwarded: resolved.forwarded,
                 target_node_id: resolved.target_node_id,
                 target_endpoint: resolved.target_endpoint,
+                command_id: None,
+                audit_action: None,
                 range_id: Some(resolved.range_id),
                 left_range_id: None,
                 right_range_id: None,
@@ -643,9 +752,12 @@ async fn execute_range_command_with_endpoint(
                 ok: true,
                 status: "reconfiguring".into(),
                 reason: "Replica change accepted; consult range health for staging or catch-up progress.".into(),
+                mode: if resolved.forwarded { "forwarded".into() } else { "local".into() },
                 forwarded: resolved.forwarded,
                 target_node_id: resolved.target_node_id,
                 target_endpoint: resolved.target_endpoint,
+                command_id: None,
+                audit_action: None,
                 range_id: Some(resolved.range_id),
                 left_range_id: None,
                 right_range_id: None,
@@ -670,9 +782,12 @@ async fn execute_range_command_with_endpoint(
                 ok: true,
                 status: "leadership-updated".into(),
                 reason: "Leadership transfer accepted; if the target already led the range this was a no-op.".into(),
+                mode: if resolved.forwarded { "forwarded".into() } else { "local".into() },
                 forwarded: resolved.forwarded,
                 target_node_id: resolved.target_node_id,
                 target_endpoint: resolved.target_endpoint,
+                command_id: None,
+                audit_action: None,
                 range_id: Some(resolved.range_id),
                 left_range_id: None,
                 right_range_id: None,
@@ -695,11 +810,13 @@ fn range_control_endpoint() -> anyhow::Result<String> {
                 .filter(|value| !value.trim().is_empty())
         })
         .unwrap_or_else(|| "127.0.0.1:50051".to_string());
-    Ok(if raw.starts_with("http://") || raw.starts_with("https://") {
-        raw
-    } else {
-        format!("http://{raw}")
-    })
+    Ok(
+        if raw.starts_with("http://") || raw.starts_with("https://") {
+            raw
+        } else {
+            format!("http://{raw}")
+        },
+    )
 }
 
 fn range_metadata_endpoint(default_endpoint: &str) -> anyhow::Result<String> {
@@ -707,11 +824,13 @@ fn range_metadata_endpoint(default_endpoint: &str) -> anyhow::Result<String> {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| default_endpoint.to_string());
-    Ok(if raw.starts_with("http://") || raw.starts_with("https://") {
-        raw
-    } else {
-        format!("http://{raw}")
-    })
+    Ok(
+        if raw.starts_with("http://") || raw.starts_with("https://") {
+            raw
+        } else {
+            format!("http://{raw}")
+        },
+    )
 }
 
 fn finish_range_target(
@@ -798,17 +917,17 @@ fn render_range_response_text(reply: &RangeCliReply) -> String {
     ) {
         (Some(range_id), Some(left), Some(right)) => {
             format!(
-                "ok operation={} status={} reason=\"{}\" range_id={} left_range_id={} right_range_id={}",
-                reply.operation, reply.status, reply.reason, range_id, left, right
+                "ok operation={} mode={} status={} reason=\"{}\" range_id={} left_range_id={} right_range_id={}",
+                reply.operation, reply.mode, reply.status, reply.reason, range_id, left, right
             )
         }
         (Some(range_id), _, _) => format!(
-            "ok operation={} status={} reason=\"{}\" range_id={}",
-            reply.operation, reply.status, reply.reason, range_id
+            "ok operation={} mode={} status={} reason=\"{}\" range_id={}",
+            reply.operation, reply.mode, reply.status, reply.reason, range_id
         ),
         _ => format!(
-            "ok operation={} status={} reason=\"{}\"",
-            reply.operation, reply.status, reply.reason
+            "ok operation={} mode={} status={} reason=\"{}\"",
+            reply.operation, reply.mode, reply.status, reply.reason
         ),
     };
     if reply.forwarded {
@@ -845,18 +964,85 @@ fn range_command_request(
             let mut output = output_mode();
             while let Some(flag) = args.next() {
                 match flag.as_str() {
-                    "--range-id" => range_id = Some(args.next().ok_or_else(|| anyhow::anyhow!("missing value for --range-id"))?),
-                    "--kind" => kind = Some(parse_service_shard_kind(&args.next().ok_or_else(|| anyhow::anyhow!("missing value for --kind"))?)?),
-                    "--tenant-id" => tenant_id = Some(args.next().ok_or_else(|| anyhow::anyhow!("missing value for --tenant-id"))?),
-                    "--scope" => scope = Some(args.next().ok_or_else(|| anyhow::anyhow!("missing value for --scope"))?),
-                    "--start-key" => start_key = Some(args.next().ok_or_else(|| anyhow::anyhow!("missing value for --start-key"))?.into_bytes()),
-                    "--end-key" => end_key = Some(args.next().ok_or_else(|| anyhow::anyhow!("missing value for --end-key"))?.into_bytes()),
-                    "--epoch" => epoch = args.next().ok_or_else(|| anyhow::anyhow!("missing value for --epoch"))?.parse()?,
-                    "--config-version" => config_version = args.next().ok_or_else(|| anyhow::anyhow!("missing value for --config-version"))?.parse()?,
-                    "--leader-node-id" => leader_node_id = Some(args.next().ok_or_else(|| anyhow::anyhow!("missing value for --leader-node-id"))?.parse()?),
-                    "--voters" => voters = Some(parse_node_id_list(&args.next().ok_or_else(|| anyhow::anyhow!("missing value for --voters"))?)?),
-                    "--learners" => learners = parse_node_id_list(&args.next().ok_or_else(|| anyhow::anyhow!("missing value for --learners"))?)?,
-                    "--output" => output = parse_output_mode(&args.next().ok_or_else(|| anyhow::anyhow!("missing value for --output"))?)?,
+                    "--range-id" => {
+                        range_id = Some(
+                            args.next()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --range-id"))?,
+                        )
+                    }
+                    "--kind" => {
+                        kind =
+                            Some(parse_service_shard_kind(&args.next().ok_or_else(
+                                || anyhow::anyhow!("missing value for --kind"),
+                            )?)?)
+                    }
+                    "--tenant-id" => {
+                        tenant_id = Some(
+                            args.next()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --tenant-id"))?,
+                        )
+                    }
+                    "--scope" => {
+                        scope = Some(
+                            args.next()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --scope"))?,
+                        )
+                    }
+                    "--start-key" => {
+                        start_key = Some(
+                            args.next()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --start-key"))?
+                                .into_bytes(),
+                        )
+                    }
+                    "--end-key" => {
+                        end_key = Some(
+                            args.next()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --end-key"))?
+                                .into_bytes(),
+                        )
+                    }
+                    "--epoch" => {
+                        epoch = args
+                            .next()
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --epoch"))?
+                            .parse()?
+                    }
+                    "--config-version" => {
+                        config_version = args
+                            .next()
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --config-version"))?
+                            .parse()?
+                    }
+                    "--leader-node-id" => {
+                        leader_node_id = Some(
+                            args.next()
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("missing value for --leader-node-id")
+                                })?
+                                .parse()?,
+                        )
+                    }
+                    "--voters" => {
+                        voters =
+                            Some(parse_node_id_list(&args.next().ok_or_else(|| {
+                                anyhow::anyhow!("missing value for --voters")
+                            })?)?)
+                    }
+                    "--learners" => {
+                        learners = parse_node_id_list(
+                            &args
+                                .next()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --learners"))?,
+                        )?
+                    }
+                    "--output" => {
+                        output = parse_output_mode(
+                            &args
+                                .next()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --output"))?,
+                        )?
+                    }
                     _ => anyhow::bail!("unknown range bootstrap flag: {flag}"),
                 }
             }
@@ -867,9 +1053,12 @@ fn range_command_request(
                     descriptor: ReplicatedRangeDescriptor::new(
                         range_id.ok_or_else(|| anyhow::anyhow!("bootstrap requires --range-id"))?,
                         ServiceShardKey {
-                            kind: kind.ok_or_else(|| anyhow::anyhow!("bootstrap requires --kind"))?,
-                            tenant_id: tenant_id.ok_or_else(|| anyhow::anyhow!("bootstrap requires --tenant-id"))?,
-                            scope: scope.ok_or_else(|| anyhow::anyhow!("bootstrap requires --scope"))?,
+                            kind: kind
+                                .ok_or_else(|| anyhow::anyhow!("bootstrap requires --kind"))?,
+                            tenant_id: tenant_id
+                                .ok_or_else(|| anyhow::anyhow!("bootstrap requires --tenant-id"))?,
+                            scope: scope
+                                .ok_or_else(|| anyhow::anyhow!("bootstrap requires --scope"))?,
                         },
                         RangeBoundary::new(start_key, end_key),
                         epoch,
@@ -879,10 +1068,18 @@ fn range_command_request(
                             .iter()
                             .copied()
                             .map(|node_id| {
-                                RangeReplica::new(node_id, ReplicaRole::Voter, ReplicaSyncState::Replicating)
+                                RangeReplica::new(
+                                    node_id,
+                                    ReplicaRole::Voter,
+                                    ReplicaSyncState::Replicating,
+                                )
                             })
                             .chain(learners.iter().copied().map(|node_id| {
-                                RangeReplica::new(node_id, ReplicaRole::Learner, ReplicaSyncState::Replicating)
+                                RangeReplica::new(
+                                    node_id,
+                                    ReplicaRole::Learner,
+                                    ReplicaSyncState::Replicating,
+                                )
                             }))
                             .collect(),
                         0,
@@ -894,7 +1091,9 @@ fn range_command_request(
             ))
         }
         "split" => {
-            let first = args.next().ok_or_else(|| anyhow::anyhow!("missing range target"))?;
+            let first = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("missing range target"))?;
             let mut range_id = None;
             let mut kind = None;
             let mut tenant_id = None;
@@ -912,13 +1111,36 @@ fn range_command_request(
                                 .into_bytes(),
                         );
                     }
-                    "--kind" => kind = Some(parse_service_shard_kind(&args.next().ok_or_else(|| anyhow::anyhow!("missing value for --kind"))?)?),
-                    "--tenant-id" => tenant_id = Some(args.next().ok_or_else(|| anyhow::anyhow!("missing value for --tenant-id"))?),
-                    "--scope" => scope = Some(args.next().ok_or_else(|| anyhow::anyhow!("missing value for --scope"))?),
-                    "--split-key" => split_key = Some(args.next().ok_or_else(|| anyhow::anyhow!("missing value for --split-key"))?.into_bytes()),
+                    "--kind" => {
+                        kind =
+                            Some(parse_service_shard_kind(&args.next().ok_or_else(
+                                || anyhow::anyhow!("missing value for --kind"),
+                            )?)?)
+                    }
+                    "--tenant-id" => {
+                        tenant_id = Some(
+                            args.next()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --tenant-id"))?,
+                        )
+                    }
+                    "--scope" => {
+                        scope = Some(
+                            args.next()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --scope"))?,
+                        )
+                    }
+                    "--split-key" => {
+                        split_key = Some(
+                            args.next()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --split-key"))?
+                                .into_bytes(),
+                        )
+                    }
                     "--output" => {
                         output = parse_output_mode(
-                            &args.next().ok_or_else(|| anyhow::anyhow!("missing value for --output"))?,
+                            &args
+                                .next()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --output"))?,
                         )?
                     }
                     _ => anyhow::bail!("unknown range split flag: {flag}"),
@@ -927,29 +1149,45 @@ fn range_command_request(
             Ok((
                 RangeCliCommand::Split {
                     target: finish_range_target(range_id, kind, tenant_id, scope)?,
-                    split_key: split_key.ok_or_else(|| anyhow::anyhow!("split requires split_key or --split-key"))?,
+                    split_key: split_key.ok_or_else(|| {
+                        anyhow::anyhow!("split requires split_key or --split-key")
+                    })?,
                 },
                 output,
             ))
         }
         "merge" => {
-            let left_range_id = args.next().ok_or_else(|| anyhow::anyhow!("missing left_range_id"))?;
-            let right_range_id = args.next().ok_or_else(|| anyhow::anyhow!("missing right_range_id"))?;
+            let left_range_id = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("missing left_range_id"))?;
+            let right_range_id = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("missing right_range_id"))?;
             let mut output = output_mode();
             while let Some(flag) = args.next() {
                 match flag.as_str() {
                     "--output" => {
                         output = parse_output_mode(
-                            &args.next().ok_or_else(|| anyhow::anyhow!("missing value for --output"))?,
+                            &args
+                                .next()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --output"))?,
                         )?
                     }
                     _ => anyhow::bail!("unknown range merge flag: {flag}"),
                 }
             }
-            Ok((RangeCliCommand::Merge { left_range_id, right_range_id }, output))
+            Ok((
+                RangeCliCommand::Merge {
+                    left_range_id,
+                    right_range_id,
+                },
+                output,
+            ))
         }
         "drain" | "retire" => {
-            let first = args.next().ok_or_else(|| anyhow::anyhow!("missing range target"))?;
+            let first = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("missing range target"))?;
             let mut range_id = None;
             let mut kind = None;
             let mut tenant_id = None;
@@ -961,12 +1199,29 @@ fn range_command_request(
                     value if !value.starts_with("--") && range_id.is_none() => {
                         range_id = Some(value.to_string());
                     }
-                    "--kind" => kind = Some(parse_service_shard_kind(&args.next().ok_or_else(|| anyhow::anyhow!("missing value for --kind"))?)?),
-                    "--tenant-id" => tenant_id = Some(args.next().ok_or_else(|| anyhow::anyhow!("missing value for --tenant-id"))?),
-                    "--scope" => scope = Some(args.next().ok_or_else(|| anyhow::anyhow!("missing value for --scope"))?),
+                    "--kind" => {
+                        kind =
+                            Some(parse_service_shard_kind(&args.next().ok_or_else(
+                                || anyhow::anyhow!("missing value for --kind"),
+                            )?)?)
+                    }
+                    "--tenant-id" => {
+                        tenant_id = Some(
+                            args.next()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --tenant-id"))?,
+                        )
+                    }
+                    "--scope" => {
+                        scope = Some(
+                            args.next()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --scope"))?,
+                        )
+                    }
                     "--output" => {
                         output = parse_output_mode(
-                            &args.next().ok_or_else(|| anyhow::anyhow!("missing value for --output"))?,
+                            &args
+                                .next()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --output"))?,
                         )?
                     }
                     _ => anyhow::bail!("unknown range {subcommand} flag: {flag}"),
@@ -981,7 +1236,9 @@ fn range_command_request(
             Ok((command, output))
         }
         "recover" => {
-            let first = args.next().ok_or_else(|| anyhow::anyhow!("missing range target"))?;
+            let first = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("missing range target"))?;
             let mut range_id = None;
             let mut kind = None;
             let mut tenant_id = None;
@@ -999,19 +1256,38 @@ fn range_command_request(
                                 .parse()?,
                         );
                     }
-                    "--kind" => kind = Some(parse_service_shard_kind(&args.next().ok_or_else(|| anyhow::anyhow!("missing value for --kind"))?)?),
-                    "--tenant-id" => tenant_id = Some(args.next().ok_or_else(|| anyhow::anyhow!("missing value for --tenant-id"))?),
-                    "--scope" => scope = Some(args.next().ok_or_else(|| anyhow::anyhow!("missing value for --scope"))?),
+                    "--kind" => {
+                        kind =
+                            Some(parse_service_shard_kind(&args.next().ok_or_else(
+                                || anyhow::anyhow!("missing value for --kind"),
+                            )?)?)
+                    }
+                    "--tenant-id" => {
+                        tenant_id = Some(
+                            args.next()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --tenant-id"))?,
+                        )
+                    }
+                    "--scope" => {
+                        scope = Some(
+                            args.next()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --scope"))?,
+                        )
+                    }
                     "--new-leader-node-id" => {
                         new_leader_node_id = Some(
                             args.next()
-                                .ok_or_else(|| anyhow::anyhow!("missing value for --new-leader-node-id"))?
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("missing value for --new-leader-node-id")
+                                })?
                                 .parse()?,
                         )
                     }
                     "--output" => {
                         output = parse_output_mode(
-                            &args.next().ok_or_else(|| anyhow::anyhow!("missing value for --output"))?,
+                            &args
+                                .next()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --output"))?,
                         )?
                     }
                     _ => anyhow::bail!("unknown range recover flag: {flag}"),
@@ -1020,14 +1296,19 @@ fn range_command_request(
             Ok((
                 RangeCliCommand::Recover {
                     target: finish_range_target(range_id, kind, tenant_id, scope)?,
-                    new_leader_node_id: new_leader_node_id
-                        .ok_or_else(|| anyhow::anyhow!("recover requires new_leader_node_id or --new-leader-node-id"))?,
+                    new_leader_node_id: new_leader_node_id.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "recover requires new_leader_node_id or --new-leader-node-id"
+                        )
+                    })?,
                 },
                 output,
             ))
         }
         "change-replicas" => {
-            let first = args.next().ok_or_else(|| anyhow::anyhow!("missing range target"))?;
+            let first = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("missing range target"))?;
             let mut range_id = None;
             let mut kind = None;
             let mut tenant_id = None;
@@ -1041,22 +1322,42 @@ fn range_command_request(
                     value if !value.starts_with("--") && range_id.is_none() => {
                         range_id = Some(value.to_string());
                     }
-                    "--kind" => kind = Some(parse_service_shard_kind(&args.next().ok_or_else(|| anyhow::anyhow!("missing value for --kind"))?)?),
-                    "--tenant-id" => tenant_id = Some(args.next().ok_or_else(|| anyhow::anyhow!("missing value for --tenant-id"))?),
-                    "--scope" => scope = Some(args.next().ok_or_else(|| anyhow::anyhow!("missing value for --scope"))?),
+                    "--kind" => {
+                        kind =
+                            Some(parse_service_shard_kind(&args.next().ok_or_else(
+                                || anyhow::anyhow!("missing value for --kind"),
+                            )?)?)
+                    }
+                    "--tenant-id" => {
+                        tenant_id = Some(
+                            args.next()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --tenant-id"))?,
+                        )
+                    }
+                    "--scope" => {
+                        scope = Some(
+                            args.next()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --scope"))?,
+                        )
+                    }
                     "--voters" => {
-                        voters = Some(parse_node_id_list(
-                            &args.next().ok_or_else(|| anyhow::anyhow!("missing value for --voters"))?,
-                        )?)
+                        voters =
+                            Some(parse_node_id_list(&args.next().ok_or_else(|| {
+                                anyhow::anyhow!("missing value for --voters")
+                            })?)?)
                     }
                     "--learners" => {
                         learners = parse_node_id_list(
-                            &args.next().ok_or_else(|| anyhow::anyhow!("missing value for --learners"))?,
+                            &args
+                                .next()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --learners"))?,
                         )?
                     }
                     "--output" => {
                         output = parse_output_mode(
-                            &args.next().ok_or_else(|| anyhow::anyhow!("missing value for --output"))?,
+                            &args
+                                .next()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --output"))?,
                         )?
                     }
                     _ => anyhow::bail!("unknown range change-replicas flag: {flag}"),
@@ -1065,14 +1366,17 @@ fn range_command_request(
             Ok((
                 RangeCliCommand::ChangeReplicas {
                     target: finish_range_target(range_id, kind, tenant_id, scope)?,
-                    voters: voters.ok_or_else(|| anyhow::anyhow!("change-replicas requires --voters"))?,
+                    voters: voters
+                        .ok_or_else(|| anyhow::anyhow!("change-replicas requires --voters"))?,
                     learners,
                 },
                 output,
             ))
         }
         "transfer-leadership" => {
-            let first = args.next().ok_or_else(|| anyhow::anyhow!("missing range target"))?;
+            let first = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("missing range target"))?;
             let mut range_id = None;
             let mut kind = None;
             let mut tenant_id = None;
@@ -1090,19 +1394,38 @@ fn range_command_request(
                                 .parse()?,
                         );
                     }
-                    "--kind" => kind = Some(parse_service_shard_kind(&args.next().ok_or_else(|| anyhow::anyhow!("missing value for --kind"))?)?),
-                    "--tenant-id" => tenant_id = Some(args.next().ok_or_else(|| anyhow::anyhow!("missing value for --tenant-id"))?),
-                    "--scope" => scope = Some(args.next().ok_or_else(|| anyhow::anyhow!("missing value for --scope"))?),
+                    "--kind" => {
+                        kind =
+                            Some(parse_service_shard_kind(&args.next().ok_or_else(
+                                || anyhow::anyhow!("missing value for --kind"),
+                            )?)?)
+                    }
+                    "--tenant-id" => {
+                        tenant_id = Some(
+                            args.next()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --tenant-id"))?,
+                        )
+                    }
+                    "--scope" => {
+                        scope = Some(
+                            args.next()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --scope"))?,
+                        )
+                    }
                     "--target-node-id" => {
                         target_node_id = Some(
                             args.next()
-                                .ok_or_else(|| anyhow::anyhow!("missing value for --target-node-id"))?
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("missing value for --target-node-id")
+                                })?
                                 .parse()?,
                         )
                     }
                     "--output" => {
                         output = parse_output_mode(
-                            &args.next().ok_or_else(|| anyhow::anyhow!("missing value for --output"))?,
+                            &args
+                                .next()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --output"))?,
                         )?
                     }
                     _ => anyhow::bail!("unknown range transfer-leadership flag: {flag}"),
@@ -1111,8 +1434,11 @@ fn range_command_request(
             Ok((
                 RangeCliCommand::TransferLeadership {
                     target: finish_range_target(range_id, kind, tenant_id, scope)?,
-                    target_node_id: target_node_id
-                        .ok_or_else(|| anyhow::anyhow!("transfer-leadership requires target_node_id or --target-node-id"))?,
+                    target_node_id: target_node_id.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "transfer-leadership requires target_node_id or --target-node-id"
+                        )
+                    })?,
                 },
                 output,
             ))
@@ -1383,6 +1709,9 @@ async fn main() -> anyhow::Result<()> {
     if mode == "range" {
         return run_range_command(args).await;
     }
+    if mode == "control-command" {
+        return run_control_command(args);
+    }
 
     let node_id = std::env::var("GREENMQTT_NODE_ID")
         .ok()
@@ -1414,7 +1743,8 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     match data_dir {
                         Some(ref dir) if storage_backend == "rocksdb" => {
-                            let stack = range_scoped_rocksdb_stack(PathBuf::from(dir), node_id).await?;
+                            let stack =
+                                range_scoped_rocksdb_stack(PathBuf::from(dir), node_id).await?;
                             local_range_host = Some(stack.range_host.clone());
                             local_range_runtime = Some(stack.range_runtime.clone());
                             (stack.sessiondict, stack.dist, stack.inbox, stack.retain)
@@ -1451,6 +1781,7 @@ async fn main() -> anyhow::Result<()> {
             assignment_registry: None,
             range_host: local_range_host,
             range_runtime: local_range_runtime,
+            inbox_lwt_sink: None,
         }
         .serve(rpc_bind)
         .await?;
@@ -1682,13 +2013,14 @@ async fn main() -> anyhow::Result<()> {
                     .as_ref()
                     .map(|dir| PathBuf::from(dir).join("metadata"))
             });
-        let (metadata_registry, shard_registry): (
+        let (metadata_registry, shard_registry, control_plane_registry): (
             Arc<dyn MetadataRegistry>,
             Arc<dyn ShardControlRegistry>,
+            Arc<dyn ControlPlaneRegistry>,
         ) = match metadata_backend.as_str() {
             "memory" => {
                 let registry = Arc::new(StaticServiceEndpointRegistry::default());
-                (registry.clone(), registry)
+                (registry.clone(), registry.clone(), registry)
             }
             "rocksdb" => {
                 let path = metadata_dir.ok_or_else(|| {
@@ -1697,7 +2029,7 @@ async fn main() -> anyhow::Result<()> {
                     )
                 })?;
                 let registry = Arc::new(PersistentMetadataRegistry::open(path).await?);
-                (registry.clone(), registry)
+                (registry.clone(), registry.clone(), registry)
             }
             "replicated" => {
                 let range_endpoint = std::env::var("GREENMQTT_RANGE_ENDPOINT")
@@ -1712,10 +2044,8 @@ async fn main() -> anyhow::Result<()> {
                 let range_base = std::env::var("GREENMQTT_METADATA_RANGE_ID")
                     .unwrap_or_else(|_| "__metadata".to_string());
                 let layout = MetadataPlaneLayout {
-                    assignments_range_id: std::env::var(
-                        "GREENMQTT_METADATA_ASSIGNMENTS_RANGE_ID",
-                    )
-                    .unwrap_or_else(|_| format!("{range_base}.assignments")),
+                    assignments_range_id: std::env::var("GREENMQTT_METADATA_ASSIGNMENTS_RANGE_ID")
+                        .unwrap_or_else(|_| format!("{range_base}.assignments")),
                     members_range_id: std::env::var("GREENMQTT_METADATA_MEMBERS_RANGE_ID")
                         .unwrap_or_else(|_| format!("{range_base}.members")),
                     ranges_range_id: std::env::var("GREENMQTT_METADATA_RANGES_RANGE_ID")
@@ -1727,7 +2057,7 @@ async fn main() -> anyhow::Result<()> {
                     Arc::new(KvRangeGrpcClient::connect(range_endpoint).await?),
                     layout,
                 ));
-                (registry.clone(), registry)
+                (registry.clone(), registry.clone(), registry)
             }
             other => anyhow::bail!("unsupported GREENMQTT_METADATA_BACKEND: {other}"),
         };
@@ -1758,7 +2088,7 @@ async fn main() -> anyhow::Result<()> {
                 broker.clone(),
                 Arc::new(peer_forwarder.clone()),
                 shard_registry.clone(),
-                metadata_registry.clone(),
+                control_plane_registry.clone(),
                 range_runtime,
                 metrics_handle,
                 http_bind,
@@ -1768,7 +2098,7 @@ async fn main() -> anyhow::Result<()> {
                 broker.clone(),
                 Arc::new(peer_forwarder.clone()),
                 shard_registry.clone(),
-                metadata_registry.clone(),
+                control_plane_registry.clone(),
                 metrics_handle,
                 http_bind,
             )
@@ -1782,6 +2112,9 @@ async fn main() -> anyhow::Result<()> {
             assignment_registry: Some(metadata_registry),
             range_host: local_range_host.clone(),
             range_runtime: local_range_runtime.clone(),
+            inbox_lwt_sink: Some(Arc::new(BrokerDelayedLwtPublisher {
+                broker: broker.clone(),
+            })),
         };
         let mut tasks = JoinSet::new();
         tasks.spawn(async move { http.start().await });
@@ -1803,6 +2136,16 @@ async fn main() -> anyhow::Result<()> {
             configured_retain_maintenance()?,
         ) {
             spawn_retain_maintenance_task(&mut tasks, retain_runtime, retain_maintenance);
+        }
+        if let Some(control_plane_runtime) = configured_control_plane_runtime(
+            node_id,
+            control_plane_registry.clone(),
+            format!("http://{rpc_bind}"),
+        )
+        .await?
+        {
+            let runtime = control_plane_runtime;
+            tasks.spawn(async move { runtime.serve().await });
         }
         for listener in tcp_listeners {
             let broker = broker.clone();
@@ -3852,6 +4195,103 @@ fn current_time_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn env_parse_bool(key: &str, default: bool) -> anyhow::Result<bool> {
+    match std::env::var(key) {
+        Ok(raw) if !raw.trim().is_empty() => match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            _ => anyhow::bail!("invalid value for {key}: {raw}"),
+        },
+        _ => Ok(default),
+    }
+}
+
+async fn configured_control_plane_runtime(
+    node_id: u64,
+    registry: Arc<dyn ControlPlaneRegistry>,
+    metadata_endpoint: String,
+) -> anyhow::Result<Option<ControlPlaneRuntime>> {
+    if !env_parse_bool("GREENMQTT_CONTROL_PLANE_ENABLED", false)? {
+        return Ok(None);
+    }
+    let controller_node_id =
+        env_parse_or::<u64>("GREENMQTT_CONTROL_PLANE_CONTROLLER_NODE_ID", node_id)?;
+    if controller_node_id != node_id {
+        eprintln!(
+            "greenmqtt control plane runtime not started on node {node_id}; controller node is {controller_node_id}"
+        );
+        return Ok(None);
+    }
+    let desired_ranges = std::env::var("GREENMQTT_CONTROL_PLANE_DESIRED_RANGES_JSON")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|raw| {
+            serde_json::from_str::<Vec<ReplicatedRangeDescriptor>>(&raw).map_err(|error| {
+                anyhow::anyhow!(
+                    "invalid GREENMQTT_CONTROL_PLANE_DESIRED_RANGES_JSON payload: {error}"
+                )
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let config = ControlPlaneRuntimeConfig {
+        balancer_name: std::env::var("GREENMQTT_CONTROL_PLANE_BALANCER_NAME")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "metadata-control-plane".to_string()),
+        controller_id: std::env::var("GREENMQTT_CONTROL_PLANE_CONTROLLER_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| format!("node-{node_id}")),
+        desired_ranges,
+        voters_per_range: env_parse_or("GREENMQTT_CONTROL_PLANE_VOTERS_PER_RANGE", 3usize)?,
+        learners_per_range: env_parse_or("GREENMQTT_CONTROL_PLANE_LEARNERS_PER_RANGE", 0usize)?,
+        bootstrap_interval: Duration::from_secs(env_parse_or(
+            "GREENMQTT_CONTROL_PLANE_BOOTSTRAP_INTERVAL_SECS",
+            30u64,
+        )?),
+        replica_reconcile_interval: Duration::from_secs(env_parse_or(
+            "GREENMQTT_CONTROL_PLANE_REPLICA_INTERVAL_SECS",
+            30u64,
+        )?),
+        leader_rebalance_interval: Duration::from_secs(env_parse_or(
+            "GREENMQTT_CONTROL_PLANE_LEADER_INTERVAL_SECS",
+            30u64,
+        )?),
+        cleanup_interval: Duration::from_secs(env_parse_or(
+            "GREENMQTT_CONTROL_PLANE_CLEANUP_INTERVAL_SECS",
+            30u64,
+        )?),
+        recovery_interval: Duration::from_secs(env_parse_or(
+            "GREENMQTT_CONTROL_PLANE_RECOVERY_INTERVAL_SECS",
+            30u64,
+        )?),
+        command_reconcile_interval: Duration::from_secs(env_parse_or(
+            "GREENMQTT_CONTROL_PLANE_COMMAND_INTERVAL_SECS",
+            10u64,
+        )?),
+    };
+    let controller = Arc::new(MetadataBalanceController::new(registry.clone()));
+    let coordinator = BalanceCoordinator::with_reconciliation(
+        controller.clone(),
+        Arc::new(ControlPlaneExecutor {
+            registry: registry.clone(),
+            range_control: RoutedRangeControlGrpcClient::connect(
+                metadata_endpoint.clone(),
+                metadata_endpoint.clone(),
+            )
+            .await?,
+        }),
+        registry.clone(),
+        config.balancer_name.clone(),
+    );
+    Ok(Some(ControlPlaneRuntime::new(
+        coordinator,
+        registry,
+        config,
+    )))
+}
+
 fn configured_dist_maintenance() -> anyhow::Result<Option<DistMaintenanceConfig>> {
     let tenants = std::env::var("GREENMQTT_DIST_MAINTENANCE_TENANTS")
         .ok()
@@ -3926,10 +4366,7 @@ fn spawn_dist_maintenance_task(
             ticker.tick().await;
             let actions = run_dist_maintenance_tick(dist.clone(), &config).await?;
             if !actions.is_empty() {
-                eprintln!(
-                    "greenmqtt dist maintenance proposed actions: {:?}",
-                    actions
-                );
+                eprintln!("greenmqtt dist maintenance proposed actions: {:?}", actions);
             }
         }
     });
@@ -3949,16 +4386,8 @@ fn configured_inbox_maintenance() -> anyhow::Result<Option<InboxMaintenanceConfi
             "GREENMQTT_INBOX_MAINTENANCE_INTERVAL_SECS",
             30u64,
         )?),
-        retry_delay: Duration::from_millis(env_parse_or(
-            "GREENMQTT_INBOX_MAINTENANCE_RETRY_DELAY_MS",
-            100u64,
-        )?),
-        max_retries: env_parse_or("GREENMQTT_INBOX_MAINTENANCE_MAX_RETRIES", 2usize)?,
         policy: ThresholdInboxBalancePolicy {
-            max_subscriptions: env_parse_or(
-                "GREENMQTT_INBOX_MAX_SUBSCRIPTIONS",
-                5_000usize,
-            )?,
+            max_subscriptions: env_parse_or("GREENMQTT_INBOX_MAX_SUBSCRIPTIONS", 5_000usize)?,
             max_offline_messages: env_parse_or(
                 "GREENMQTT_INBOX_MAX_OFFLINE_MESSAGES",
                 20_000usize,
@@ -3989,24 +4418,9 @@ async fn run_inbox_maintenance_tick(
     inbox: Arc<ReplicatedInboxHandle>,
     config: &InboxMaintenanceConfig,
 ) -> anyhow::Result<Vec<InboxBalanceAction>> {
-    let handler = Arc::new(InboxServiceDelayHandler::new(
-        inbox.clone(),
-        Arc::new(NoopDelayedLwtPublisher),
-    ));
-    let worker = InboxMaintenanceWorker::new(
-        TenantInboxGcRunner::new(inbox.clone()),
-        InboxDelayTaskRunner::new(handler, config.max_retries, config.retry_delay),
-    );
     let mut stats = Vec::new();
     for tenant_id in &config.tenants {
-        let task = worker.schedule_delayed_task(
-            InboxDelayedTask::ExpireTenant {
-                tenant_id: tenant_id.clone(),
-                now_ms: current_time_ms(),
-            },
-            Duration::ZERO,
-        );
-        task.await??;
+        let _ = inbox_tenant_gc_run(inbox.as_ref(), tenant_id, current_time_ms()).await?;
         stats.push(InboxTenantStats {
             tenant_id: tenant_id.clone(),
             subscriptions: inbox.count_tenant_subscriptions(tenant_id).await?,
@@ -4052,10 +4466,7 @@ fn configured_retain_maintenance() -> anyhow::Result<Option<RetainMaintenanceCon
             30u64,
         )?),
         policy: ThresholdRetainBalancePolicy {
-            max_retained_messages: env_parse_or(
-                "GREENMQTT_RETAIN_MAX_MESSAGES",
-                10_000usize,
-            )?,
+            max_retained_messages: env_parse_or("GREENMQTT_RETAIN_MAX_MESSAGES", 10_000usize)?,
             desired_voters: env_parse_or("GREENMQTT_RETAIN_DESIRED_VOTERS", 3usize)?,
             desired_learners: env_parse_or("GREENMQTT_RETAIN_DESIRED_LEARNERS", 1usize)?,
         },
@@ -4071,17 +4482,18 @@ async fn replicated_retain_runtime_handle(
     let (metadata_endpoint, range_endpoint) =
         resolved_replicated_endpoints(state_endpoint, "retain")?;
     let (router, executor) = replicated_range_clients(&metadata_endpoint, &range_endpoint).await?;
-    Ok(Some(Arc::new(ReplicatedRetainHandle::new(router, executor))))
+    Ok(Some(Arc::new(ReplicatedRetainHandle::new(
+        router, executor,
+    ))))
 }
 
 async fn run_retain_maintenance_tick(
     retain: Arc<ReplicatedRetainHandle>,
     config: &RetainMaintenanceConfig,
 ) -> anyhow::Result<Vec<RetainBalanceAction>> {
-    let worker = RetainMaintenanceWorker::new(retain.clone());
     let mut stats = Vec::new();
     for tenant_id in &config.tenants {
-        let _ = worker.refresh_tenant(tenant_id).await?;
+        let _ = retain_tenant_gc_run(retain.as_ref(), tenant_id).await?;
         stats.push(RetainTenantStats {
             tenant_id: tenant_id.clone(),
             retained_messages: retain.list_tenant_retained(tenant_id).await?.len(),
@@ -4167,8 +4579,6 @@ struct DistMaintenanceConfig {
 struct InboxMaintenanceConfig {
     tenants: Vec<String>,
     interval: Duration,
-    retry_delay: Duration,
-    max_retries: usize,
     policy: ThresholdInboxBalancePolicy,
 }
 
@@ -4179,12 +4589,76 @@ struct RetainMaintenanceConfig {
     policy: ThresholdRetainBalancePolicy,
 }
 
-#[derive(Clone, Default)]
-struct NoopDelayedLwtPublisher;
+#[derive(Clone)]
+struct ControlPlaneExecutor {
+    registry: Arc<dyn ControlPlaneRegistry>,
+    range_control: RoutedRangeControlGrpcClient,
+}
 
 #[async_trait]
-impl DelayedLwtSink for NoopDelayedLwtPublisher {
-    async fn send_lwt(&self, _publish: &DelayedLwtPublish) -> anyhow::Result<()> {
+impl BalanceCommandExecutor for ControlPlaneExecutor {
+    async fn execute(&self, command: &BalanceCommand) -> anyhow::Result<bool> {
+        match command {
+            BalanceCommand::BootstrapRange { range_id, .. } => {
+                let descriptor = self
+                    .registry
+                    .resolve_range(range_id)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("bootstrap range missing from metadata"))?;
+                let _ = self.range_control.bootstrap_range(descriptor).await?;
+                Ok(true)
+            }
+            BalanceCommand::ChangeReplicas {
+                range_id,
+                voters,
+                learners,
+            } => {
+                self.range_control
+                    .change_replicas(range_id, voters.clone(), learners.clone())
+                    .await?;
+                Ok(true)
+            }
+            BalanceCommand::TransferLeadership {
+                range_id,
+                to_node_id,
+                ..
+            } => {
+                self.range_control
+                    .transfer_leadership(range_id, *to_node_id)
+                    .await?;
+                Ok(true)
+            }
+            BalanceCommand::RecoverRange {
+                range_id,
+                new_leader_node_id,
+            } => {
+                self.range_control
+                    .recover_range(range_id, *new_leader_node_id)
+                    .await?;
+                Ok(true)
+            }
+            BalanceCommand::CleanupReplicas { .. }
+            | BalanceCommand::MigrateShard { .. }
+            | BalanceCommand::FailoverShard { .. }
+            | BalanceCommand::RecordBalancerState { .. }
+            | BalanceCommand::SplitRange { .. }
+            | BalanceCommand::MergeRanges { .. } => Ok(true),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct BrokerDelayedLwtPublisher {
+    broker: AppBroker,
+}
+
+#[async_trait]
+impl DelayedLwtSink for BrokerDelayedLwtPublisher {
+    async fn send_lwt(&self, publish: &DelayedLwtPublish) -> anyhow::Result<()> {
+        let _ = self
+            .broker
+            .publish(&publish.session_id, publish.publish.clone())
+            .await?;
         Ok(())
     }
 }

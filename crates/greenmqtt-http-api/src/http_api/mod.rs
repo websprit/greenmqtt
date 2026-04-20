@@ -5,10 +5,8 @@ use axum::{
     Extension, Router,
 };
 use greenmqtt_broker::{BrokerRuntime, PeerRegistry};
+use greenmqtt_core::{ControlPlaneRegistry, Lifecycle, ShardControlRegistry};
 use greenmqtt_kv_server::ReplicaRuntime;
-use greenmqtt_core::{
-    Lifecycle, MetadataRegistry, ShardControlRegistry,
-};
 use greenmqtt_plugin_api::{AclProvider, AuthProvider, EventHook};
 use metrics_exporter_prometheus::PrometheusHandle;
 use std::net::SocketAddr;
@@ -19,7 +17,7 @@ pub struct HttpApi<A, C, H> {
     broker: Arc<BrokerRuntime<A, C, H>>,
     peers: Option<Arc<dyn PeerRegistry>>,
     shards: Option<Arc<dyn ShardControlRegistry>>,
-    range_routing: Option<Arc<dyn MetadataRegistry>>,
+    range_routing: Option<Arc<dyn ControlPlaneRegistry>>,
     range_runtime: Option<Arc<ReplicaRuntime>>,
     metrics: Option<PrometheusHandle>,
     bind: SocketAddr,
@@ -63,7 +61,7 @@ where
         broker: Arc<BrokerRuntime<A, C, H>>,
         peers: Arc<dyn PeerRegistry>,
         shards: Arc<dyn ShardControlRegistry>,
-        range_routing: Arc<dyn MetadataRegistry>,
+        range_routing: Arc<dyn ControlPlaneRegistry>,
         metrics: PrometheusHandle,
         bind: SocketAddr,
     ) -> Self {
@@ -82,7 +80,7 @@ where
         broker: Arc<BrokerRuntime<A, C, H>>,
         peers: Arc<dyn PeerRegistry>,
         shards: Arc<dyn ShardControlRegistry>,
-        range_routing: Arc<dyn MetadataRegistry>,
+        range_routing: Arc<dyn ControlPlaneRegistry>,
         range_runtime: Arc<ReplicaRuntime>,
         metrics: PrometheusHandle,
         bind: SocketAddr,
@@ -138,7 +136,7 @@ where
         broker: Arc<BrokerRuntime<A, C, H>>,
         peers: Option<Arc<dyn PeerRegistry>>,
         shards: Option<Arc<dyn ShardControlRegistry>>,
-        range_routing: Option<Arc<dyn MetadataRegistry>>,
+        range_routing: Option<Arc<dyn ControlPlaneRegistry>>,
         metrics: Option<PrometheusHandle>,
     ) -> Router {
         Self::router_with_peers_shards_metrics_and_ranges(
@@ -155,7 +153,7 @@ where
         broker: Arc<BrokerRuntime<A, C, H>>,
         peers: Option<Arc<dyn PeerRegistry>>,
         shards: Option<Arc<dyn ShardControlRegistry>>,
-        range_routing: Option<Arc<dyn MetadataRegistry>>,
+        range_routing: Option<Arc<dyn ControlPlaneRegistry>>,
         range_runtime: Option<Arc<ReplicaRuntime>>,
         metrics: Option<PrometheusHandle>,
     ) -> Router {
@@ -189,6 +187,7 @@ where
                 post(super::shard::failover_shard),
             )
             .route("/v1/ranges", get(super::range::list_ranges))
+            .route("/v1/ranges/{range_id}", get(super::range::get_range).delete(super::range::retire_range))
             .route("/v1/ranges/bootstrap", post(super::range::bootstrap_range))
             .route("/v1/ranges/merge", post(super::range::merge_ranges))
             .route("/v1/ranges/zombies", get(super::range::list_zombie_ranges))
@@ -204,10 +203,29 @@ where
                 "/v1/ranges/{range_id}/recover",
                 post(super::range::recover_range),
             )
-            .route("/v1/ranges/{range_id}/split", post(super::range::split_range))
+            .route(
+                "/v1/ranges/{range_id}/split",
+                post(super::range::split_range),
+            )
             .route("/v1/ranges/{range_id}/drain", post(super::range::drain_range))
-            .route("/v1/ranges/{range_id}", delete(super::range::retire_range))
             .route("/v1/audit", get(super::admin::list_admin_audit))
+            .route(
+                "/v1/control-commands",
+                get(super::admin::list_control_commands)
+                    .delete(super::admin::prune_control_commands),
+            )
+            .route(
+                "/v1/control-commands/{command_id}",
+                get(super::admin::get_control_command),
+            )
+            .route(
+                "/v1/control-commands/{command_id}/retry",
+                post(super::admin::retry_control_command),
+            )
+            .route(
+                "/v1/control-commands/{command_id}/fail",
+                post(super::admin::fail_control_command),
+            )
             .route(
                 "/v1/tenants/{tenant_id}/quota",
                 get(super::admin::get_tenant_quota).put(super::admin::put_tenant_quota),
@@ -282,6 +300,25 @@ where
             .route(
                 "/v1/retain",
                 get(super::query::list_retained).delete(super::admin::delete_retained),
+            )
+            .route("/v1/inbox/lwt", post(super::admin::send_inbox_lwt))
+            .route("/v1/inbox/expire", post(super::admin::expire_inbox_tenant))
+            .route(
+                "/v1/inbox/gc/preview",
+                post(super::admin::preview_inbox_tenant_gc),
+            )
+            .route("/v1/inbox/gc/run", post(super::admin::run_inbox_tenant_gc))
+            .route(
+                "/v1/retain/expire",
+                post(super::admin::expire_retain_tenant),
+            )
+            .route(
+                "/v1/retain/gc/preview",
+                post(super::admin::preview_retain_tenant_gc),
+            )
+            .route(
+                "/v1/retain/gc/run",
+                post(super::admin::run_retain_tenant_gc),
             )
             .route("/v1/routes", get(super::query::list_routes))
             .route("/v1/connect", post(super::session::connect))

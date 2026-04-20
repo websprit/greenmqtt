@@ -126,11 +126,7 @@ impl SessionDictGrpcClient {
                 entry.identity.map(|identity| {
                     let identity = from_proto_client_identity(identity);
                     (
-                        (
-                            identity.tenant_id,
-                            identity.user_id,
-                            identity.client_id,
-                        ),
+                        (identity.tenant_id, identity.user_id, identity.client_id),
                         entry.exists,
                     )
                 })

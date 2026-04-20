@@ -265,4 +265,3 @@ async fn http_lists_peers_from_registry_in_sorted_order() {
         ]
     );
 }
-

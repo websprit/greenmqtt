@@ -1,18 +1,18 @@
 use super::{
     collect_listener_profiles, configured_acl, configured_acl_for_profile, configured_auth,
-    configured_auth_for_profile, configured_dist_service, configured_hooks,
-    configured_hooks_for_profile, configured_inbox_service, configured_listener_profiles,
-    configured_retain_service, configured_sessiondict_service, configured_webhook,
-    durable_services, listener_specs_from_env, parse_acl_rules, parse_bench_scenario,
-    parse_bench_scenarios, parse_bridge_rules, parse_compare_backends, parse_identity_matchers,
-    parse_listener_specs, parse_topic_rewrite_rules, redis_services, render_shard_response_text,
-    replicated_range_clients, resolved_state_mode, run_bench, run_compare_bench,
-    run_compare_soak, run_dist_maintenance_tick, run_inbox_maintenance_tick,
-    run_profile_bench, run_retain_maintenance_tick, run_shard_command, run_soak,
-    shard_command_request, validate_bench_report, validate_soak_report,
-    execute_range_command_with_endpoint, range_command_request, BenchConfig, BenchReport,
-    BenchScenario, BenchThresholds, DistMaintenanceConfig, InboxMaintenanceConfig, ListenerSpec,
-    OutputMode, RetainMaintenanceConfig, SoakConfig, SoakReport, SoakThresholds, StateMode,
+    configured_auth_for_profile, configured_control_plane_runtime, configured_dist_service,
+    configured_hooks, configured_hooks_for_profile, configured_inbox_service,
+    configured_listener_profiles, configured_retain_service, configured_sessiondict_service,
+    configured_webhook, durable_services, execute_range_command_with_endpoint,
+    listener_specs_from_env, parse_acl_rules, parse_bench_scenario, parse_bench_scenarios,
+    parse_bridge_rules, parse_compare_backends, parse_identity_matchers, parse_listener_specs,
+    parse_topic_rewrite_rules, range_command_request, redis_services, render_shard_response_text,
+    replicated_range_clients, resolved_state_mode, run_bench, run_compare_bench, run_compare_soak,
+    run_dist_maintenance_tick, run_inbox_maintenance_tick, run_profile_bench,
+    run_retain_maintenance_tick, run_shard_command, run_soak, shard_command_request,
+    validate_bench_report, validate_soak_report, BenchConfig, BenchReport, BenchScenario,
+    BenchThresholds, DistMaintenanceConfig, InboxMaintenanceConfig, ListenerSpec, OutputMode,
+    RetainMaintenanceConfig, SoakConfig, SoakReport, SoakThresholds, StateMode,
 };
 use async_trait::async_trait;
 use greenmqtt_broker::{BrokerConfig, BrokerRuntime};
@@ -20,12 +20,11 @@ use greenmqtt_core::{
     ClientIdentity, ClusterMembershipRegistry, ClusterNodeLifecycle, ClusterNodeMembership,
     ConnectRequest, OfflineMessage, PublishProperties, PublishRequest, ReplicatedRangeDescriptor,
     ReplicatedRangeRegistry, RouteRecord, ServiceEndpoint, ServiceEndpointRegistry, ServiceKind,
-    ServiceShardAssignment, ServiceShardKey, ServiceShardKind, ServiceShardLifecycle,
-    SessionKind, SessionRecord, Subscription,
+    ServiceShardAssignment, ServiceShardKey, ServiceShardKind, ServiceShardLifecycle, SessionKind,
+    SessionRecord, Subscription,
 };
 use greenmqtt_dist::{
-    DistBalanceAction, DistHandle, DistRouter, ReplicatedDistHandle,
-    ThresholdDistBalancePolicy,
+    DistBalanceAction, DistHandle, DistRouter, ReplicatedDistHandle, ThresholdDistBalancePolicy,
 };
 use greenmqtt_inbox::{
     inbox_tenant_scan_shard, inflight_tenant_scan_shard, InboxBalanceAction, InboxHandle,
@@ -39,8 +38,8 @@ use greenmqtt_plugin_api::{
     AuthProvider, ConfiguredAcl, ConfiguredAuth, ConfiguredEventHook, EventHook, NoopEventHook,
 };
 use greenmqtt_retain::{
-    retain_tenant_shard, ReplicatedRetainHandle, RetainBalanceAction, RetainHandle,
-    RetainService, ThresholdRetainBalancePolicy,
+    retain_tenant_shard, ReplicatedRetainHandle, RetainBalanceAction, RetainHandle, RetainService,
+    ThresholdRetainBalancePolicy,
 };
 use greenmqtt_rpc::{StaticPeerForwarder, StaticServiceEndpointRegistry};
 use greenmqtt_sessiondict::SessionDictHandle;
@@ -338,6 +337,7 @@ fn range_cli_command_drives_grpc_range_control_service() {
                 assignment_registry: None,
                 range_host: Some(host.clone()),
                 range_runtime: Some(runtime.clone()),
+                inbox_lwt_sink: None,
             }
             .serve(bind),
         );
@@ -472,6 +472,7 @@ fn range_cli_command_can_resolve_shard_identity_via_metadata() {
                 assignment_registry: Some(registry.clone()),
                 range_host: Some(host.clone()),
                 range_runtime: Some(runtime.clone()),
+                inbox_lwt_sink: None,
             }
             .serve(bind),
         );
@@ -527,6 +528,7 @@ fn range_cli_command_reports_forward_target_when_endpoint_is_wrong_node() {
                 assignment_registry: Some(registry.clone()),
                 range_host: None,
                 range_runtime: None,
+                inbox_lwt_sink: None,
             }
             .serve(metadata_bind),
         );
@@ -544,6 +546,7 @@ fn range_cli_command_reports_forward_target_when_endpoint_is_wrong_node() {
                 assignment_registry: Some(registry.clone()),
                 range_host: Some(Arc::new(MemoryKvRangeHost::default())),
                 range_runtime: None,
+                inbox_lwt_sink: None,
             }
             .serve(wrong_bind),
         );
@@ -625,12 +628,16 @@ fn range_cli_command_reports_forward_target_when_endpoint_is_wrong_node() {
                 assignment_registry: Some(registry.clone()),
                 range_host: Some(host.clone()),
                 range_runtime: Some(owner_runtime.clone()),
+                inbox_lwt_sink: None,
             }
             .serve(owner_bind),
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        std::env::set_var("GREENMQTT_METADATA_ENDPOINT", format!("http://{metadata_bind}"));
+        std::env::set_var(
+            "GREENMQTT_METADATA_ENDPOINT",
+            format!("http://{metadata_bind}"),
+        );
         let output = execute_range_command_with_endpoint(
             vec!["drain".to_string(), "range-cli-forward".to_string()].into_iter(),
             &format!("http://{wrong_bind}"),
@@ -724,7 +731,8 @@ fn configured_services_can_run_under_global_replicated_state_mode() {
                 peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
                 assignment_registry: Some(registry),
                 range_host: Some(host),
-            range_runtime: None,
+                range_runtime: None,
+                inbox_lwt_sink: None,
             }
             .serve(bind),
         );
@@ -884,6 +892,7 @@ fn dist_maintenance_tick_refreshes_routes_and_proposes_hot_tenant_actions() {
                 assignment_registry: Some(registry.clone()),
                 range_host: Some(host),
                 range_runtime: None,
+                inbox_lwt_sink: None,
             }
             .serve(bind),
         );
@@ -1000,6 +1009,7 @@ fn inbox_maintenance_tick_expires_tenant_state_and_proposes_hot_tenant_actions()
                 assignment_registry: Some(registry.clone()),
                 range_host: Some(host),
                 range_runtime: None,
+                inbox_lwt_sink: None,
             }
             .serve(bind),
         );
@@ -1151,6 +1161,7 @@ fn retain_maintenance_tick_refreshes_routes_and_proposes_hot_tenant_actions() {
                 assignment_registry: Some(registry.clone()),
                 range_host: Some(host),
                 range_runtime: None,
+                inbox_lwt_sink: None,
             }
             .serve(bind),
         );
@@ -1263,7 +1274,8 @@ fn broker_can_use_replicated_service_clients_under_global_state_mode() {
                 peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
                 assignment_registry: Some(registry),
                 range_host: Some(host),
-            range_runtime: None,
+                range_runtime: None,
+                inbox_lwt_sink: None,
             }
             .serve(bind),
         );
@@ -1449,6 +1461,7 @@ fn configured_retain_service_survives_leader_failover() {
                 assignment_registry: Some(registry.clone()),
                 range_host: None,
                 range_runtime: None,
+                inbox_lwt_sink: None,
             }
             .serve(metadata_bind),
         );
@@ -1486,7 +1499,8 @@ fn configured_retain_service_survives_leader_failover() {
                 peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
                 assignment_registry: Some(registry.clone()),
                 range_host: Some(host_1),
-            range_runtime: None,
+                range_runtime: None,
+                inbox_lwt_sink: None,
             }
             .serve(retain_bind_1),
         );
@@ -1524,7 +1538,8 @@ fn configured_retain_service_survives_leader_failover() {
                 peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
                 assignment_registry: Some(registry.clone()),
                 range_host: Some(host_2),
-            range_runtime: None,
+                range_runtime: None,
+                inbox_lwt_sink: None,
             }
             .serve(retain_bind_2),
         );
@@ -1737,7 +1752,8 @@ fn broker_can_continue_after_retain_leader_move_under_replicated_state_mode() {
                 peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
                 assignment_registry: Some(registry.clone()),
                 range_host: None,
-            range_runtime: None,
+                range_runtime: None,
+                inbox_lwt_sink: None,
             }
             .serve(metadata_bind),
         );
@@ -1750,7 +1766,8 @@ fn broker_can_continue_after_retain_leader_move_under_replicated_state_mode() {
                 peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
                 assignment_registry: Some(registry.clone()),
                 range_host: Some(stable_host),
-            range_runtime: None,
+                range_runtime: None,
+                inbox_lwt_sink: None,
             }
             .serve(stable_bind),
         );
@@ -1788,7 +1805,8 @@ fn broker_can_continue_after_retain_leader_move_under_replicated_state_mode() {
                 peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
                 assignment_registry: Some(registry.clone()),
                 range_host: Some(retain_host_1),
-            range_runtime: None,
+                range_runtime: None,
+                inbox_lwt_sink: None,
             }
             .serve(retain_bind_1),
         );
@@ -1826,7 +1844,8 @@ fn broker_can_continue_after_retain_leader_move_under_replicated_state_mode() {
                 peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
                 assignment_registry: Some(registry.clone()),
                 range_host: Some(retain_host_2),
-            range_runtime: None,
+                range_runtime: None,
+                inbox_lwt_sink: None,
             }
             .serve(retain_bind_2),
         );
@@ -3997,7 +4016,12 @@ fn range_command_request_builds_transfer_and_split_requests() {
     }
 
     let (split, _) = range_command_request(
-        vec!["split".to_string(), "range-a".to_string(), "mid".to_string()].into_iter(),
+        vec![
+            "split".to_string(),
+            "range-a".to_string(),
+            "mid".to_string(),
+        ]
+        .into_iter(),
     )
     .unwrap();
     match split {
@@ -4051,4 +4075,62 @@ fn render_shard_response_text_formats_action_preview() {
     let text = render_shard_response_text(body).unwrap();
     assert!(text.contains("previous=t1:* owner=7"));
     assert!(text.contains("current=t1:* owner=9"));
+}
+
+#[test]
+fn configured_control_plane_runtime_skips_non_controller_node() {
+    let registry = Arc::new(StaticServiceEndpointRegistry::default());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    with_env_var("GREENMQTT_CONTROL_PLANE_ENABLED", Some("true"), || {
+        with_env_var(
+            "GREENMQTT_CONTROL_PLANE_CONTROLLER_NODE_ID",
+            Some("9"),
+            || {
+                let result = runtime.block_on(async {
+                    configured_control_plane_runtime(
+                        7,
+                        registry.clone(),
+                        "http://127.0.0.1:50051".to_string(),
+                    )
+                    .await
+                });
+                assert!(result.unwrap().is_none());
+            },
+        );
+    });
+}
+
+#[test]
+fn configured_control_plane_runtime_rejects_invalid_desired_ranges_json() {
+    let registry = Arc::new(StaticServiceEndpointRegistry::default());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    with_env_var("GREENMQTT_CONTROL_PLANE_ENABLED", Some("true"), || {
+        with_env_var(
+            "GREENMQTT_CONTROL_PLANE_CONTROLLER_NODE_ID",
+            Some("7"),
+            || {
+                with_env_var(
+                    "GREENMQTT_CONTROL_PLANE_DESIRED_RANGES_JSON",
+                    Some("not-json"),
+                    || {
+                        let result = runtime.block_on(async {
+                            configured_control_plane_runtime(
+                                7,
+                                registry.clone(),
+                                "http://127.0.0.1:50051".to_string(),
+                            )
+                            .await
+                        });
+                        assert!(result.is_err());
+                    },
+                );
+            },
+        );
+    });
 }

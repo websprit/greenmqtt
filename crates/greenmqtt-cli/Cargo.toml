@@ -13,6 +13,7 @@ greenmqtt-core = { path = "../greenmqtt-core" }
 greenmqtt-dist = { path = "../greenmqtt-dist" }
 greenmqtt-http-api = { path = "../greenmqtt-http-api" }
 greenmqtt-inbox = { path = "../greenmqtt-inbox" }
+greenmqtt-kv-balance = { path = "../greenmqtt-kv-balance" }
 greenmqtt-kv-client = { path = "../greenmqtt-kv-client" }
 greenmqtt-kv-engine = { path = "../greenmqtt-kv-engine" }
 greenmqtt-kv-raft = { path = "../greenmqtt-kv-raft" }

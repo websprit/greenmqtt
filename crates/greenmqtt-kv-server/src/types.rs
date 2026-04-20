@@ -13,7 +13,6 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-
 #[derive(Clone)]
 pub struct HostedRange {
     pub descriptor: ReplicatedRangeDescriptor,

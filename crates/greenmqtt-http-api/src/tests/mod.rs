@@ -11,13 +11,12 @@ use greenmqtt_broker::{
 };
 use greenmqtt_core::{
     BalancerState, BalancerStateRegistry, ClientIdentity, ClusterMembershipRegistry,
-    ClusterNodeLifecycle, ClusterNodeMembership, ConnectReply, ConnectRequest, Delivery,
-    OfflineMessage, PublishProperties, PublishRequest, RangeReconfigurationRegistry,
-    RangeReconfigurationState, ReplicatedRangeDescriptor, ReplicatedRangeRegistry,
-    RetainedMessage, RouteRecord, ServiceEndpoint, ServiceEndpointRegistry, ServiceKind,
-    ServiceShardAssignment, ServiceShardKey, ServiceShardKind, ServiceShardLifecycle,
-    ServiceShardRecoveryControl, ServiceShardTransition, SessionKind, SessionRecord, Subscription,
-    TenantQuota,
+    ClusterNodeLifecycle, ClusterNodeMembership, ConnectReply, ConnectRequest,
+    ControlCommandRecord, ControlCommandRegistry, Delivery, OfflineMessage, PublishProperties, PublishRequest, RangeReconfigurationRegistry,
+    RangeReconfigurationState, ReplicatedRangeDescriptor, ReplicatedRangeRegistry, RetainedMessage,
+    RouteRecord, ServiceEndpoint, ServiceEndpointRegistry, ServiceKind, ServiceShardAssignment,
+    ServiceShardKey, ServiceShardKind, ServiceShardLifecycle, ServiceShardRecoveryControl,
+    ServiceShardTransition, SessionKind, SessionRecord, Subscription, TenantQuota,
 };
 use greenmqtt_dist::{DistHandle, DistRouter};
 use greenmqtt_inbox::{InboxHandle, InboxService, PersistentInboxHandle};
@@ -101,6 +100,7 @@ struct TestShardRegistry {
     ranges: RwLock<BTreeMap<String, ReplicatedRangeDescriptor>>,
     balancer_states: RwLock<BTreeMap<String, BalancerState>>,
     reconfig_states: RwLock<BTreeMap<String, RangeReconfigurationState>>,
+    control_commands: RwLock<BTreeMap<String, ControlCommandRecord>>,
 }
 
 #[async_trait]
@@ -357,6 +357,53 @@ impl ServiceShardRecoveryControl for TestShardRegistry {
             .write()
             .expect("shard registry poisoned")
             .insert(transition.shard.clone(), transition.target_assignment))
+    }
+}
+
+#[async_trait]
+impl ControlCommandRegistry for TestShardRegistry {
+    async fn upsert_control_command(
+        &self,
+        record: ControlCommandRecord,
+    ) -> anyhow::Result<Option<ControlCommandRecord>> {
+        Ok(self
+            .control_commands
+            .write()
+            .expect("shard registry poisoned")
+            .insert(record.command_id.clone(), record))
+    }
+
+    async fn resolve_control_command(
+        &self,
+        command_id: &str,
+    ) -> anyhow::Result<Option<ControlCommandRecord>> {
+        Ok(self
+            .control_commands
+            .read()
+            .expect("shard registry poisoned")
+            .get(command_id)
+            .cloned())
+    }
+
+    async fn remove_control_command(
+        &self,
+        command_id: &str,
+    ) -> anyhow::Result<Option<ControlCommandRecord>> {
+        Ok(self
+            .control_commands
+            .write()
+            .expect("shard registry poisoned")
+            .remove(command_id))
+    }
+
+    async fn list_control_commands(&self) -> anyhow::Result<Vec<ControlCommandRecord>> {
+        Ok(self
+            .control_commands
+            .read()
+            .expect("shard registry poisoned")
+            .values()
+            .cloned()
+            .collect())
     }
 }
 
@@ -1463,13 +1510,12 @@ fn temp_audit_log_path(name: &str) -> PathBuf {
     ))
 }
 
-
-mod peer_quota;
 mod flow_metrics;
-mod subscriptions;
-mod routes;
 mod offline_inflight;
-mod sessiondict;
+mod peer_quota;
 mod query_audit;
 mod range;
+mod routes;
+mod sessiondict;
 mod shard;
+mod subscriptions;

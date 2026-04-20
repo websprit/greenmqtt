@@ -111,10 +111,12 @@ async fn mqtt_v5_session_balancer_recheck_disconnects_with_server_reference() {
             >> 4,
         PACKET_TYPE_DISCONNECT
     );
-    let disconnect_len =
-        tokio::time::timeout(Duration::from_secs(1), read_remaining_length_for_test(&mut client))
-            .await
-            .expect("timed out waiting for disconnect remaining length");
+    let disconnect_len = tokio::time::timeout(
+        Duration::from_secs(1),
+        read_remaining_length_for_test(&mut client),
+    )
+    .await
+    .expect("timed out waiting for disconnect remaining length");
     let mut disconnect = vec![0u8; disconnect_len];
     tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut disconnect))
         .await
@@ -372,10 +374,12 @@ async fn mqtt_v5_session_registration_takeover_disconnects_live_session() {
             >> 4,
         PACKET_TYPE_DISCONNECT
     );
-    let disconnect_len =
-        tokio::time::timeout(Duration::from_secs(1), read_remaining_length_for_test(&mut client))
-            .await
-            .expect("timed out waiting for disconnect remaining length");
+    let disconnect_len = tokio::time::timeout(
+        Duration::from_secs(1),
+        read_remaining_length_for_test(&mut client),
+    )
+    .await
+    .expect("timed out waiting for disconnect remaining length");
     let mut disconnect = vec![0u8; disconnect_len];
     tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut disconnect))
         .await

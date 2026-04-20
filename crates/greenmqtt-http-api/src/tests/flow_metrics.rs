@@ -506,6 +506,42 @@ async fn http_metrics_returns_prometheus_counters() {
 }
 
 #[tokio::test]
+async fn http_retain_gc_run_records_metrics_and_audit() {
+    let metrics = test_prometheus_handle();
+    let broker = broker();
+    broker
+        .retain
+        .retain(RetainedMessage {
+            tenant_id: "demo".into(),
+            topic: "devices/d1/state".into(),
+            payload: b"retained".to_vec().into(),
+            qos: 1,
+        })
+        .await
+        .unwrap();
+    let app = HttpApi::router(broker.clone());
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/retain/gc/run?tenant_id=demo")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let reply: PurgeReply = serde_json::from_slice(&body).unwrap();
+    assert_eq!(reply.removed, 1);
+
+    let audit = broker.list_admin_audit(None);
+    assert!(audit.iter().any(|entry| entry.action == "retain_tenant_gc"));
+    let rendered = metrics.render();
+    assert!(rendered.contains("greenmqtt_retain_expire_sweep_total"));
+    assert!(rendered.contains("action=\"tenant_gc\""));
+}
+
+#[tokio::test]
 async fn http_metrics_supports_tenant_scoped_gauges() {
     let broker = broker();
     let demo = broker
