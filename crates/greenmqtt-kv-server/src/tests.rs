@@ -951,6 +951,130 @@ async fn replica_runtime_exposes_joint_consensus_pending_state() {
 }
 
 #[tokio::test]
+async fn replica_runtime_blocks_finalize_until_dual_majority_is_reached() {
+    let engine = MemoryKvEngine::default();
+    engine
+        .bootstrap(greenmqtt_kv_engine::KvRangeBootstrap {
+            range_id: "range-dual-majority".into(),
+            boundary: RangeBoundary::full(),
+        })
+        .await
+        .unwrap();
+    let space = Arc::<dyn greenmqtt_kv_engine::KvRangeSpace>::from(
+        engine.open_range("range-dual-majority").await.unwrap(),
+    );
+    let raft = Arc::new(MemoryRaftNode::new(
+        1,
+        "range-dual-majority",
+        RaftClusterConfig {
+            voters: vec![1, 2],
+            learners: Vec::new(),
+        },
+    ));
+    raft.recover().await.unwrap();
+    let host = Arc::new(MemoryKvRangeHost::default());
+    host.add_range(HostedRange {
+        descriptor: ReplicatedRangeDescriptor::new(
+            "range-dual-majority",
+            ServiceShardKey::retain("tenant-a"),
+            RangeBoundary::full(),
+            1,
+            1,
+            Some(1),
+            vec![
+                RangeReplica::new(1, ReplicaRole::Voter, ReplicaSyncState::Replicating),
+                RangeReplica::new(2, ReplicaRole::Voter, ReplicaSyncState::Replicating),
+            ],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ),
+        raft: raft.clone(),
+        space,
+    })
+    .await
+    .unwrap();
+    let runtime = ReplicaRuntime::new(host, Arc::new(RecordingTransport::default()));
+
+    for _ in 0..8 {
+        raft.tick().await.unwrap();
+    }
+    raft.receive(
+        2,
+        RaftMessage::RequestVoteResponse(greenmqtt_kv_raft::RequestVoteResponse {
+            term: raft.status().await.unwrap().current_term,
+            vote_granted: true,
+        }),
+    )
+    .await
+    .unwrap();
+
+    runtime
+        .change_replicas("range-dual-majority", vec![1, 3], Vec::new())
+        .await
+        .unwrap();
+    runtime
+        .change_replicas("range-dual-majority", vec![1, 3], Vec::new())
+        .await
+        .unwrap();
+
+    raft.propose(
+        bincode::serialize(&Vec::<greenmqtt_kv_engine::KvMutation>::new())
+            .unwrap()
+            .into(),
+    )
+    .await
+    .unwrap();
+    raft.receive(
+        2,
+        RaftMessage::AppendEntriesResponse(greenmqtt_kv_raft::AppendEntriesResponse {
+            term: raft.status().await.unwrap().current_term,
+            success: true,
+            match_index: 1,
+        }),
+    )
+    .await
+    .unwrap();
+
+    let error = runtime
+        .change_replicas("range-dual-majority", vec![1, 3], Vec::new())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("dual-majority catch-up"));
+    let pending = runtime
+        .pending_reconfiguration("range-dual-majority")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.phase, ReconfigurationPhase::JointConsensus);
+    assert!(pending.blocked_on_catch_up);
+
+    raft.receive(
+        3,
+        RaftMessage::AppendEntriesResponse(greenmqtt_kv_raft::AppendEntriesResponse {
+            term: raft.status().await.unwrap().current_term,
+            success: true,
+            match_index: 1,
+        }),
+    )
+    .await
+    .unwrap();
+
+    runtime
+        .change_replicas("range-dual-majority", vec![1, 3], Vec::new())
+        .await
+        .unwrap();
+    let final_status = raft.status().await.unwrap();
+    assert_eq!(final_status.cluster_config.voters, vec![1, 3]);
+    assert!(runtime
+        .pending_reconfiguration("range-dual-majority")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
 async fn replica_runtime_survives_repeated_replica_reconfiguration_cycles() {
     let engine = MemoryKvEngine::default();
     engine

@@ -845,6 +845,7 @@ dependencies = [
  "greenmqtt-kv-server",
  "greenmqtt-plugin-api",
  "greenmqtt-retain",
+ "greenmqtt-rpc",
  "greenmqtt-sessiondict",
  "greenmqtt-storage",
  "metrics",

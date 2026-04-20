@@ -102,6 +102,29 @@ impl ReplicaRuntime {
             })
     }
 
+    fn voter_quorum_caught_up_to_index(
+        status: &RaftStatusSnapshot,
+        voters: &[NodeId],
+        required_index: u64,
+    ) -> bool {
+        if voters.is_empty() {
+            return false;
+        }
+        let mut matches = voters
+            .iter()
+            .map(|node_id| {
+                status
+                    .replica_progress
+                    .iter()
+                    .find(|replica| replica.node_id == *node_id)
+                    .map(|replica| replica.match_index)
+                    .unwrap_or(0)
+            })
+            .collect::<Vec<_>>();
+        matches.sort_unstable_by(|left, right| right.cmp(left));
+        matches[voters.len() / 2] >= required_index
+    }
+
     fn pending_from_status(status: &RaftStatusSnapshot) -> Option<PendingReconfiguration> {
         let transition = status.config_transition.as_ref()?;
         Some(PendingReconfiguration {
@@ -123,12 +146,16 @@ impl ReplicaRuntime {
             },
             blocked_on_catch_up: !Self::config_caught_up(
                 status,
+                &transition.joint_config.voters,
+                &transition.joint_config.learners,
+            ) || !Self::voter_quorum_caught_up_to_index(
+                status,
                 &transition.old_config.voters,
-                &transition.old_config.learners,
-            ) || !Self::config_caught_up(
+                status.last_log_index,
+            ) || !Self::voter_quorum_caught_up_to_index(
                 status,
                 &transition.final_config.voters,
-                &transition.final_config.learners,
+                status.last_log_index,
             ),
         })
     }
@@ -754,14 +781,14 @@ impl ReplicaRuntime {
 
         let status_transition = status.config_transition.clone();
         if let Some(transition) = status_transition {
-            let blocked_on_catch_up = !Self::config_caught_up(
+            let blocked_on_catch_up = !Self::voter_quorum_caught_up_to_index(
                 &status,
                 &transition.old_config.voters,
-                &transition.old_config.learners,
-            ) || !Self::config_caught_up(
+                status.last_log_index,
+            ) || !Self::voter_quorum_caught_up_to_index(
                 &status,
                 &transition.final_config.voters,
-                &transition.final_config.learners,
+                status.last_log_index,
             );
             self.pending_reconfig
                 .lock()
@@ -782,7 +809,7 @@ impl ReplicaRuntime {
                     },
                 );
             if blocked_on_catch_up {
-                anyhow::bail!("config change blocked on joint catch-up for range `{range_id}`");
+                anyhow::bail!("config change blocked on dual-majority catch-up for range `{range_id}`");
             }
             range
                 .raft

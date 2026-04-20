@@ -1329,6 +1329,16 @@ impl RangeAdminGrpcClient {
         Ok(client.list_range_health(()).await?.into_inner())
     }
 
+    pub async fn list_range_health_snapshots(&self) -> anyhow::Result<Vec<RangeHealthSnapshot>> {
+        Ok(self
+            .list_range_health()
+            .await?
+            .entries
+            .into_iter()
+            .map(from_proto_range_health_record)
+            .collect())
+    }
+
     pub async fn get_range_health(&self, range_id: &str) -> anyhow::Result<RangeHealthReply> {
         let mut client = self.inner.lock().await;
         Ok(client
@@ -1339,9 +1349,94 @@ impl RangeAdminGrpcClient {
             .into_inner())
     }
 
+    pub async fn get_range_health_snapshot(
+        &self,
+        range_id: &str,
+    ) -> anyhow::Result<Option<RangeHealthSnapshot>> {
+        Ok(self
+            .get_range_health(range_id)
+            .await?
+            .health
+            .map(from_proto_range_health_record))
+    }
+
     pub async fn debug_dump(&self) -> anyhow::Result<String> {
         let mut client = self.inner.lock().await;
         Ok(client.debug_dump(()).await?.into_inner().text)
+    }
+}
+
+fn from_proto_reconfiguration_record(
+    record: greenmqtt_proto::internal::RangeReconfigurationRecord,
+    range_id: String,
+) -> RangeReconfigurationState {
+    let phase = if record.has_phase {
+        match record.phase.as_str() {
+            "staging_learners" => Some(ReconfigurationPhase::StagingLearners),
+            "joint_consensus" => Some(ReconfigurationPhase::JointConsensus),
+            "finalizing" => Some(ReconfigurationPhase::Finalizing),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    RangeReconfigurationState {
+        range_id,
+        old_voters: record.old_voters,
+        old_learners: record.old_learners,
+        current_voters: record.current_voters,
+        current_learners: record.current_learners,
+        joint_voters: record.joint_voters,
+        joint_learners: record.joint_learners,
+        pending_voters: record.pending_voters,
+        pending_learners: record.pending_learners,
+        phase,
+        blocked_on_catch_up: record.blocked_on_catch_up,
+    }
+}
+
+fn from_proto_range_health_record(
+    record: greenmqtt_proto::internal::RangeHealthRecord,
+) -> RangeHealthSnapshot {
+    let range_id = record.range_id.clone();
+    RangeHealthSnapshot {
+        range_id: range_id.clone(),
+        lifecycle: match record.lifecycle.as_str() {
+            "bootstrapping" => ServiceShardLifecycle::Bootstrapping,
+            "draining" => ServiceShardLifecycle::Draining,
+            "recovering" => ServiceShardLifecycle::Recovering,
+            "offline" => ServiceShardLifecycle::Offline,
+            _ => ServiceShardLifecycle::Serving,
+        },
+        role: match record.role.as_str() {
+            "candidate" => greenmqtt_kv_raft::RaftNodeRole::Candidate,
+            "leader" => greenmqtt_kv_raft::RaftNodeRole::Leader,
+            _ => greenmqtt_kv_raft::RaftNodeRole::Follower,
+        },
+        current_term: record.current_term,
+        leader_node_id: record.has_leader_node_id.then_some(record.leader_node_id),
+        commit_index: record.commit_index,
+        applied_index: record.applied_index,
+        latest_snapshot_index: record
+            .has_latest_snapshot_index
+            .then_some(record.latest_snapshot_index),
+        replica_lag: record
+            .replica_lag
+            .into_iter()
+            .map(|replica| ReplicaLagSnapshot {
+                node_id: replica.node_id,
+                lag: replica.lag,
+                match_index: replica.match_index,
+                next_index: replica.next_index,
+            })
+            .collect(),
+        reconfiguration: record
+            .reconfiguration
+            .map(|reconfig| from_proto_reconfiguration_record(reconfig, range_id.clone()))
+            .unwrap_or_else(|| RangeReconfigurationState {
+                range_id,
+                ..Default::default()
+            }),
     }
 }
 
@@ -1487,6 +1582,203 @@ impl RangeControlGrpcClient {
                 leader_node_id: entry.has_leader_node_id.then_some(entry.leader_node_id),
             })
             .collect())
+    }
+}
+
+impl RoutedRangeControlGrpcClient {
+    pub async fn connect(
+        metadata_endpoint: impl Into<String>,
+        fallback_endpoint: impl Into<String>,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            metadata: MetadataGrpcClient::connect(metadata_endpoint.into()).await?,
+            fallback_endpoint: fallback_endpoint.into(),
+        })
+    }
+
+    fn operator_endpoint_for_member(
+        member: &ClusterNodeMembership,
+        preferred_kind: Option<ServiceKind>,
+    ) -> anyhow::Result<String> {
+        if let Some(kind) = preferred_kind {
+            if let Some(endpoint) = member
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.kind == kind)
+            {
+                return Ok(endpoint.endpoint.clone());
+            }
+        }
+        member
+            .endpoints
+            .first()
+            .map(|endpoint| endpoint.endpoint.clone())
+            .ok_or_else(|| anyhow::anyhow!("member {} has no registered RPC endpoints", member.node_id))
+    }
+
+    fn target_node_for_descriptor(descriptor: &ReplicatedRangeDescriptor) -> Option<NodeId> {
+        descriptor
+            .leader_node_id
+            .or_else(|| {
+                descriptor
+                    .replicas
+                    .iter()
+                    .find(|replica| replica.role == greenmqtt_core::ReplicaRole::Voter)
+                    .map(|replica| replica.node_id)
+            })
+            .or_else(|| descriptor.replicas.first().map(|replica| replica.node_id))
+    }
+
+    pub async fn resolve_range_target(
+        &self,
+        range_id: &str,
+    ) -> anyhow::Result<RoutedRangeControlTarget> {
+        let descriptor = self
+            .metadata
+            .lookup_range(range_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("range `{range_id}` not found in metadata"))?;
+        let target_node_id = Self::target_node_for_descriptor(&descriptor)
+            .ok_or_else(|| anyhow::anyhow!("range `{range_id}` has no target replica"))?;
+        let member = self
+            .metadata
+            .lookup_member(target_node_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("range target node {target_node_id} not found"))?;
+        Ok(RoutedRangeControlTarget {
+            range_id: range_id.to_string(),
+            node_id: target_node_id,
+            endpoint: Self::operator_endpoint_for_member(
+                &member,
+                Some(descriptor.shard.service_kind()),
+            )?,
+        })
+    }
+
+    pub async fn resolve_shard_target(
+        &self,
+        shard: &ServiceShardKey,
+    ) -> anyhow::Result<RoutedRangeControlTarget> {
+        let descriptors = self
+            .metadata
+            .list_ranges(Some(shard.kind.clone()), Some(&shard.tenant_id), Some(&shard.scope))
+            .await?;
+        anyhow::ensure!(
+            !descriptors.is_empty(),
+            "no range found for shard {:?}",
+            shard
+        );
+        anyhow::ensure!(
+            descriptors.len() == 1,
+            "shard {:?} resolves to {} ranges; specify a concrete range_id",
+            shard,
+            descriptors.len()
+        );
+        self.resolve_range_target(&descriptors[0].id).await
+    }
+
+    async fn control_client_for_range(
+        &self,
+        range_id: &str,
+    ) -> anyhow::Result<RangeControlGrpcClient> {
+        let target = self.resolve_range_target(range_id).await?;
+        RangeControlGrpcClient::connect(target.endpoint).await
+    }
+
+    async fn control_client_for_descriptor(
+        &self,
+        descriptor: &ReplicatedRangeDescriptor,
+    ) -> anyhow::Result<RangeControlGrpcClient> {
+        if let Some(node_id) = Self::target_node_for_descriptor(descriptor) {
+            if let Some(member) = self.metadata.lookup_member(node_id).await? {
+                let endpoint = Self::operator_endpoint_for_member(
+                    &member,
+                    Some(descriptor.shard.service_kind()),
+                )?;
+                return RangeControlGrpcClient::connect(endpoint).await;
+            }
+        }
+        RangeControlGrpcClient::connect(self.fallback_endpoint.clone()).await
+    }
+
+    pub async fn bootstrap_range(
+        &self,
+        descriptor: ReplicatedRangeDescriptor,
+    ) -> anyhow::Result<String> {
+        self.control_client_for_descriptor(&descriptor)
+            .await?
+            .bootstrap_range(descriptor)
+            .await
+    }
+
+    pub async fn change_replicas(
+        &self,
+        range_id: &str,
+        voters: Vec<NodeId>,
+        learners: Vec<NodeId>,
+    ) -> anyhow::Result<()> {
+        self.control_client_for_range(range_id)
+            .await?
+            .change_replicas(range_id, voters, learners)
+            .await
+    }
+
+    pub async fn transfer_leadership(
+        &self,
+        range_id: &str,
+        target_node_id: NodeId,
+    ) -> anyhow::Result<()> {
+        self.control_client_for_range(range_id)
+            .await?
+            .transfer_leadership(range_id, target_node_id)
+            .await
+    }
+
+    pub async fn recover_range(
+        &self,
+        range_id: &str,
+        new_leader_node_id: NodeId,
+    ) -> anyhow::Result<()> {
+        self.control_client_for_range(range_id)
+            .await?
+            .recover_range(range_id, new_leader_node_id)
+            .await
+    }
+
+    pub async fn split_range(
+        &self,
+        range_id: &str,
+        split_key: Vec<u8>,
+    ) -> anyhow::Result<(String, String)> {
+        self.control_client_for_range(range_id)
+            .await?
+            .split_range(range_id, split_key)
+            .await
+    }
+
+    pub async fn merge_ranges(
+        &self,
+        left_range_id: &str,
+        right_range_id: &str,
+    ) -> anyhow::Result<String> {
+        self.control_client_for_range(left_range_id)
+            .await?
+            .merge_ranges(left_range_id, right_range_id)
+            .await
+    }
+
+    pub async fn drain_range(&self, range_id: &str) -> anyhow::Result<()> {
+        self.control_client_for_range(range_id)
+            .await?
+            .drain_range(range_id)
+            .await
+    }
+
+    pub async fn retire_range(&self, range_id: &str) -> anyhow::Result<()> {
+        self.control_client_for_range(range_id)
+            .await?
+            .retire_range(range_id)
+            .await
     }
 }
 
@@ -1727,4 +2019,3 @@ impl PeerRegistry for StaticPeerForwarder {
         self.connect_node(node_id, endpoint).await
     }
 }
-

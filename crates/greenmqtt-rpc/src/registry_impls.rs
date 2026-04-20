@@ -1004,6 +1004,125 @@ impl RangeReconfigurationRegistry for ReplicatedMetadataRegistry {
 }
 
 #[async_trait]
+impl ControlCommandRegistry for DynamicServiceEndpointRegistry {
+    async fn upsert_control_command(
+        &self,
+        record: ControlCommandRecord,
+    ) -> anyhow::Result<Option<ControlCommandRecord>> {
+        Ok(self
+            .control_commands
+            .write()
+            .expect("service registry poisoned")
+            .insert(record.command_id.clone(), record))
+    }
+
+    async fn resolve_control_command(
+        &self,
+        command_id: &str,
+    ) -> anyhow::Result<Option<ControlCommandRecord>> {
+        Ok(self
+            .control_commands
+            .read()
+            .expect("service registry poisoned")
+            .get(command_id)
+            .cloned())
+    }
+
+    async fn remove_control_command(
+        &self,
+        command_id: &str,
+    ) -> anyhow::Result<Option<ControlCommandRecord>> {
+        Ok(self
+            .control_commands
+            .write()
+            .expect("service registry poisoned")
+            .remove(command_id))
+    }
+
+    async fn list_control_commands(&self) -> anyhow::Result<Vec<ControlCommandRecord>> {
+        let mut commands: Vec<_> = self
+            .control_commands
+            .read()
+            .expect("service registry poisoned")
+            .values()
+            .cloned()
+            .collect();
+        commands.sort_by(|left, right| left.command_id.cmp(&right.command_id));
+        Ok(commands)
+    }
+}
+
+#[async_trait]
+impl ControlCommandRegistry for PersistentMetadataRegistry {
+    async fn upsert_control_command(
+        &self,
+        record: ControlCommandRecord,
+    ) -> anyhow::Result<Option<ControlCommandRecord>> {
+        let key = command_key(&record.command_id);
+        let previous = self.read_value::<ControlCommandRecord>(key.clone()).await?;
+        self.write_value(key, &record).await?;
+        Ok(previous)
+    }
+
+    async fn resolve_control_command(
+        &self,
+        command_id: &str,
+    ) -> anyhow::Result<Option<ControlCommandRecord>> {
+        self.read_value(command_key(command_id)).await
+    }
+
+    async fn remove_control_command(
+        &self,
+        command_id: &str,
+    ) -> anyhow::Result<Option<ControlCommandRecord>> {
+        self.delete_value(command_key(command_id)).await
+    }
+
+    async fn list_control_commands(&self) -> anyhow::Result<Vec<ControlCommandRecord>> {
+        let mut commands = self
+            .scan_prefix::<ControlCommandRecord>(COMMAND_PREFIX)
+            .await?;
+        commands.sort_by(|left, right| left.command_id.cmp(&right.command_id));
+        Ok(commands)
+    }
+}
+
+#[async_trait]
+impl ControlCommandRegistry for ReplicatedMetadataRegistry {
+    async fn upsert_control_command(
+        &self,
+        record: ControlCommandRecord,
+    ) -> anyhow::Result<Option<ControlCommandRecord>> {
+        let key = command_key(&record.command_id);
+        let previous = self.read_value::<ControlCommandRecord>(key.clone()).await?;
+        self.write_value(key, &record).await?;
+        Ok(previous)
+    }
+
+    async fn resolve_control_command(
+        &self,
+        command_id: &str,
+    ) -> anyhow::Result<Option<ControlCommandRecord>> {
+        self.read_value(command_key(command_id)).await
+    }
+
+    async fn remove_control_command(
+        &self,
+        command_id: &str,
+    ) -> anyhow::Result<Option<ControlCommandRecord>> {
+        self.delete_value(command_key(command_id)).await
+    }
+
+    async fn list_control_commands(&self) -> anyhow::Result<Vec<ControlCommandRecord>> {
+        let mut commands = self
+            .scan_prefix::<ControlCommandRecord>(COMMAND_PREFIX)
+            .await?;
+        commands.sort_by(|left, right| left.command_id.cmp(&right.command_id));
+        Ok(commands)
+    }
+}
+
+#[async_trait]
 impl ClusterMembershipRegistry for DynamicServiceEndpointRegistry {
     async fn upsert_member(
         &self,
@@ -1170,4 +1289,3 @@ impl ServiceShardRecoveryControl for ReplicatedMetadataRegistry {
         self.upsert_assignment(transition.target_assignment).await
     }
 }
-

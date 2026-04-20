@@ -25,7 +25,7 @@ async fn http_lists_shards_with_optional_filters() {
         .await
         .unwrap();
 
-    let app = HttpApi::router_with_peers_shards_and_metrics(broker, None, Some(shards), None);
+    let app = HttpApi::router_with_peers_shards_and_metrics(broker, None, Some(shards), None, None);
 
     let response = app
         .clone()
@@ -80,7 +80,7 @@ async fn http_gets_single_shard_assignment() {
     );
     shards.upsert_assignment(assignment.clone()).await.unwrap();
 
-    let app = HttpApi::router_with_peers_shards_and_metrics(broker, None, Some(shards), None);
+    let app = HttpApi::router_with_peers_shards_and_metrics(broker, None, Some(shards), None, None);
 
     let response = app
         .oneshot(
@@ -149,6 +149,7 @@ async fn http_can_move_shard_and_record_admin_audit() {
         None,
         Some(shards.clone()),
         None,
+        None,
     );
     let response = app
         .oneshot(
@@ -193,6 +194,7 @@ async fn http_dry_run_drain_shard_does_not_mutate_or_audit() {
         broker.clone(),
         None,
         Some(shards.clone()),
+        None,
         None,
     );
     let response = app
@@ -269,6 +271,7 @@ async fn http_failover_shard_records_audit_and_metrics() {
         broker.clone(),
         None,
         Some(shards.clone()),
+        None,
         Some(metrics),
     );
     let response = app

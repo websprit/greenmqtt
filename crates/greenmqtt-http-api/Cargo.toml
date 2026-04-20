@@ -14,6 +14,7 @@ greenmqtt-dist = { path = "../greenmqtt-dist" }
 greenmqtt-inbox = { path = "../greenmqtt-inbox" }
 greenmqtt-kv-server = { path = "../greenmqtt-kv-server" }
 greenmqtt-plugin-api = { path = "../greenmqtt-plugin-api" }
+greenmqtt-rpc = { path = "../greenmqtt-rpc" }
 greenmqtt-retain = { path = "../greenmqtt-retain" }
 greenmqtt-sessiondict = { path = "../greenmqtt-sessiondict" }
 metrics.workspace = true

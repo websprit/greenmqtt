@@ -410,6 +410,7 @@ async fn http_metrics_returns_prometheus_counters() {
         broker.clone(),
         Some(Arc::new(TestPeerRegistry::new(vec![2, 5]))),
         Some(shards.clone()),
+        None,
         Some(metrics),
     );
     let _ = app
@@ -1013,4 +1014,3 @@ async fn http_dry_run_retained_delete_reports_without_removing() {
     let audit = broker.list_admin_audit(None);
     assert!(audit.is_empty());
 }
-

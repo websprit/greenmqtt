@@ -163,14 +163,11 @@ impl MemoryRaftNode {
         if state.cluster_config.voters.is_empty() {
             return;
         }
-        let mut voter_matches = state
-            .cluster_config
-            .voters
-            .iter()
-            .map(|node_id| state.match_indexes.get(node_id).copied().unwrap_or(0))
-            .collect::<Vec<_>>();
-        voter_matches.sort_unstable_by(|left, right| right.cmp(left));
-        let majority_index = voter_matches[Self::quorum_size(state) - 1];
+        let majority_index = if let Some(transition) = state.config_transition.as_ref() {
+            Self::joint_majority_commit_index(state, transition)
+        } else {
+            Self::majority_match_index(state, &state.cluster_config.voters)
+        };
         if majority_index > state.commit_index {
             let previous_commit = state.commit_index;
             state.commit_index = majority_index;
@@ -188,6 +185,35 @@ impl MemoryRaftNode {
 
     fn replica_caught_up_to_tail(state: &MemoryRaftState, node_id: NodeId) -> bool {
         Self::replica_match_index(state, node_id) >= Self::last_log_index(state)
+    }
+
+    fn majority_match_index(state: &MemoryRaftState, voters: &[NodeId]) -> LogIndex {
+        if voters.is_empty() {
+            return 0;
+        }
+        let mut voter_matches = voters
+            .iter()
+            .map(|node_id| state.match_indexes.get(node_id).copied().unwrap_or(0))
+            .collect::<Vec<_>>();
+        voter_matches.sort_unstable_by(|left, right| right.cmp(left));
+        voter_matches[voters.len() / 2]
+    }
+
+    fn voter_quorum_caught_up_to_index(
+        state: &MemoryRaftState,
+        voters: &[NodeId],
+        required_index: LogIndex,
+    ) -> bool {
+        Self::majority_match_index(state, voters) >= required_index
+    }
+
+    fn joint_majority_commit_index(
+        state: &MemoryRaftState,
+        transition: &RaftConfigTransitionState,
+    ) -> LogIndex {
+        let old_majority = Self::majority_match_index(state, &transition.old_config.voters);
+        let final_majority = Self::majority_match_index(state, &transition.final_config.voters);
+        old_majority.min(final_majority)
     }
 
     fn cluster_config_union(
@@ -850,13 +876,22 @@ impl RaftNode for MemoryRaftNode {
                         .config_transition
                         .clone()
                         .ok_or_else(|| anyhow::anyhow!("no joint consensus change in progress"))?;
+                    let required_index = Self::last_log_index(&state);
                     anyhow::ensure!(
-                        Self::config_caught_up_to_commit(&state, &transition.old_config),
-                        "old config has not satisfied joint catch-up"
+                        Self::voter_quorum_caught_up_to_index(
+                            &state,
+                            &transition.old_config.voters,
+                            required_index,
+                        ),
+                        "old config has not satisfied dual-majority catch-up"
                     );
                     anyhow::ensure!(
-                        Self::config_caught_up_to_commit(&state, &transition.final_config),
-                        "final config has not satisfied joint catch-up"
+                        Self::voter_quorum_caught_up_to_index(
+                            &state,
+                            &transition.final_config.voters,
+                            required_index,
+                        ),
+                        "final config has not satisfied dual-majority catch-up"
                     );
                     if state
                         .leader_node_id
@@ -1016,4 +1051,3 @@ impl RaftNode for MemoryRaftNode {
         Ok(removed)
     }
 }
-

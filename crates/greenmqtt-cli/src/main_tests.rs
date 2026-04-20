@@ -391,6 +391,267 @@ fn range_cli_command_drives_grpc_range_control_service() {
 }
 
 #[test]
+fn range_cli_command_can_resolve_shard_identity_via_metadata() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let bind = listener.local_addr().unwrap();
+        drop(listener);
+        let engine = MemoryKvEngine::default();
+        let host = Arc::new(MemoryKvRangeHost::default());
+        let registry = Arc::new(StaticServiceEndpointRegistry::default());
+        let runtime = Arc::new(greenmqtt_kv_server::ReplicaRuntime::with_config(
+            host.clone(),
+            Arc::new(greenmqtt_rpc::NoopReplicaTransport),
+            Some(Arc::new(TestRangeLifecycleManager {
+                engine: engine.clone(),
+            })),
+            Duration::from_secs(1),
+            64,
+            64,
+            64,
+        ));
+        runtime
+            .bootstrap_range(ReplicatedRangeDescriptor::new(
+                "range-cli-route",
+                ServiceShardKey::retain("t1"),
+                greenmqtt_core::RangeBoundary::full(),
+                1,
+                1,
+                Some(1),
+                vec![greenmqtt_core::RangeReplica::new(
+                    1,
+                    greenmqtt_core::ReplicaRole::Voter,
+                    greenmqtt_core::ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Bootstrapping,
+            ))
+            .await
+            .unwrap();
+        registry
+            .upsert_member(ClusterNodeMembership::new(
+                1,
+                1,
+                ClusterNodeLifecycle::Serving,
+                vec![ServiceEndpoint::new(
+                    ServiceKind::Retain,
+                    1,
+                    format!("http://{bind}"),
+                )],
+            ))
+            .await
+            .unwrap();
+        registry
+            .upsert_range(ReplicatedRangeDescriptor::new(
+                "range-cli-route",
+                ServiceShardKey::retain("t1"),
+                greenmqtt_core::RangeBoundary::full(),
+                1,
+                1,
+                Some(1),
+                vec![greenmqtt_core::RangeReplica::new(
+                    1,
+                    greenmqtt_core::ReplicaRole::Voter,
+                    greenmqtt_core::ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ))
+            .await
+            .unwrap();
+        let server = tokio::spawn(
+            greenmqtt_rpc::RpcRuntime {
+                sessiondict: Arc::new(SessionDictHandle::default()),
+                dist: Arc::new(DistHandle::default()),
+                inbox: Arc::new(InboxHandle::default()),
+                retain: Arc::new(RetainHandle::default()),
+                peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
+                assignment_registry: Some(registry.clone()),
+                range_host: Some(host.clone()),
+                range_runtime: Some(runtime.clone()),
+            }
+            .serve(bind),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let endpoint = format!("http://{bind}");
+        let output = execute_range_command_with_endpoint(
+            vec![
+                "change-replicas".to_string(),
+                "--kind".to_string(),
+                "retain".to_string(),
+                "--tenant-id".to_string(),
+                "t1".to_string(),
+                "--scope".to_string(),
+                "*".to_string(),
+                "--voters".to_string(),
+                "1,2".to_string(),
+            ]
+            .into_iter(),
+            &endpoint,
+        )
+        .await
+        .unwrap();
+        assert!(output.contains("operation=change-replicas"));
+        assert!(output.contains("status=reconfiguring"));
+
+        let pending = runtime
+            .pending_reconfiguration("range-cli-route")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.target_voters, vec![1, 2]);
+
+        server.abort();
+    });
+}
+
+#[test]
+fn range_cli_command_reports_forward_target_when_endpoint_is_wrong_node() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let metadata_bind = listener.local_addr().unwrap();
+        drop(listener);
+        let registry = Arc::new(StaticServiceEndpointRegistry::default());
+        let metadata_server = tokio::spawn(
+            greenmqtt_rpc::RpcRuntime {
+                sessiondict: Arc::new(SessionDictHandle::default()),
+                dist: Arc::new(DistHandle::default()),
+                inbox: Arc::new(InboxHandle::default()),
+                retain: Arc::new(RetainHandle::default()),
+                peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
+                assignment_registry: Some(registry.clone()),
+                range_host: None,
+                range_runtime: None,
+            }
+            .serve(metadata_bind),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let wrong_bind = listener.local_addr().unwrap();
+        drop(listener);
+        let wrong_server = tokio::spawn(
+            greenmqtt_rpc::RpcRuntime {
+                sessiondict: Arc::new(SessionDictHandle::default()),
+                dist: Arc::new(DistHandle::default()),
+                inbox: Arc::new(InboxHandle::default()),
+                retain: Arc::new(RetainHandle::default()),
+                peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
+                assignment_registry: Some(registry.clone()),
+                range_host: Some(Arc::new(MemoryKvRangeHost::default())),
+                range_runtime: None,
+            }
+            .serve(wrong_bind),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let owner_bind = listener.local_addr().unwrap();
+        drop(listener);
+        let engine = MemoryKvEngine::default();
+        let host = Arc::new(MemoryKvRangeHost::default());
+        let owner_runtime = Arc::new(greenmqtt_kv_server::ReplicaRuntime::with_config(
+            host.clone(),
+            Arc::new(greenmqtt_rpc::NoopReplicaTransport),
+            Some(Arc::new(TestRangeLifecycleManager {
+                engine: engine.clone(),
+            })),
+            Duration::from_secs(1),
+            64,
+            64,
+            64,
+        ));
+        owner_runtime
+            .bootstrap_range(ReplicatedRangeDescriptor::new(
+                "range-cli-forward",
+                ServiceShardKey::retain("t1"),
+                greenmqtt_core::RangeBoundary::full(),
+                1,
+                1,
+                Some(2),
+                vec![greenmqtt_core::RangeReplica::new(
+                    2,
+                    greenmqtt_core::ReplicaRole::Voter,
+                    greenmqtt_core::ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Bootstrapping,
+            ))
+            .await
+            .unwrap();
+        registry
+            .upsert_member(ClusterNodeMembership::new(
+                2,
+                1,
+                ClusterNodeLifecycle::Serving,
+                vec![ServiceEndpoint::new(
+                    ServiceKind::Retain,
+                    2,
+                    format!("http://{owner_bind}"),
+                )],
+            ))
+            .await
+            .unwrap();
+        registry
+            .upsert_range(ReplicatedRangeDescriptor::new(
+                "range-cli-forward",
+                ServiceShardKey::retain("t1"),
+                greenmqtt_core::RangeBoundary::full(),
+                1,
+                1,
+                Some(2),
+                vec![greenmqtt_core::RangeReplica::new(
+                    2,
+                    greenmqtt_core::ReplicaRole::Voter,
+                    greenmqtt_core::ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ))
+            .await
+            .unwrap();
+        let owner_server = tokio::spawn(
+            greenmqtt_rpc::RpcRuntime {
+                sessiondict: Arc::new(SessionDictHandle::default()),
+                dist: Arc::new(DistHandle::default()),
+                inbox: Arc::new(InboxHandle::default()),
+                retain: Arc::new(RetainHandle::default()),
+                peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
+                assignment_registry: Some(registry.clone()),
+                range_host: Some(host.clone()),
+                range_runtime: Some(owner_runtime.clone()),
+            }
+            .serve(owner_bind),
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        std::env::set_var("GREENMQTT_METADATA_ENDPOINT", format!("http://{metadata_bind}"));
+        let output = execute_range_command_with_endpoint(
+            vec!["drain".to_string(), "range-cli-forward".to_string()].into_iter(),
+            &format!("http://{wrong_bind}"),
+        )
+        .await
+        .unwrap();
+        assert!(output.contains("forwarded=true"));
+        assert!(output.contains("target_node_id=2"));
+        assert!(output.contains(&format!("target_endpoint=http://{owner_bind}")));
+
+        let hosted = host.open_range("range-cli-forward").await.unwrap().unwrap();
+        assert_eq!(hosted.descriptor.lifecycle, ServiceShardLifecycle::Draining);
+
+        std::env::remove_var("GREENMQTT_METADATA_ENDPOINT");
+        metadata_server.abort();
+        wrong_server.abort();
+        owner_server.abort();
+    });
+}
+
+#[test]
 fn configured_services_can_run_under_global_replicated_state_mode() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
@@ -3700,11 +3961,11 @@ fn range_command_request_builds_change_replicas_request() {
     .unwrap();
     match command {
         super::RangeCliCommand::ChangeReplicas {
-            range_id,
+            target,
             voters,
             learners,
         } => {
-            assert_eq!(range_id, "range-a");
+            assert_eq!(target, super::RangeCliTarget::RangeId("range-a".into()));
             assert_eq!(voters, vec![1, 2, 3]);
             assert_eq!(learners, vec![4]);
         }
@@ -3726,10 +3987,10 @@ fn range_command_request_builds_transfer_and_split_requests() {
     .unwrap();
     match transfer {
         super::RangeCliCommand::TransferLeadership {
-            range_id,
+            target,
             target_node_id,
         } => {
-            assert_eq!(range_id, "range-a");
+            assert_eq!(target, super::RangeCliTarget::RangeId("range-a".into()));
             assert_eq!(target_node_id, 9);
         }
         other => panic!("unexpected command: {other:?}"),
@@ -3740,9 +4001,42 @@ fn range_command_request_builds_transfer_and_split_requests() {
     )
     .unwrap();
     match split {
-        super::RangeCliCommand::Split { range_id, split_key } => {
-            assert_eq!(range_id, "range-a");
+        super::RangeCliCommand::Split { target, split_key } => {
+            assert_eq!(target, super::RangeCliTarget::RangeId("range-a".into()));
             assert_eq!(split_key, b"mid".to_vec());
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+}
+
+#[test]
+fn range_command_request_accepts_shard_identity_target() {
+    let (command, _) = range_command_request(
+        vec![
+            "change-replicas".to_string(),
+            "--kind".to_string(),
+            "retain".to_string(),
+            "--tenant-id".to_string(),
+            "t1".to_string(),
+            "--scope".to_string(),
+            "*".to_string(),
+            "--voters".to_string(),
+            "1,2".to_string(),
+        ]
+        .into_iter(),
+    )
+    .unwrap();
+    match command {
+        super::RangeCliCommand::ChangeReplicas { target, voters, .. } => {
+            assert_eq!(
+                target,
+                super::RangeCliTarget::Shard(ServiceShardKey {
+                    kind: ServiceShardKind::Retain,
+                    tenant_id: "t1".into(),
+                    scope: "*".into(),
+                })
+            );
+            assert_eq!(voters, vec![1, 2]);
         }
         other => panic!("unexpected command: {other:?}"),
     }

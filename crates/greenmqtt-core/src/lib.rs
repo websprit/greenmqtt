@@ -327,6 +327,39 @@ pub struct BalancerState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ControlCommandExecutionState {
+    Issued,
+    Accepted,
+    NotExecuted,
+    Applied,
+    TerminalFailed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ControlCommandReflectionState {
+    Pending,
+    Reflected,
+    Unreflected,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ControlCommandRecord {
+    pub command_id: String,
+    pub command_type: String,
+    pub target_range_or_shard: String,
+    pub issued_at_ms: u64,
+    pub issued_by: String,
+    #[serde(default)]
+    pub attempt_count: u32,
+    #[serde(default)]
+    pub payload: BTreeMap<String, String>,
+    pub execution_state: ControlCommandExecutionState,
+    pub reflection_state: ControlCommandReflectionState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ReconfigurationPhase {
     StagingLearners,
     JointConsensus,
@@ -466,9 +499,35 @@ impl<T> MetadataRegistry for T where
 {
 }
 
-pub trait ControlPlaneRegistry: ShardControlRegistry + MetadataRegistry {}
+#[async_trait]
+pub trait ControlCommandRegistry: Send + Sync {
+    async fn upsert_control_command(
+        &self,
+        record: ControlCommandRecord,
+    ) -> anyhow::Result<Option<ControlCommandRecord>>;
 
-impl<T> ControlPlaneRegistry for T where T: ShardControlRegistry + MetadataRegistry {}
+    async fn resolve_control_command(
+        &self,
+        command_id: &str,
+    ) -> anyhow::Result<Option<ControlCommandRecord>>;
+
+    async fn remove_control_command(
+        &self,
+        command_id: &str,
+    ) -> anyhow::Result<Option<ControlCommandRecord>>;
+
+    async fn list_control_commands(&self) -> anyhow::Result<Vec<ControlCommandRecord>>;
+}
+
+pub trait ControlPlaneRegistry:
+    ShardControlRegistry + MetadataRegistry + ControlCommandRegistry
+{
+}
+
+impl<T> ControlPlaneRegistry for T where
+    T: ShardControlRegistry + MetadataRegistry + ControlCommandRegistry
+{
+}
 
 #[async_trait]
 pub trait ServiceEndpointRegistry: Send + Sync {

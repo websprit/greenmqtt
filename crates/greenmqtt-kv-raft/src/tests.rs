@@ -1018,6 +1018,67 @@ async fn joint_consensus_blocks_finalizing_away_current_leader() {
 }
 
 #[tokio::test]
+async fn joint_consensus_requires_dual_majority_before_commit_and_finalize() {
+    let node = MemoryRaftNode::new(
+        1,
+        "range-joint-dual-majority",
+        RaftClusterConfig {
+            voters: vec![1, 2],
+            learners: Vec::new(),
+        },
+    );
+    node.recover().await.unwrap();
+    elect_local_leader(&node).await;
+    node.change_cluster_config(RaftConfigChange::EnterJointConsensus {
+        voters: vec![1, 3],
+        learners: Vec::new(),
+    })
+    .await
+    .unwrap();
+
+    node.propose(Bytes::from_static(b"joint-cmd")).await.unwrap();
+    node.receive(
+        2,
+        RaftMessage::AppendEntriesResponse(AppendEntriesResponse {
+            term: node.status().await.unwrap().current_term,
+            success: true,
+            match_index: 1,
+        }),
+    )
+    .await
+    .unwrap();
+
+    let status = node.status().await.unwrap();
+    assert_eq!(status.commit_index, 0);
+
+    let error = node
+        .change_cluster_config(RaftConfigChange::FinalizeJointConsensus)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("dual-majority catch-up"));
+
+    node.receive(
+        3,
+        RaftMessage::AppendEntriesResponse(AppendEntriesResponse {
+            term: node.status().await.unwrap().current_term,
+            success: true,
+            match_index: 1,
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(node.status().await.unwrap().commit_index, 1);
+    node.change_cluster_config(RaftConfigChange::FinalizeJointConsensus)
+        .await
+        .unwrap();
+    let final_status = node.status().await.unwrap();
+    assert_eq!(final_status.cluster_config.voters, vec![1, 3]);
+    assert!(final_status.config_transition.is_none());
+}
+
+#[tokio::test]
 async fn three_replica_reference_soak_survives_restarts_and_repeated_replication() {
     let leader_store = Arc::new(MemoryRaftStateStore::default());
     let follower2_store = Arc::new(MemoryRaftStateStore::default());

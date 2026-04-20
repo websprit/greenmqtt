@@ -1,13 +1,17 @@
 use async_trait::async_trait;
 use greenmqtt_cluster::ClusterWorkflowController;
 use greenmqtt_core::{
-    BalancerState, BalancerStateRegistry, ClusterNodeLifecycle, ControlPlaneRegistry, NodeId,
+    BalancerState, BalancerStateRegistry, ClusterNodeLifecycle, ControlCommandExecutionState,
+    ControlCommandRecord, ControlCommandReflectionState, ControlPlaneRegistry, NodeId,
     RangeBoundary, RangeReplica, ReplicaRole, ReplicaSyncState, ReplicatedRangeDescriptor,
-    ServiceEndpoint, ServiceKind, ServiceShardAssignment, ServiceShardKey,
-    ServiceShardLifecycle, ServiceShardTransition, ServiceShardTransitionKind,
+    ServiceEndpoint, ServiceKind, ServiceShardAssignment, ServiceShardKey, ServiceShardLifecycle,
+    ServiceShardTransition, ServiceShardTransitionKind,
 };
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const MAX_COMMAND_RETRY_ATTEMPTS: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BalanceCommand {
@@ -205,6 +209,343 @@ impl BalanceCoordinator {
         }
     }
 
+    fn command_type(command: &BalanceCommand) -> &'static str {
+        match command {
+            BalanceCommand::BootstrapRange { .. } => "bootstrap_range",
+            BalanceCommand::MigrateShard { .. } => "migrate_shard",
+            BalanceCommand::FailoverShard { .. } => "failover_shard",
+            BalanceCommand::RecordBalancerState { .. } => "record_balancer_state",
+            BalanceCommand::ChangeReplicas { .. } => "change_replicas",
+            BalanceCommand::TransferLeadership { .. } => "transfer_leadership",
+            BalanceCommand::CleanupReplicas { .. } => "cleanup_replicas",
+            BalanceCommand::RecoverRange { .. } => "recover_range",
+            BalanceCommand::SplitRange { .. } => "split_range",
+            BalanceCommand::MergeRanges { .. } => "merge_ranges",
+        }
+    }
+
+    fn command_target(command: &BalanceCommand) -> String {
+        match command {
+            BalanceCommand::BootstrapRange { range_id, .. }
+            | BalanceCommand::ChangeReplicas { range_id, .. }
+            | BalanceCommand::CleanupReplicas { range_id, .. }
+            | BalanceCommand::RecoverRange { range_id, .. } => range_id.clone(),
+            BalanceCommand::TransferLeadership { range_id, .. } => range_id.clone(),
+            BalanceCommand::SplitRange { source_range_id, .. } => source_range_id.clone(),
+            BalanceCommand::MergeRanges { merged_range_id, .. } => merged_range_id.clone(),
+            BalanceCommand::RecordBalancerState { name } => name.clone(),
+            BalanceCommand::MigrateShard { shard, .. } | BalanceCommand::FailoverShard { shard, .. } => {
+                format!("{:?}:{}:{}", shard.kind, shard.tenant_id, shard.scope)
+            }
+        }
+    }
+
+    fn command_record(
+        &self,
+        command: &BalanceCommand,
+        execution_state: ControlCommandExecutionState,
+        reflection_state: ControlCommandReflectionState,
+        last_error: Option<String>,
+        previous: Option<ControlCommandRecord>,
+        increment_attempt: bool,
+    ) -> ControlCommandRecord {
+        let previous_attempts = previous.as_ref().map(|record| record.attempt_count).unwrap_or(0);
+        let previous_issued_at = previous
+            .as_ref()
+            .map(|record| record.issued_at_ms)
+            .unwrap_or_else(|| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("clock went backwards")
+                    .as_millis() as u64
+            });
+        ControlCommandRecord {
+            command_id: Self::command_label(command),
+            command_type: Self::command_type(command).to_string(),
+            target_range_or_shard: Self::command_target(command),
+            issued_at_ms: previous_issued_at,
+            issued_by: self
+                .feedback_name
+                .clone()
+                .unwrap_or_else(|| "balance-coordinator".to_string()),
+            attempt_count: previous_attempts + u32::from(increment_attempt),
+            payload: previous
+                .as_ref()
+                .map(|record| record.payload.clone())
+                .unwrap_or_else(|| Self::command_payload(command)),
+            execution_state,
+            reflection_state,
+            last_error,
+        }
+    }
+
+    fn command_payload(command: &BalanceCommand) -> BTreeMap<String, String> {
+        let mut payload = BTreeMap::new();
+        match command {
+            BalanceCommand::BootstrapRange {
+                range_id,
+                shard,
+                target_node_id,
+            } => {
+                payload.insert("range_id".into(), range_id.clone());
+                payload.insert("shard_kind".into(), format!("{:?}", shard.kind));
+                payload.insert("tenant_id".into(), shard.tenant_id.clone());
+                payload.insert("scope".into(), shard.scope.clone());
+                payload.insert("target_node_id".into(), target_node_id.to_string());
+            }
+            BalanceCommand::MigrateShard {
+                shard,
+                from_node_id,
+                to_node_id,
+            }
+            | BalanceCommand::FailoverShard {
+                shard,
+                from_node_id,
+                to_node_id,
+            } => {
+                payload.insert("shard_kind".into(), format!("{:?}", shard.kind));
+                payload.insert("tenant_id".into(), shard.tenant_id.clone());
+                payload.insert("scope".into(), shard.scope.clone());
+                payload.insert("from_node_id".into(), from_node_id.to_string());
+                payload.insert("to_node_id".into(), to_node_id.to_string());
+            }
+            BalanceCommand::RecordBalancerState { name } => {
+                payload.insert("name".into(), name.clone());
+            }
+            BalanceCommand::ChangeReplicas {
+                range_id,
+                voters,
+                learners,
+            } => {
+                payload.insert("range_id".into(), range_id.clone());
+                payload.insert(
+                    "voters".into(),
+                    voters.iter().map(ToString::to_string).collect::<Vec<_>>().join(","),
+                );
+                payload.insert(
+                    "learners".into(),
+                    learners
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
+            }
+            BalanceCommand::TransferLeadership {
+                range_id,
+                from_node_id,
+                to_node_id,
+            } => {
+                payload.insert("range_id".into(), range_id.clone());
+                payload.insert("from_node_id".into(), from_node_id.to_string());
+                payload.insert("to_node_id".into(), to_node_id.to_string());
+            }
+            BalanceCommand::CleanupReplicas {
+                range_id,
+                removed_node_ids,
+            } => {
+                payload.insert("range_id".into(), range_id.clone());
+                payload.insert(
+                    "removed_node_ids".into(),
+                    removed_node_ids
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
+            }
+            BalanceCommand::RecoverRange {
+                range_id,
+                new_leader_node_id,
+            } => {
+                payload.insert("range_id".into(), range_id.clone());
+                payload.insert("new_leader_node_id".into(), new_leader_node_id.to_string());
+            }
+            BalanceCommand::SplitRange {
+                source_range_id,
+                left_range_id,
+                right_range_id,
+            } => {
+                payload.insert("source_range_id".into(), source_range_id.clone());
+                payload.insert("left_range_id".into(), left_range_id.clone());
+                payload.insert("right_range_id".into(), right_range_id.clone());
+            }
+            BalanceCommand::MergeRanges {
+                left_range_id,
+                right_range_id,
+                merged_range_id,
+            } => {
+                payload.insert("left_range_id".into(), left_range_id.clone());
+                payload.insert("right_range_id".into(), right_range_id.clone());
+                payload.insert("merged_range_id".into(), merged_range_id.clone());
+            }
+        }
+        payload
+    }
+
+    fn parse_node_ids(value: Option<&String>) -> anyhow::Result<Vec<NodeId>> {
+        match value {
+            Some(value) if !value.is_empty() => value
+                .split(',')
+                .map(|item| item.parse::<NodeId>())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| anyhow::anyhow!("invalid node id list: {error}")),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    fn parse_required_node_id(payload: &BTreeMap<String, String>, key: &str) -> anyhow::Result<NodeId> {
+        payload
+            .get(key)
+            .ok_or_else(|| anyhow::anyhow!("missing payload field `{key}`"))?
+            .parse::<NodeId>()
+            .map_err(|error| anyhow::anyhow!("invalid payload field `{key}`: {error}"))
+    }
+
+    fn parse_required_string(payload: &BTreeMap<String, String>, key: &str) -> anyhow::Result<String> {
+        payload
+            .get(key)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("missing payload field `{key}`"))
+    }
+
+    fn parse_service_shard_kind(value: &str) -> anyhow::Result<greenmqtt_core::ServiceShardKind> {
+        match value {
+            "SessionDict" => Ok(greenmqtt_core::ServiceShardKind::SessionDict),
+            "Inbox" => Ok(greenmqtt_core::ServiceShardKind::Inbox),
+            "Inflight" => Ok(greenmqtt_core::ServiceShardKind::Inflight),
+            "Dist" => Ok(greenmqtt_core::ServiceShardKind::Dist),
+            "Retain" => Ok(greenmqtt_core::ServiceShardKind::Retain),
+            other => anyhow::bail!("unknown shard kind `{other}`"),
+        }
+    }
+
+    fn command_from_record(record: &ControlCommandRecord) -> anyhow::Result<BalanceCommand> {
+        let payload = &record.payload;
+        Ok(match record.command_type.as_str() {
+            "bootstrap_range" => BalanceCommand::BootstrapRange {
+                range_id: Self::parse_required_string(payload, "range_id")?,
+                shard: ServiceShardKey {
+                    kind: Self::parse_service_shard_kind(
+                        payload
+                            .get("shard_kind")
+                            .ok_or_else(|| anyhow::anyhow!("missing payload field `shard_kind`"))?,
+                    )?,
+                    tenant_id: Self::parse_required_string(payload, "tenant_id")?,
+                    scope: Self::parse_required_string(payload, "scope")?,
+                },
+                target_node_id: Self::parse_required_node_id(payload, "target_node_id")?,
+            },
+            "migrate_shard" => BalanceCommand::MigrateShard {
+                shard: ServiceShardKey {
+                    kind: Self::parse_service_shard_kind(
+                        payload
+                            .get("shard_kind")
+                            .ok_or_else(|| anyhow::anyhow!("missing payload field `shard_kind`"))?,
+                    )?,
+                    tenant_id: Self::parse_required_string(payload, "tenant_id")?,
+                    scope: Self::parse_required_string(payload, "scope")?,
+                },
+                from_node_id: Self::parse_required_node_id(payload, "from_node_id")?,
+                to_node_id: Self::parse_required_node_id(payload, "to_node_id")?,
+            },
+            "failover_shard" => BalanceCommand::FailoverShard {
+                shard: ServiceShardKey {
+                    kind: Self::parse_service_shard_kind(
+                        payload
+                            .get("shard_kind")
+                            .ok_or_else(|| anyhow::anyhow!("missing payload field `shard_kind`"))?,
+                    )?,
+                    tenant_id: Self::parse_required_string(payload, "tenant_id")?,
+                    scope: Self::parse_required_string(payload, "scope")?,
+                },
+                from_node_id: Self::parse_required_node_id(payload, "from_node_id")?,
+                to_node_id: Self::parse_required_node_id(payload, "to_node_id")?,
+            },
+            "record_balancer_state" => BalanceCommand::RecordBalancerState {
+                name: Self::parse_required_string(payload, "name")?,
+            },
+            "change_replicas" => BalanceCommand::ChangeReplicas {
+                range_id: Self::parse_required_string(payload, "range_id")?,
+                voters: Self::parse_node_ids(payload.get("voters"))?,
+                learners: Self::parse_node_ids(payload.get("learners"))?,
+            },
+            "transfer_leadership" => BalanceCommand::TransferLeadership {
+                range_id: Self::parse_required_string(payload, "range_id")?,
+                from_node_id: Self::parse_required_node_id(payload, "from_node_id")?,
+                to_node_id: Self::parse_required_node_id(payload, "to_node_id")?,
+            },
+            "cleanup_replicas" => BalanceCommand::CleanupReplicas {
+                range_id: Self::parse_required_string(payload, "range_id")?,
+                removed_node_ids: Self::parse_node_ids(payload.get("removed_node_ids"))?,
+            },
+            "recover_range" => BalanceCommand::RecoverRange {
+                range_id: Self::parse_required_string(payload, "range_id")?,
+                new_leader_node_id: Self::parse_required_node_id(payload, "new_leader_node_id")?,
+            },
+            "split_range" => BalanceCommand::SplitRange {
+                source_range_id: Self::parse_required_string(payload, "source_range_id")?,
+                left_range_id: Self::parse_required_string(payload, "left_range_id")?,
+                right_range_id: Self::parse_required_string(payload, "right_range_id")?,
+            },
+            "merge_ranges" => BalanceCommand::MergeRanges {
+                left_range_id: Self::parse_required_string(payload, "left_range_id")?,
+                right_range_id: Self::parse_required_string(payload, "right_range_id")?,
+                merged_range_id: Self::parse_required_string(payload, "merged_range_id")?,
+            },
+            other => anyhow::bail!("unsupported control command type `{other}`"),
+        })
+    }
+
+    async fn record_command_state(
+        &self,
+        command: &BalanceCommand,
+        execution_state: ControlCommandExecutionState,
+        reflection_state: ControlCommandReflectionState,
+        last_error: Option<String>,
+        increment_attempt: bool,
+    ) -> anyhow::Result<()> {
+        let Some(registry) = &self.control_plane else {
+            return Ok(());
+        };
+        let previous = registry
+            .resolve_control_command(&Self::command_label(command))
+            .await?;
+        registry
+            .upsert_control_command(self.command_record(
+                command,
+                execution_state,
+                reflection_state,
+                last_error,
+                previous,
+                increment_attempt,
+            ))
+            .await?;
+        Ok(())
+    }
+
+    async fn update_existing_command_record(
+        &self,
+        record: &ControlCommandRecord,
+        execution_state: ControlCommandExecutionState,
+        reflection_state: ControlCommandReflectionState,
+        last_error: Option<String>,
+        increment_attempt: bool,
+    ) -> anyhow::Result<()> {
+        let Some(registry) = &self.control_plane else {
+            return Ok(());
+        };
+        let mut updated = record.clone();
+        updated.execution_state = execution_state;
+        updated.reflection_state = reflection_state;
+        updated.last_error = last_error;
+        if increment_attempt {
+            updated.attempt_count += 1;
+        }
+        registry.upsert_control_command(updated).await?;
+        Ok(())
+    }
+
     async fn command_reflected(
         registry: &dyn ControlPlaneRegistry,
         command: &BalanceCommand,
@@ -299,6 +640,38 @@ impl BalanceCoordinator {
         })
     }
 
+    fn command_record_is_stuck(record: &ControlCommandRecord) -> bool {
+        if record.command_type == "record_balancer_state" {
+            return false;
+        }
+        match record.execution_state {
+            ControlCommandExecutionState::Issued
+            | ControlCommandExecutionState::Accepted
+            | ControlCommandExecutionState::NotExecuted => true,
+            ControlCommandExecutionState::Applied => {
+                record.reflection_state != ControlCommandReflectionState::Reflected
+            }
+            ControlCommandExecutionState::TerminalFailed => false,
+        }
+    }
+
+    async fn collect_stuck_transition_targets(
+        registry: &dyn ControlPlaneRegistry,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut stuck = BTreeSet::new();
+        for record in registry.list_control_commands().await? {
+            if Self::command_record_is_stuck(&record) {
+                stuck.insert(record.target_range_or_shard);
+            }
+        }
+        for state in registry.list_reconfiguration_states().await? {
+            if state.blocked_on_catch_up || state.phase.is_some() {
+                stuck.insert(state.range_id);
+            }
+        }
+        Ok(stuck.into_iter().collect())
+    }
+
     async fn execute_with_reconciliation(
         &self,
         commands: &[BalanceCommand],
@@ -309,28 +682,183 @@ impl BalanceCoordinator {
         };
         for command in commands {
             let label = Self::command_label(command);
+            self.record_command_state(
+                command,
+                ControlCommandExecutionState::Issued,
+                ControlCommandReflectionState::Pending,
+                None,
+                false,
+            )
+            .await?;
             let executed = self.executor.execute(command).await?;
             if !executed {
                 summary.not_executed.push(label);
+                self.record_command_state(
+                    command,
+                    ControlCommandExecutionState::NotExecuted,
+                    ControlCommandReflectionState::Unreflected,
+                    Some("executor returned false".into()),
+                    true,
+                )
+                .await?;
                 continue;
             }
+            self.record_command_state(
+                command,
+                ControlCommandExecutionState::Accepted,
+                ControlCommandReflectionState::Pending,
+                None,
+                true,
+            )
+            .await?;
             summary.applied += 1;
             if let Some(registry) = &self.control_plane {
-                if !Self::command_reflected(registry.as_ref(), command).await? {
+                let reflected = Self::command_reflected(registry.as_ref(), command).await?;
+                if !reflected {
                     summary.unreflected.push(Self::command_label(command));
                 }
+                self.record_command_state(
+                    command,
+                    ControlCommandExecutionState::Applied,
+                    if reflected {
+                        ControlCommandReflectionState::Reflected
+                    } else {
+                        ControlCommandReflectionState::Unreflected
+                    },
+                    None,
+                    false,
+                )
+                .await?;
+            } else {
+                self.record_command_state(
+                    command,
+                    ControlCommandExecutionState::Applied,
+                    ControlCommandReflectionState::Pending,
+                    None,
+                    false,
+                )
+                .await?;
             }
         }
         if let Some(registry) = &self.control_plane {
-            for state in registry.list_reconfiguration_states().await? {
-                if state.blocked_on_catch_up || state.phase.is_some() {
-                    summary.stuck_transitions.push(state.range_id);
-                }
-            }
+            summary.stuck_transitions = Self::collect_stuck_transition_targets(registry.as_ref()).await?;
         }
         summary.stuck_transitions.sort();
         summary.stuck_transitions.dedup();
         Ok(summary)
+    }
+
+    pub async fn reconcile_control_commands(&self) -> anyhow::Result<usize> {
+        let Some(registry) = &self.control_plane else {
+            return Ok(0);
+        };
+        let mut recovered = 0usize;
+        for record in registry.list_control_commands().await? {
+            match record.execution_state {
+                ControlCommandExecutionState::Issued
+                | ControlCommandExecutionState::NotExecuted => {
+                    let command = match Self::command_from_record(&record) {
+                        Ok(command) => command,
+                        Err(error) => {
+                            self.update_existing_command_record(
+                                &record,
+                                ControlCommandExecutionState::TerminalFailed,
+                                ControlCommandReflectionState::Unreflected,
+                                Some(error.to_string()),
+                                false,
+                            )
+                            .await?;
+                            continue;
+                        }
+                    };
+                    let executed = self.executor.execute(&command).await?;
+                    if !executed {
+                        let terminal = record.attempt_count + 1 >= MAX_COMMAND_RETRY_ATTEMPTS;
+                        self.record_command_state(
+                            &command,
+                            if terminal {
+                                ControlCommandExecutionState::TerminalFailed
+                            } else {
+                                ControlCommandExecutionState::NotExecuted
+                            },
+                            ControlCommandReflectionState::Unreflected,
+                            Some(if terminal {
+                                "retry budget exhausted".into()
+                            } else {
+                                "executor returned false".into()
+                            }),
+                            true,
+                        )
+                        .await?;
+                        continue;
+                    }
+                    recovered += 1;
+                    self.record_command_state(
+                        &command,
+                        ControlCommandExecutionState::Accepted,
+                        ControlCommandReflectionState::Pending,
+                        None,
+                        true,
+                    )
+                    .await?;
+                    let reflected = Self::command_reflected(registry.as_ref(), &command).await?;
+                    self.record_command_state(
+                        &command,
+                        ControlCommandExecutionState::Applied,
+                        if reflected {
+                            ControlCommandReflectionState::Reflected
+                        } else {
+                            ControlCommandReflectionState::Unreflected
+                        },
+                        None,
+                        false,
+                    )
+                    .await?;
+                }
+                ControlCommandExecutionState::Accepted | ControlCommandExecutionState::Applied => {
+                    if record.reflection_state == ControlCommandReflectionState::Reflected {
+                        continue;
+                    }
+                    let command = match Self::command_from_record(&record) {
+                        Ok(command) => command,
+                        Err(error) => {
+                            self.update_existing_command_record(
+                                &record,
+                                ControlCommandExecutionState::TerminalFailed,
+                                ControlCommandReflectionState::Unreflected,
+                                Some(error.to_string()),
+                                false,
+                            )
+                            .await?;
+                            continue;
+                        }
+                    };
+                    let reflected = Self::command_reflected(registry.as_ref(), &command).await?;
+                    if reflected {
+                        self.record_command_state(
+                            &command,
+                            ControlCommandExecutionState::Applied,
+                            ControlCommandReflectionState::Reflected,
+                            None,
+                            false,
+                        )
+                        .await?;
+                        recovered += 1;
+                    } else if record.attempt_count >= MAX_COMMAND_RETRY_ATTEMPTS {
+                        self.record_command_state(
+                            &command,
+                            ControlCommandExecutionState::TerminalFailed,
+                            ControlCommandReflectionState::Unreflected,
+                            Some("reflection retry budget exhausted".into()),
+                            false,
+                        )
+                        .await?;
+                    }
+                }
+                ControlCommandExecutionState::TerminalFailed => {}
+            }
+        }
+        Ok(recovered)
     }
 
     pub async fn bootstrap_missing_ranges(
@@ -1006,20 +1534,24 @@ impl ClusterWorkflowController for MetadataBalanceController {
 mod tests {
     use super::{
         execute_balance_commands, BalanceCommand, BalanceCommandExecutor, BalanceController,
-        BalanceCoordinator, MetadataBalanceController,
+        BalanceCoordinator, MetadataBalanceController, MAX_COMMAND_RETRY_ATTEMPTS,
     };
     use async_trait::async_trait;
     use greenmqtt_cluster::ClusterWorkflowController;
     use greenmqtt_core::{
         BalancerState, BalancerStateRegistry, ClusterMembershipRegistry, ClusterNodeLifecycle,
-        ClusterNodeMembership, RangeBoundary, RangeReconfigurationRegistry, RangeReplica,
-        ReplicaRole, ReplicaSyncState, ReplicatedRangeDescriptor, ReplicatedRangeRegistry,
-        ServiceEndpoint, ServiceEndpointRegistry, ServiceKind, ServiceShardAssignment,
-        ServiceShardKey, ServiceShardLifecycle,
+        ClusterNodeMembership, ControlCommandExecutionState, ControlCommandReflectionState,
+        ControlCommandRecord, ControlCommandRegistry, ControlPlaneRegistry, RangeBoundary,
+        RangeReconfigurationRegistry, RangeReplica, ReplicaRole, ReplicaSyncState,
+        ReplicatedRangeDescriptor, ReplicatedRangeRegistry, ServiceEndpoint,
+        ServiceEndpointRegistry, ServiceKind, ServiceShardAssignment, ServiceShardKey,
+        ServiceShardLifecycle,
     };
-    use greenmqtt_rpc::StaticServiceEndpointRegistry;
+    use greenmqtt_rpc::{PersistentMetadataRegistry, StaticServiceEndpointRegistry};
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[tokio::test]
     async fn controller_bootstraps_missing_range_and_assignment() {
@@ -1628,6 +2160,74 @@ mod tests {
         }
     }
 
+    struct ApplyingExecutor {
+        registry: Arc<dyn ControlPlaneRegistry>,
+    }
+
+    #[async_trait]
+    impl BalanceCommandExecutor for ApplyingExecutor {
+        async fn execute(&self, command: &BalanceCommand) -> anyhow::Result<bool> {
+            match command {
+                BalanceCommand::BootstrapRange {
+                    range_id,
+                    shard,
+                    target_node_id,
+                } => {
+                    let member = self
+                        .registry
+                        .resolve_member(*target_node_id)
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("missing member"))?;
+                    let endpoint = member
+                        .endpoints
+                        .first()
+                        .ok_or_else(|| anyhow::anyhow!("missing endpoint"))?
+                        .clone();
+                    self.registry
+                        .upsert_range(ReplicatedRangeDescriptor::new(
+                            range_id.clone(),
+                            shard.clone(),
+                            RangeBoundary::full(),
+                            1,
+                            1,
+                            Some(*target_node_id),
+                            vec![RangeReplica::new(
+                                *target_node_id,
+                                ReplicaRole::Voter,
+                                ReplicaSyncState::Replicating,
+                            )],
+                            0,
+                            0,
+                            ServiceShardLifecycle::Serving,
+                        ))
+                        .await?;
+                    self.registry
+                        .upsert_assignment(ServiceShardAssignment::new(
+                            shard.clone(),
+                            endpoint,
+                            1,
+                            1,
+                            ServiceShardLifecycle::Serving,
+                        ))
+                        .await?;
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
+        }
+    }
+
+    fn temp_registry_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "greenmqtt-kv-balance-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock went backwards")
+                .as_nanos()
+        ))
+    }
+
     #[tokio::test]
     async fn execute_balance_commands_applies_all_supported_commands() {
         let executor = RecordingExecutor::default();
@@ -1861,7 +2461,292 @@ mod tests {
                 .load_rules
                 .get("last_stuck_transitions")
                 .map(String::as_str),
-            Some("stuck-range")
+            Some("retain-range-feedback,stuck-range")
+        );
+    }
+
+    #[tokio::test]
+    async fn balance_coordinator_persists_durable_command_records() {
+        let registry = Arc::new(StaticServiceEndpointRegistry::default());
+        registry
+            .upsert_member(ClusterNodeMembership::new(
+                7,
+                1,
+                ClusterNodeLifecycle::Serving,
+                vec![ServiceEndpoint::new(
+                    ServiceKind::Retain,
+                    7,
+                    "http://127.0.0.1:50070",
+                )],
+            ))
+            .await
+            .unwrap();
+        let controller: Arc<dyn BalanceController> =
+            Arc::new(MetadataBalanceController::new(registry.clone()));
+        let executor = Arc::new(RecordingExecutor {
+            result: Some(false),
+            ..RecordingExecutor::default()
+        });
+        let coordinator = BalanceCoordinator::with_reconciliation(
+            controller,
+            executor,
+            registry.clone(),
+            "dist-balancer",
+        );
+
+        let applied = coordinator
+            .bootstrap_missing_ranges(vec![ReplicatedRangeDescriptor::new(
+                "retain-range-command",
+                ServiceShardKey::retain("t1"),
+                RangeBoundary::full(),
+                1,
+                1,
+                None,
+                Vec::new(),
+                0,
+                0,
+                ServiceShardLifecycle::Bootstrapping,
+            )])
+            .await
+            .unwrap();
+        assert_eq!(applied, 0);
+
+        let commands = registry.list_control_commands().await.unwrap();
+        assert_eq!(commands.len(), 1);
+        let command = &commands[0];
+        assert_eq!(command.command_id, "bootstrap:retain-range-command");
+        assert_eq!(command.command_type, "bootstrap_range");
+        assert_eq!(command.target_range_or_shard, "retain-range-command");
+        assert_eq!(
+            command.execution_state,
+            ControlCommandExecutionState::NotExecuted
+        );
+        assert_eq!(
+            command.reflection_state,
+            ControlCommandReflectionState::Unreflected
+        );
+        assert_eq!(command.last_error.as_deref(), Some("executor returned false"));
+    }
+
+    #[tokio::test]
+    async fn balance_coordinator_reuses_command_identity_for_repeated_logical_commands() {
+        let registry = Arc::new(StaticServiceEndpointRegistry::default());
+        registry
+            .upsert_member(ClusterNodeMembership::new(
+                7,
+                1,
+                ClusterNodeLifecycle::Serving,
+                vec![ServiceEndpoint::new(
+                    ServiceKind::Retain,
+                    7,
+                    "http://127.0.0.1:50070",
+                )],
+            ))
+            .await
+            .unwrap();
+        let controller: Arc<dyn BalanceController> =
+            Arc::new(MetadataBalanceController::new(registry.clone()));
+        let executor = Arc::new(RecordingExecutor {
+            result: Some(false),
+            ..RecordingExecutor::default()
+        });
+        let coordinator = BalanceCoordinator::with_reconciliation(
+            controller,
+            executor.clone(),
+            registry.clone(),
+            "dist-balancer",
+        );
+        registry
+            .upsert_control_command(ControlCommandRecord {
+                command_id: "bootstrap:retain-range-repeat".into(),
+                command_type: "bootstrap_range".into(),
+                target_range_or_shard: "retain-range-repeat".into(),
+                issued_at_ms: 1,
+                issued_by: "test".into(),
+                attempt_count: 0,
+                payload: BTreeMap::from([
+                    ("range_id".into(), "retain-range-repeat".into()),
+                    ("shard_kind".into(), "Retain".into()),
+                    ("tenant_id".into(), "t1".into()),
+                    ("scope".into(), "*".into()),
+                    ("target_node_id".into(), "7".into()),
+                ]),
+                execution_state: ControlCommandExecutionState::Issued,
+                reflection_state: ControlCommandReflectionState::Pending,
+                last_error: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(coordinator.reconcile_control_commands().await.unwrap(), 0);
+        assert_eq!(coordinator.reconcile_control_commands().await.unwrap(), 0);
+
+        let commands = registry.list_control_commands().await.unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].command_id, "bootstrap:retain-range-repeat");
+        assert_eq!(commands[0].attempt_count, 2);
+    }
+
+    #[tokio::test]
+    async fn balance_command_records_survive_registry_restart() {
+        let path = temp_registry_path("restart");
+        std::fs::create_dir_all(&path).unwrap();
+        let registry = PersistentMetadataRegistry::open(&path).await.unwrap();
+        registry
+            .upsert_control_command(ControlCommandRecord {
+                command_id: "bootstrap:retain-range-restart".into(),
+                command_type: "bootstrap_range".into(),
+                target_range_or_shard: "retain-range-restart".into(),
+                issued_at_ms: 1,
+                issued_by: "test".into(),
+                attempt_count: 1,
+                payload: BTreeMap::from([
+                    ("range_id".into(), "retain-range-restart".into()),
+                    ("shard_kind".into(), "Retain".into()),
+                    ("tenant_id".into(), "t1".into()),
+                    ("scope".into(), "*".into()),
+                    ("target_node_id".into(), "7".into()),
+                ]),
+                execution_state: ControlCommandExecutionState::NotExecuted,
+                reflection_state: ControlCommandReflectionState::Unreflected,
+                last_error: Some("executor returned false".into()),
+            })
+            .await
+            .unwrap();
+        drop(registry);
+
+        let reopened = PersistentMetadataRegistry::open(&path).await.unwrap();
+        let commands = reopened.list_control_commands().await.unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            commands[0].execution_state,
+            ControlCommandExecutionState::NotExecuted
+        );
+        assert_eq!(commands[0].attempt_count, 1);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_recovers_orphaned_issued_command_records() {
+        let registry = Arc::new(StaticServiceEndpointRegistry::default());
+        registry
+            .upsert_member(ClusterNodeMembership::new(
+                7,
+                1,
+                ClusterNodeLifecycle::Serving,
+                vec![ServiceEndpoint::new(
+                    ServiceKind::Retain,
+                    7,
+                    "http://127.0.0.1:50070",
+                )],
+            ))
+            .await
+            .unwrap();
+        registry
+            .upsert_control_command(ControlCommandRecord {
+                command_id: "bootstrap:retain-range-orphan".into(),
+                command_type: "bootstrap_range".into(),
+                target_range_or_shard: "retain-range-orphan".into(),
+                issued_at_ms: 1,
+                issued_by: "test".into(),
+                attempt_count: 0,
+                payload: BTreeMap::from([
+                    ("range_id".into(), "retain-range-orphan".into()),
+                    ("shard_kind".into(), "Retain".into()),
+                    ("tenant_id".into(), "t1".into()),
+                    ("scope".into(), "*".into()),
+                    ("target_node_id".into(), "7".into()),
+                ]),
+                execution_state: ControlCommandExecutionState::Issued,
+                reflection_state: ControlCommandReflectionState::Pending,
+                last_error: None,
+            })
+            .await
+            .unwrap();
+        let controller: Arc<dyn BalanceController> =
+            Arc::new(MetadataBalanceController::new(registry.clone()));
+        let executor = Arc::new(ApplyingExecutor {
+            registry: registry.clone(),
+        });
+        let coordinator = BalanceCoordinator::with_reconciliation(
+            controller,
+            executor,
+            registry.clone(),
+            "dist-balancer",
+        );
+
+        let recovered = coordinator.reconcile_control_commands().await.unwrap();
+        assert_eq!(recovered, 1);
+
+        let command = registry
+            .resolve_control_command("bootstrap:retain-range-orphan")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(command.execution_state, ControlCommandExecutionState::Applied);
+        assert_eq!(
+            command.reflection_state,
+            ControlCommandReflectionState::Reflected
+        );
+        assert!(registry
+            .resolve_range("retain-range-orphan")
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn reconciliation_marks_terminal_failure_after_retry_budget() {
+        let registry = Arc::new(StaticServiceEndpointRegistry::default());
+        registry
+            .upsert_control_command(ControlCommandRecord {
+                command_id: "bootstrap:retain-range-fail".into(),
+                command_type: "bootstrap_range".into(),
+                target_range_or_shard: "retain-range-fail".into(),
+                issued_at_ms: 1,
+                issued_by: "test".into(),
+                attempt_count: MAX_COMMAND_RETRY_ATTEMPTS,
+                payload: BTreeMap::from([
+                    ("range_id".into(), "retain-range-fail".into()),
+                    ("shard_kind".into(), "Retain".into()),
+                    ("tenant_id".into(), "t1".into()),
+                    ("scope".into(), "*".into()),
+                    ("target_node_id".into(), "7".into()),
+                ]),
+                execution_state: ControlCommandExecutionState::NotExecuted,
+                reflection_state: ControlCommandReflectionState::Unreflected,
+                last_error: Some("executor returned false".into()),
+            })
+            .await
+            .unwrap();
+        let controller: Arc<dyn BalanceController> =
+            Arc::new(MetadataBalanceController::new(registry.clone()));
+        let executor = Arc::new(RecordingExecutor {
+            result: Some(false),
+            ..RecordingExecutor::default()
+        });
+        let coordinator = BalanceCoordinator::with_reconciliation(
+            controller,
+            executor,
+            registry.clone(),
+            "dist-balancer",
+        );
+
+        let recovered = coordinator.reconcile_control_commands().await.unwrap();
+        assert_eq!(recovered, 0);
+
+        let command = registry
+            .resolve_control_command("bootstrap:retain-range-fail")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            command.execution_state,
+            ControlCommandExecutionState::TerminalFailed
+        );
+        assert_eq!(
+            command.last_error.as_deref(),
+            Some("retry budget exhausted")
         );
     }
 }

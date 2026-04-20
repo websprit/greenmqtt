@@ -1421,6 +1421,7 @@ pub(crate) fn internal_status(error: anyhow::Error) -> Status {
     }
     if message.contains("blocked on catch-up")
         || message.contains("joint catch-up")
+        || message.contains("dual-majority catch-up")
         || message.contains("entering joint config")
         || message.contains("joint consensus change already in progress")
     {

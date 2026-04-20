@@ -623,6 +623,7 @@ message RangeHealthRecord {
   bool has_latest_snapshot_index = 9;
   repeated ReplicaLagRecord replica_lag = 10;
   RangeReconfigurationRecord reconfiguration = 11;
+  string lifecycle = 12;
 }
 
 message RangeHealthRequest {

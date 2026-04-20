@@ -43,6 +43,7 @@ async fn http_range_control_bootstrap_drain_and_retire() {
         broker.clone(),
         None,
         None,
+        None,
         Some(runtime.clone()),
         None,
     );
@@ -128,6 +129,7 @@ async fn http_range_control_can_change_replicas_split_merge_and_list_zombies() {
     ));
     let app = HttpApi::router_with_peers_shards_metrics_and_ranges(
         broker,
+        None,
         None,
         None,
         Some(runtime.clone()),
@@ -271,6 +273,7 @@ async fn http_range_list_supports_draining_and_zombie_filters() {
         broker,
         None,
         None,
+        None,
         Some(runtime.clone()),
         None,
     );
@@ -368,4 +371,379 @@ async fn http_range_list_supports_draining_and_zombie_filters() {
         serde_json::from_slice(&body).unwrap();
     assert_eq!(zombies.len(), 1);
     assert_eq!(zombies[0].range_id, "range-zombie");
+}
+
+#[tokio::test]
+async fn http_range_control_forwards_to_remote_owner_when_local_runtime_is_wrong_node() {
+    let broker = broker();
+    let registry = Arc::new(TestShardRegistry::default());
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let bind = listener.local_addr().unwrap();
+    drop(listener);
+
+    let engine = MemoryKvEngine::default();
+    let host = Arc::new(MemoryKvRangeHost::default());
+    let runtime = Arc::new(ReplicaRuntime::with_config(
+        host.clone(),
+        Arc::new(NoopTransport),
+        Some(Arc::new(TestRangeLifecycleManager {
+            engine: engine.clone(),
+        })),
+        std::time::Duration::from_secs(1),
+        64,
+        64,
+        64,
+    ));
+    runtime
+        .bootstrap_range(ReplicatedRangeDescriptor::new(
+            "range-http-forward",
+            ServiceShardKey::retain("t1"),
+            RangeBoundary::full(),
+            1,
+            1,
+            Some(2),
+            vec![RangeReplica::new(
+                2,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Bootstrapping,
+        ))
+        .await
+        .unwrap();
+
+    registry
+        .upsert_member(ClusterNodeMembership::new(
+            2,
+            1,
+            ClusterNodeLifecycle::Serving,
+            vec![ServiceEndpoint::new(
+                ServiceKind::Retain,
+                2,
+                format!("http://{bind}"),
+            )],
+        ))
+        .await
+        .unwrap();
+    registry
+        .upsert_range(ReplicatedRangeDescriptor::new(
+            "range-http-forward",
+            ServiceShardKey::retain("t1"),
+            RangeBoundary::full(),
+            1,
+            1,
+            Some(2),
+            vec![RangeReplica::new(
+                2,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ))
+        .await
+        .unwrap();
+
+    let rpc = tokio::spawn(
+        greenmqtt_rpc::RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
+            assignment_registry: Some(registry.clone()),
+            range_host: Some(host.clone()),
+            range_runtime: Some(runtime.clone()),
+        }
+        .serve(bind),
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let app = HttpApi::router_with_peers_shards_metrics_and_ranges(
+        broker,
+        None,
+        None,
+        Some(registry),
+        None,
+        None,
+    );
+
+    let response = app
+        .oneshot(
+            Request::post("/v1/ranges/range-http-forward/drain")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let reply: crate::range::RangeActionReply = serde_json::from_slice(&body).unwrap();
+    assert_eq!(reply.status, "draining");
+    assert!(reply.forwarded);
+    assert_eq!(reply.target_node_id, Some(2));
+    assert_eq!(reply.target_endpoint.as_deref(), Some(format!("http://{bind}").as_str()));
+
+    let hosted = host.open_range("range-http-forward").await.unwrap().unwrap();
+    assert_eq!(hosted.descriptor.lifecycle, ServiceShardLifecycle::Draining);
+
+    rpc.abort();
+}
+
+#[tokio::test]
+async fn http_range_lists_aggregate_cluster_health_draining_pending_and_zombies() {
+    let broker = broker();
+    let registry = Arc::new(TestShardRegistry::default());
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let node1_bind = listener.local_addr().unwrap();
+    drop(listener);
+    let engine1 = MemoryKvEngine::default();
+    let host1 = Arc::new(MemoryKvRangeHost::default());
+    let runtime1 = Arc::new(ReplicaRuntime::with_config(
+        host1.clone(),
+        Arc::new(NoopTransport),
+        Some(Arc::new(TestRangeLifecycleManager {
+            engine: engine1.clone(),
+        })),
+        std::time::Duration::from_secs(1),
+        64,
+        64,
+        64,
+    ));
+    runtime1
+        .bootstrap_range(ReplicatedRangeDescriptor::new(
+            "range-draining-cluster",
+            ServiceShardKey::retain("t1"),
+            RangeBoundary::full(),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Bootstrapping,
+        ))
+        .await
+        .unwrap();
+    runtime1.drain_range("range-draining-cluster").await.unwrap();
+
+    let node1_server = tokio::spawn(
+        greenmqtt_rpc::RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
+            assignment_registry: Some(registry.clone()),
+            range_host: Some(host1.clone()),
+            range_runtime: Some(runtime1.clone()),
+        }
+        .serve(node1_bind),
+    );
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let node2_bind = listener.local_addr().unwrap();
+    drop(listener);
+    let engine2 = MemoryKvEngine::default();
+    let host2 = Arc::new(MemoryKvRangeHost::default());
+    let runtime2 = Arc::new(ReplicaRuntime::with_config(
+        host2.clone(),
+        Arc::new(NoopTransport),
+        Some(Arc::new(TestRangeLifecycleManager {
+            engine: engine2.clone(),
+        })),
+        std::time::Duration::from_secs(1),
+        64,
+        64,
+        64,
+    ));
+    runtime2
+        .bootstrap_range(ReplicatedRangeDescriptor::new(
+            "range-pending-cluster",
+            ServiceShardKey::retain("t2"),
+            RangeBoundary::full(),
+            1,
+            1,
+            Some(2),
+            vec![RangeReplica::new(
+                2,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Bootstrapping,
+        ))
+        .await
+        .unwrap();
+    runtime2
+        .change_replicas("range-pending-cluster", vec![2, 3], Vec::new())
+        .await
+        .unwrap();
+
+    engine2
+        .bootstrap(KvRangeBootstrap {
+            range_id: "range-zombie-cluster".into(),
+            boundary: RangeBoundary::full(),
+        })
+        .await
+        .unwrap();
+    let zombie_space = Arc::<dyn greenmqtt_kv_engine::KvRangeSpace>::from(
+        engine2.open_range("range-zombie-cluster").await.unwrap(),
+    );
+    let zombie_raft = Arc::new(MemoryRaftNode::new(
+        2,
+        "range-zombie-cluster",
+        greenmqtt_kv_raft::RaftClusterConfig {
+            voters: vec![2, 3],
+            learners: Vec::new(),
+        },
+    ));
+    zombie_raft.recover().await.unwrap();
+    host2.add_range(HostedRange {
+        descriptor: ReplicatedRangeDescriptor::new(
+            "range-zombie-cluster",
+            ServiceShardKey::retain("t3"),
+            RangeBoundary::full(),
+            1,
+            1,
+            None,
+            vec![RangeReplica::new(
+                2,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Recovering,
+        ),
+        raft: zombie_raft,
+        space: zombie_space,
+    })
+    .await
+    .unwrap();
+
+    let node2_server = tokio::spawn(
+        greenmqtt_rpc::RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
+            assignment_registry: Some(registry.clone()),
+            range_host: Some(host2.clone()),
+            range_runtime: Some(runtime2.clone()),
+        }
+        .serve(node2_bind),
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    registry
+        .upsert_member(ClusterNodeMembership::new(
+            1,
+            1,
+            ClusterNodeLifecycle::Serving,
+            vec![ServiceEndpoint::new(
+                ServiceKind::Retain,
+                1,
+                format!("http://{node1_bind}"),
+            )],
+        ))
+        .await
+        .unwrap();
+    registry
+        .upsert_member(ClusterNodeMembership::new(
+            2,
+            1,
+            ClusterNodeLifecycle::Serving,
+            vec![ServiceEndpoint::new(
+                ServiceKind::Retain,
+                2,
+                format!("http://{node2_bind}"),
+            )],
+        ))
+        .await
+        .unwrap();
+
+    let app = HttpApi::router_with_peers_shards_metrics_and_ranges(
+        broker,
+        None,
+        None,
+        Some(registry),
+        None,
+        None,
+    );
+
+    let response = app
+        .clone()
+        .oneshot(Request::get("/v1/ranges").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let all: Vec<greenmqtt_kv_server::RangeHealthSnapshot> = serde_json::from_slice(&body).unwrap();
+    assert!(all.iter().any(|entry| entry.range_id == "range-draining-cluster"));
+    assert!(all.iter().any(|entry| entry.range_id == "range-pending-cluster"));
+    assert!(all.iter().any(|entry| entry.range_id == "range-zombie-cluster"));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/v1/ranges?lifecycle=draining")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let draining: Vec<greenmqtt_kv_server::RangeHealthSnapshot> =
+        serde_json::from_slice(&body).unwrap();
+    assert_eq!(draining.len(), 1);
+    assert_eq!(draining[0].range_id, "range-draining-cluster");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/v1/ranges?pending_only=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let pending: Vec<greenmqtt_kv_server::RangeHealthSnapshot> =
+        serde_json::from_slice(&body).unwrap();
+    assert!(pending.iter().any(|entry| {
+        entry.range_id == "range-pending-cluster" && entry.reconfiguration.phase.is_some()
+    }));
+
+    let response = app
+        .oneshot(
+            Request::get("/v1/ranges/zombies")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let zombies: Vec<greenmqtt_kv_server::ZombieRangeSnapshot> =
+        serde_json::from_slice(&body).unwrap();
+    assert!(zombies
+        .iter()
+        .any(|entry| entry.range_id == "range-zombie-cluster"));
+
+    node1_server.abort();
+    node2_server.abort();
 }

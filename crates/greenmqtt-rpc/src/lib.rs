@@ -3,12 +3,13 @@ use bytes::Bytes;
 use greenmqtt_broker::{DeliverySink, PeerRegistry};
 use greenmqtt_core::{
     BalancerState, BalancerStateRegistry, ClientIdentity, ClusterMembershipRegistry,
-    ClusterNodeMembership, Delivery, InflightMessage, MetadataRegistry, NodeId, OfflineMessage,
-    RangeReconfigurationRegistry, RangeReconfigurationState, ReconfigurationPhase,
-    ReplicatedRangeDescriptor, ReplicatedRangeRegistry, RetainedMessage, RouteRecord,
-    ServiceEndpoint, ServiceEndpointRegistry, ServiceKind, ServiceShardAssignment,
-    ServiceShardKey, ServiceShardKind, ServiceShardLifecycle, ServiceShardRecoveryControl,
-    ServiceShardTransition, ServiceShardTransitionKind, Subscription,
+    ClusterNodeMembership, ControlCommandRecord, ControlCommandRegistry, Delivery,
+    InflightMessage, MetadataRegistry, NodeId, OfflineMessage, RangeReconfigurationRegistry,
+    RangeReconfigurationState, ReconfigurationPhase, ReplicatedRangeDescriptor,
+    ReplicatedRangeRegistry, RetainedMessage, RouteRecord, ServiceEndpoint,
+    ServiceEndpointRegistry, ServiceKind, ServiceShardAssignment, ServiceShardKey,
+    ServiceShardKind, ServiceShardLifecycle, ServiceShardRecoveryControl, ServiceShardTransition,
+    ServiceShardTransitionKind, Subscription,
 };
 use greenmqtt_dist::{dist_tenant_shard, DistRouter};
 use greenmqtt_inbox::{
@@ -156,6 +157,19 @@ pub struct RangeControlGrpcClient {
     inner: Arc<Mutex<RangeControlServiceClient<Channel>>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutedRangeControlTarget {
+    pub range_id: String,
+    pub node_id: NodeId,
+    pub endpoint: String,
+}
+
+#[derive(Clone)]
+pub struct RoutedRangeControlGrpcClient {
+    metadata: MetadataGrpcClient,
+    fallback_endpoint: String,
+}
+
 #[derive(Clone, Default)]
 pub struct KvRangeGrpcExecutorFactory;
 
@@ -190,6 +204,7 @@ pub struct DynamicServiceEndpointRegistry {
     ranges: Arc<RwLock<BTreeMap<String, ReplicatedRangeDescriptor>>>,
     balancer_states: Arc<RwLock<BTreeMap<String, BalancerState>>>,
     reconfiguration_states: Arc<RwLock<BTreeMap<String, RangeReconfigurationState>>>,
+    control_commands: Arc<RwLock<BTreeMap<String, ControlCommandRecord>>>,
 }
 
 #[derive(Clone)]
@@ -218,6 +233,7 @@ const MEMBER_PREFIX: &[u8] = b"member\0";
 const RANGE_PREFIX: &[u8] = b"range\0";
 const BALANCER_PREFIX: &[u8] = b"balancer\0";
 const RECONFIG_PREFIX: &[u8] = b"reconfig\0";
+const COMMAND_PREFIX: &[u8] = b"command\0";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetadataPlaneLayout {
@@ -255,7 +271,7 @@ impl MetadataPlaneLayout {
             &self.members_range_id
         } else if key.starts_with(RANGE_PREFIX) {
             &self.ranges_range_id
-        } else if key.starts_with(BALANCER_PREFIX) {
+        } else if key.starts_with(BALANCER_PREFIX) || key.starts_with(COMMAND_PREFIX) {
             &self.balancers_range_id
         } else {
             &self.assignments_range_id
@@ -413,6 +429,14 @@ fn to_proto_range_health(health: &RangeHealthSnapshot) -> RangeHealthRecord {
             .map(to_proto_replica_lag)
             .collect(),
         reconfiguration: Some(to_proto_reconfiguration(&health.reconfiguration)),
+        lifecycle: match health.lifecycle {
+            ServiceShardLifecycle::Bootstrapping => "bootstrapping",
+            ServiceShardLifecycle::Serving => "serving",
+            ServiceShardLifecycle::Draining => "draining",
+            ServiceShardLifecycle::Recovering => "recovering",
+            ServiceShardLifecycle::Offline => "offline",
+        }
+        .to_string(),
     }
 }
 
@@ -506,6 +530,10 @@ fn balancer_key(name: &str) -> Bytes {
 
 fn reconfiguration_key(range_id: &str) -> Bytes {
     metadata_key(RECONFIG_PREFIX, range_id.as_bytes())
+}
+
+fn command_key(command_id: &str) -> Bytes {
+    metadata_key(COMMAND_PREFIX, command_id.as_bytes())
 }
 
 fn decode_metadata_value<T: DeserializeOwned>(value: &[u8]) -> anyhow::Result<T> {

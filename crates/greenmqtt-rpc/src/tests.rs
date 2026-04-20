@@ -2,7 +2,7 @@ use crate::{
     DistGrpcClient, InboxGrpcClient, KvRangeGrpcClient, MetadataGrpcClient, MetadataPlaneLayout,
     NoopDeliverySink, PeriodicAntiEntropyReconciler, PersistentMetadataRegistry,
     RaftTransportGrpcClient, RangeAdminGrpcClient, RangeControlGrpcClient,
-    ReplicatedMetadataRegistry, RetainGrpcClient, RpcRuntime, SessionDictGrpcClient,
+    ReplicatedMetadataRegistry, RetainGrpcClient, RoutedRangeControlGrpcClient, RpcRuntime, SessionDictGrpcClient,
     StaticPeerForwarder, StaticServiceEndpointRegistry,
 };
 use async_trait::async_trait;
@@ -2159,6 +2159,166 @@ async fn multi_node_replicated_metadata_range_control_and_zombie_detection_work_
         .entries
         .iter()
         .any(|entry| entry.range_id == "range-zombie-node2" && !entry.has_leader_node_id));
+
+    metadata_server.abort();
+    node1_server.abort();
+    node2_server.abort();
+}
+
+#[tokio::test]
+async fn routed_range_control_client_resolves_the_correct_node_from_metadata() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let metadata_bind = listener.local_addr().unwrap();
+    drop(listener);
+    let registry = Arc::new(StaticServiceEndpointRegistry::default());
+    let metadata_server = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: Some(registry.clone()),
+            range_host: None,
+            range_runtime: None,
+        }
+        .serve(metadata_bind),
+    );
+    sleep(Duration::from_millis(50)).await;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let node1_bind = listener.local_addr().unwrap();
+    drop(listener);
+    let node1_server = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: Some(registry.clone()),
+            range_host: Some(Arc::new(MemoryKvRangeHost::default())),
+            range_runtime: None,
+        }
+        .serve(node1_bind),
+    );
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let node2_bind = listener.local_addr().unwrap();
+    drop(listener);
+    let node2_engine = MemoryKvEngine::default();
+    let node2_host = Arc::new(MemoryKvRangeHost::default());
+    let node2_runtime = Arc::new(ReplicaRuntime::with_config(
+        node2_host.clone(),
+        Arc::new(crate::NoopReplicaTransport),
+        Some(Arc::new(TestRangeLifecycleManager {
+            engine: node2_engine.clone(),
+        })),
+        Duration::from_secs(1),
+        1024,
+        64,
+        64,
+    ));
+    node2_runtime
+        .bootstrap_range(ReplicatedRangeDescriptor::new(
+            "range-route-node2",
+            ServiceShardKey::retain("tenant-route"),
+            RangeBoundary::full(),
+            1,
+            1,
+            Some(2),
+            vec![RangeReplica::new(
+                2,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Bootstrapping,
+        ))
+        .await
+        .unwrap();
+    registry
+        .upsert_member(ClusterNodeMembership::new(
+            1,
+            1,
+            ClusterNodeLifecycle::Serving,
+            vec![ServiceEndpoint::new(
+                ServiceKind::Retain,
+                1,
+                format!("http://{node1_bind}"),
+            )],
+        ))
+        .await
+        .unwrap();
+    registry
+        .upsert_member(ClusterNodeMembership::new(
+            2,
+            1,
+            ClusterNodeLifecycle::Serving,
+            vec![ServiceEndpoint::new(
+                ServiceKind::Retain,
+                2,
+                format!("http://{node2_bind}"),
+            )],
+        ))
+        .await
+        .unwrap();
+    registry
+        .upsert_range(ReplicatedRangeDescriptor::new(
+            "range-route-node2",
+            ServiceShardKey::retain("tenant-route"),
+            RangeBoundary::full(),
+            1,
+            1,
+            Some(2),
+            vec![RangeReplica::new(
+                2,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ))
+        .await
+        .unwrap();
+    let node2_server = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: Some(registry.clone()),
+            range_host: Some(node2_host),
+            range_runtime: Some(node2_runtime.clone()),
+        }
+        .serve(node2_bind),
+    );
+    sleep(Duration::from_millis(100)).await;
+
+    let routed = RoutedRangeControlGrpcClient::connect(
+        format!("http://{metadata_bind}"),
+        format!("http://{node1_bind}"),
+    )
+    .await
+    .unwrap();
+    let target = routed.resolve_range_target("range-route-node2").await.unwrap();
+    assert_eq!(target.node_id, 2);
+    assert_eq!(target.endpoint, format!("http://{node2_bind}"));
+
+    routed
+        .change_replicas("range-route-node2", vec![2, 3], Vec::new())
+        .await
+        .unwrap();
+    let reconfig = registry
+        .resolve_reconfiguration_state("range-route-node2")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reconfig.current_voters, vec![2]);
+    assert_eq!(reconfig.pending_voters, vec![2, 3]);
 
     metadata_server.abort();
     node1_server.abort();

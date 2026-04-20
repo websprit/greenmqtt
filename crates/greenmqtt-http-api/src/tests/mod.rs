@@ -10,12 +10,14 @@ use greenmqtt_broker::{
     SessionSummary,
 };
 use greenmqtt_core::{
-    ClientIdentity, ClusterMembershipRegistry, ClusterNodeLifecycle, ClusterNodeMembership,
-    ConnectReply, ConnectRequest, Delivery, OfflineMessage, PublishProperties, PublishRequest,
+    BalancerState, BalancerStateRegistry, ClientIdentity, ClusterMembershipRegistry,
+    ClusterNodeLifecycle, ClusterNodeMembership, ConnectReply, ConnectRequest, Delivery,
+    OfflineMessage, PublishProperties, PublishRequest, RangeReconfigurationRegistry,
+    RangeReconfigurationState, ReplicatedRangeDescriptor, ReplicatedRangeRegistry,
     RetainedMessage, RouteRecord, ServiceEndpoint, ServiceEndpointRegistry, ServiceKind,
     ServiceShardAssignment, ServiceShardKey, ServiceShardKind, ServiceShardLifecycle,
-    ServiceShardRecoveryControl, ServiceShardTransition, SessionKind, SessionRecord,
-    Subscription, TenantQuota,
+    ServiceShardRecoveryControl, ServiceShardTransition, SessionKind, SessionRecord, Subscription,
+    TenantQuota,
 };
 use greenmqtt_dist::{DistHandle, DistRouter};
 use greenmqtt_inbox::{InboxHandle, InboxService, PersistentInboxHandle};
@@ -96,6 +98,9 @@ struct TestPeerRegistry {
 struct TestShardRegistry {
     assignments: RwLock<BTreeMap<ServiceShardKey, ServiceShardAssignment>>,
     members: RwLock<BTreeMap<u64, ClusterNodeMembership>>,
+    ranges: RwLock<BTreeMap<String, ReplicatedRangeDescriptor>>,
+    balancer_states: RwLock<BTreeMap<String, BalancerState>>,
+    reconfig_states: RwLock<BTreeMap<String, RangeReconfigurationState>>,
 }
 
 #[async_trait]
@@ -188,6 +193,151 @@ impl ClusterMembershipRegistry for TestShardRegistry {
     async fn list_members(&self) -> anyhow::Result<Vec<ClusterNodeMembership>> {
         Ok(self
             .members
+            .read()
+            .expect("shard registry poisoned")
+            .values()
+            .cloned()
+            .collect())
+    }
+}
+
+#[async_trait]
+impl ReplicatedRangeRegistry for TestShardRegistry {
+    async fn upsert_range(
+        &self,
+        descriptor: ReplicatedRangeDescriptor,
+    ) -> anyhow::Result<Option<ReplicatedRangeDescriptor>> {
+        Ok(self
+            .ranges
+            .write()
+            .expect("shard registry poisoned")
+            .insert(descriptor.id.clone(), descriptor))
+    }
+
+    async fn resolve_range(
+        &self,
+        range_id: &str,
+    ) -> anyhow::Result<Option<ReplicatedRangeDescriptor>> {
+        Ok(self
+            .ranges
+            .read()
+            .expect("shard registry poisoned")
+            .get(range_id)
+            .cloned())
+    }
+
+    async fn remove_range(
+        &self,
+        range_id: &str,
+    ) -> anyhow::Result<Option<ReplicatedRangeDescriptor>> {
+        Ok(self
+            .ranges
+            .write()
+            .expect("shard registry poisoned")
+            .remove(range_id))
+    }
+
+    async fn list_ranges(
+        &self,
+        shard_kind: Option<ServiceShardKind>,
+    ) -> anyhow::Result<Vec<ReplicatedRangeDescriptor>> {
+        let mut ranges: Vec<_> = self
+            .ranges
+            .read()
+            .expect("shard registry poisoned")
+            .values()
+            .filter(|descriptor| {
+                shard_kind
+                    .as_ref()
+                    .map(|kind| descriptor.shard.kind == *kind)
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+        ranges.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(ranges)
+    }
+}
+
+#[async_trait]
+impl BalancerStateRegistry for TestShardRegistry {
+    async fn upsert_balancer_state(
+        &self,
+        name: &str,
+        state: BalancerState,
+    ) -> anyhow::Result<Option<BalancerState>> {
+        Ok(self
+            .balancer_states
+            .write()
+            .expect("shard registry poisoned")
+            .insert(name.to_string(), state))
+    }
+
+    async fn resolve_balancer_state(&self, name: &str) -> anyhow::Result<Option<BalancerState>> {
+        Ok(self
+            .balancer_states
+            .read()
+            .expect("shard registry poisoned")
+            .get(name)
+            .cloned())
+    }
+
+    async fn remove_balancer_state(&self, name: &str) -> anyhow::Result<Option<BalancerState>> {
+        Ok(self
+            .balancer_states
+            .write()
+            .expect("shard registry poisoned")
+            .remove(name))
+    }
+
+    async fn list_balancer_states(&self) -> anyhow::Result<BTreeMap<String, BalancerState>> {
+        Ok(self
+            .balancer_states
+            .read()
+            .expect("shard registry poisoned")
+            .clone())
+    }
+}
+
+#[async_trait]
+impl RangeReconfigurationRegistry for TestShardRegistry {
+    async fn upsert_reconfiguration_state(
+        &self,
+        state: RangeReconfigurationState,
+    ) -> anyhow::Result<Option<RangeReconfigurationState>> {
+        Ok(self
+            .reconfig_states
+            .write()
+            .expect("shard registry poisoned")
+            .insert(state.range_id.clone(), state))
+    }
+
+    async fn resolve_reconfiguration_state(
+        &self,
+        range_id: &str,
+    ) -> anyhow::Result<Option<RangeReconfigurationState>> {
+        Ok(self
+            .reconfig_states
+            .read()
+            .expect("shard registry poisoned")
+            .get(range_id)
+            .cloned())
+    }
+
+    async fn remove_reconfiguration_state(
+        &self,
+        range_id: &str,
+    ) -> anyhow::Result<Option<RangeReconfigurationState>> {
+        Ok(self
+            .reconfig_states
+            .write()
+            .expect("shard registry poisoned")
+            .remove(range_id))
+    }
+
+    async fn list_reconfiguration_states(&self) -> anyhow::Result<Vec<RangeReconfigurationState>> {
+        Ok(self
+            .reconfig_states
             .read()
             .expect("shard registry poisoned")
             .values()
