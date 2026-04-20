@@ -377,12 +377,17 @@ fn to_proto_reconfiguration(
 ) -> RangeReconfigurationRecord {
     let (phase, has_phase) = match &state.phase {
         Some(ReconfigurationPhase::StagingLearners) => ("staging_learners".to_string(), true),
+        Some(ReconfigurationPhase::JointConsensus) => ("joint_consensus".to_string(), true),
         Some(ReconfigurationPhase::Finalizing) => ("finalizing".to_string(), true),
         None => (String::new(), false),
     };
     RangeReconfigurationRecord {
+        old_voters: state.old_voters.clone(),
+        old_learners: state.old_learners.clone(),
         current_voters: state.current_voters.clone(),
         current_learners: state.current_learners.clone(),
+        joint_voters: state.joint_voters.clone(),
+        joint_learners: state.joint_learners.clone(),
         pending_voters: state.pending_voters.clone(),
         pending_learners: state.pending_learners.clone(),
         phase,
@@ -5445,7 +5450,12 @@ impl RangeControlService for RangeControlRpc {
         if result
             .as_ref()
             .err()
-            .map(|error| error.to_string().contains("blocked on catch-up"))
+            .map(|error| {
+                let message = error.to_string();
+                message.contains("blocked on catch-up")
+                    || message.contains("joint catch-up")
+                    || message.contains("entering joint config")
+            })
             .unwrap_or(false)
             || result.is_ok()
         {
@@ -5599,7 +5609,11 @@ fn internal_status(error: anyhow::Error) -> Status {
     if message.contains("range lifecycle is not serving") {
         return Status::failed_precondition(format!("kv/config-changing {message}"));
     }
-    if message.contains("blocked on catch-up") {
+    if message.contains("blocked on catch-up")
+        || message.contains("joint catch-up")
+        || message.contains("entering joint config")
+        || message.contains("joint consensus change already in progress")
+    {
         return Status::failed_precondition(format!("kv/config-changing {message}"));
     }
     if message.contains("active leader lease") {

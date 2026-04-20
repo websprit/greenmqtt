@@ -2560,6 +2560,50 @@ async fn fence_current_session_disconnects_only_matching_epoch() {
 }
 
 #[tokio::test]
+async fn disconnect_stops_session_registration_handle_cleanly() {
+    let mut broker = test_broker();
+    broker.set_session_registration_poll_interval(Duration::from_millis(10));
+    let subscriber = broker
+        .connect(ConnectRequest {
+            identity: ClientIdentity {
+                tenant_id: "tenant-a".into(),
+                user_id: "user-a".into(),
+                client_id: "registration-stop".into(),
+            },
+            node_id: 1,
+            kind: SessionKind::Transient,
+            clean_start: true,
+            session_expiry_interval_secs: None,
+        })
+        .await
+        .unwrap();
+
+    broker.disconnect(&subscriber.session.session_id).await.unwrap();
+    assert!(broker.list_local_sessions().await.unwrap().is_empty());
+
+    broker
+        .sessiondict
+        .register(SessionRecord {
+            session_id: "replacement".into(),
+            node_id: 7,
+            kind: SessionKind::Transient,
+            identity: ClientIdentity {
+                tenant_id: "tenant-a".into(),
+                user_id: "user-a".into(),
+                client_id: "registration-stop".into(),
+            },
+            session_expiry_interval_secs: None,
+            expires_at_ms: None,
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(broker
+        .take_pending_session_control(&subscriber.session.session_id)
+        .is_none());
+}
+
+#[tokio::test]
 async fn failover_sessions_from_node_reassigns_only_failed_peer_sessions() {
     let broker = test_broker();
 

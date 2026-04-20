@@ -131,6 +131,10 @@ struct PendingOutbound {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PendingReconfiguration {
+    pub old_voters: Vec<NodeId>,
+    pub old_learners: Vec<NodeId>,
+    pub joint_voters: Vec<NodeId>,
+    pub joint_learners: Vec<NodeId>,
     pub target_voters: Vec<NodeId>,
     pub target_learners: Vec<NodeId>,
     pub current_voters: Vec<NodeId>,
@@ -212,26 +216,84 @@ impl ReplicaRuntime {
             })
     }
 
+    fn config_caught_up(status: &RaftStatusSnapshot, voters: &[NodeId], learners: &[NodeId]) -> bool {
+        voters
+            .iter()
+            .chain(learners.iter())
+            .all(|node_id| {
+                status
+                    .replica_progress
+                    .iter()
+                    .find(|replica| replica.node_id == *node_id)
+                    .map(|replica| replica.match_index >= status.commit_index)
+                    .unwrap_or(false)
+            })
+    }
+
+    fn pending_from_status(status: &RaftStatusSnapshot) -> Option<PendingReconfiguration> {
+        let transition = status.config_transition.as_ref()?;
+        Some(PendingReconfiguration {
+            old_voters: transition.old_config.voters.clone(),
+            old_learners: transition.old_config.learners.clone(),
+            joint_voters: transition.joint_config.voters.clone(),
+            joint_learners: transition.joint_config.learners.clone(),
+            target_voters: transition.final_config.voters.clone(),
+            target_learners: transition.final_config.learners.clone(),
+            current_voters: status.cluster_config.voters.clone(),
+            current_learners: status.cluster_config.learners.clone(),
+            phase: match transition.phase {
+                greenmqtt_kv_raft::RaftConfigTransitionPhase::JointConsensus => {
+                    ReconfigurationPhase::JointConsensus
+                }
+                greenmqtt_kv_raft::RaftConfigTransitionPhase::Finalizing => {
+                    ReconfigurationPhase::Finalizing
+                }
+            },
+            blocked_on_catch_up: !Self::config_caught_up(
+                status,
+                &transition.old_config.voters,
+                &transition.old_config.learners,
+            ) || !Self::config_caught_up(
+                status,
+                &transition.final_config.voters,
+                &transition.final_config.learners,
+            ),
+        })
+    }
+
     pub async fn pending_reconfiguration(
         &self,
         range_id: &str,
     ) -> anyhow::Result<Option<PendingReconfiguration>> {
-        Ok(self
+        if let Some(pending) = self
             .pending_reconfig
             .lock()
             .expect("replica runtime poisoned")
             .get(range_id)
-            .cloned())
+            .cloned()
+        {
+            return Ok(Some(pending));
+        }
+        let Some(status) = self.host.range(range_id).await? else {
+            return Ok(None);
+        };
+        Ok(Self::pending_from_status(&status.raft))
     }
 
     pub async fn list_pending_reconfigurations(
         &self,
     ) -> anyhow::Result<BTreeMap<String, PendingReconfiguration>> {
-        Ok(self
+        let mut pending = self
             .pending_reconfig
             .lock()
             .expect("replica runtime poisoned")
-            .clone())
+            .clone();
+        for status in self.host.list_ranges().await? {
+            if let Some(derived) = Self::pending_from_status(&status.raft) {
+                pending.entry(status.descriptor.id.clone()).or_insert(derived);
+            }
+        }
+        Ok(pending)
     }
 
     pub async fn reconfiguration_state(
@@ -246,11 +308,28 @@ impl ReplicaRuntime {
             .lock()
             .expect("replica runtime poisoned")
             .get(range_id)
-            .cloned();
+            .cloned()
+            .or_else(|| Self::pending_from_status(&status.raft));
         Ok(Some(RangeReconfigurationState {
             range_id: range_id.to_string(),
+            old_voters: pending
+                .as_ref()
+                .map(|pending| pending.old_voters.clone())
+                .unwrap_or_else(|| status.raft.cluster_config.voters.clone()),
+            old_learners: pending
+                .as_ref()
+                .map(|pending| pending.old_learners.clone())
+                .unwrap_or_else(|| status.raft.cluster_config.learners.clone()),
             current_voters: status.raft.cluster_config.voters.clone(),
             current_learners: status.raft.cluster_config.learners.clone(),
+            joint_voters: pending
+                .as_ref()
+                .map(|pending| pending.joint_voters.clone())
+                .unwrap_or_else(|| status.raft.cluster_config.voters.clone()),
+            joint_learners: pending
+                .as_ref()
+                .map(|pending| pending.joint_learners.clone())
+                .unwrap_or_else(|| status.raft.cluster_config.learners.clone()),
             pending_voters: pending
                 .as_ref()
                 .map(|pending| pending.target_voters.clone())
@@ -769,6 +848,10 @@ impl ReplicaRuntime {
                 .insert(
                     range_id.to_string(),
                     PendingReconfiguration {
+                        old_voters: current_voters.clone(),
+                        old_learners: current_learners.clone(),
+                        joint_voters: current_voters.clone(),
+                        joint_learners: staged_learners.clone(),
                         target_voters: desired_voters,
                         target_learners: desired_learners,
                         current_voters: current_voters.clone(),
@@ -786,7 +869,10 @@ impl ReplicaRuntime {
                 .await;
         }
 
-        if current_voters == desired_voters && current_learners == desired_learners {
+        if current_voters == desired_voters
+            && current_learners == desired_learners
+            && status.config_transition.is_none()
+        {
             self.pending_reconfig
                 .lock()
                 .expect("replica runtime poisoned")
@@ -794,24 +880,47 @@ impl ReplicaRuntime {
             return Ok(());
         }
 
-        let blocked_on_catch_up =
-            !Self::desired_replicas_caught_up(&status, &desired_voters, &desired_learners);
-        if blocked_on_catch_up {
+        let status_transition = status.config_transition.clone();
+        if let Some(transition) = status_transition {
+            let blocked_on_catch_up = !Self::config_caught_up(
+                &status,
+                &transition.old_config.voters,
+                &transition.old_config.learners,
+            ) || !Self::config_caught_up(
+                &status,
+                &transition.final_config.voters,
+                &transition.final_config.learners,
+            );
             self.pending_reconfig
                 .lock()
                 .expect("replica runtime poisoned")
                 .insert(
                     range_id.to_string(),
                     PendingReconfiguration {
-                        target_voters: desired_voters,
-                        target_learners: desired_learners,
+                        old_voters: transition.old_config.voters.clone(),
+                        old_learners: transition.old_config.learners.clone(),
+                        joint_voters: transition.joint_config.voters.clone(),
+                        joint_learners: transition.joint_config.learners.clone(),
+                        target_voters: transition.final_config.voters.clone(),
+                        target_learners: transition.final_config.learners.clone(),
                         current_voters: current_voters.clone(),
                         current_learners: current_learners.clone(),
-                        phase: ReconfigurationPhase::Finalizing,
-                        blocked_on_catch_up: true,
+                        phase: ReconfigurationPhase::JointConsensus,
+                        blocked_on_catch_up,
                     },
                 );
-            anyhow::bail!("config change blocked on catch-up for range `{range_id}`");
+            if blocked_on_catch_up {
+                anyhow::bail!("config change blocked on joint catch-up for range `{range_id}`");
+            }
+            range
+                .raft
+                .change_cluster_config(RaftConfigChange::FinalizeJointConsensus)
+                .await?;
+            self.pending_reconfig
+                .lock()
+                .expect("replica runtime poisoned")
+                .remove(range_id);
+            return Ok(());
         }
 
         if let Some(local_leader) = status.leader_node_id {
@@ -825,17 +934,66 @@ impl ReplicaRuntime {
             }
         }
 
+        let joint_voters = {
+            let mut voters = current_voters.clone();
+            voters.extend(desired_voters.iter().copied());
+            voters.sort_unstable();
+            voters.dedup();
+            voters
+        };
+        let joint_learners = {
+            let mut learners = current_learners.clone();
+            learners.extend(desired_learners.iter().copied());
+            learners.retain(|node_id| !joint_voters.contains(node_id));
+            learners.sort_unstable();
+            learners.dedup();
+            learners
+        };
+        let blocked_on_catch_up =
+            !Self::desired_replicas_caught_up(&status, &joint_voters, &joint_learners);
+        self.pending_reconfig
+            .lock()
+            .expect("replica runtime poisoned")
+            .insert(
+                range_id.to_string(),
+                PendingReconfiguration {
+                    old_voters: current_voters.clone(),
+                    old_learners: current_learners.clone(),
+                    joint_voters: joint_voters.clone(),
+                    joint_learners: joint_learners.clone(),
+                    target_voters: desired_voters.clone(),
+                    target_learners: desired_learners.clone(),
+                    current_voters: current_voters.clone(),
+                    current_learners: current_learners.clone(),
+                    phase: ReconfigurationPhase::JointConsensus,
+                    blocked_on_catch_up,
+                },
+            );
+        if blocked_on_catch_up {
+            anyhow::bail!("config change blocked before entering joint config for range `{range_id}`");
+        }
         range
             .raft
-            .change_cluster_config(RaftConfigChange::ReplaceCluster {
+            .change_cluster_config(RaftConfigChange::EnterJointConsensus {
                 voters: desired_voters,
                 learners: desired_learners,
             })
             .await?;
-        self.pending_reconfig
-            .lock()
-            .expect("replica runtime poisoned")
-            .remove(range_id);
+        let joint_status = range.raft.status().await?;
+        if joint_status.cluster_config.voters == desired_target.0
+            && joint_status.cluster_config.learners == desired_target.1
+            && joint_voters == desired_target.0
+            && joint_learners == desired_target.1
+        {
+            range
+                .raft
+                .change_cluster_config(RaftConfigChange::FinalizeJointConsensus)
+                .await?;
+            self.pending_reconfig
+                .lock()
+                .expect("replica runtime poisoned")
+                .remove(range_id);
+        }
         Ok(())
     }
 
@@ -1180,7 +1338,9 @@ mod tests {
     };
     use greenmqtt_kv_balance::{execute_balance_commands, BalanceCommand};
     use greenmqtt_kv_engine::{KvEngine, MemoryKvEngine};
-    use greenmqtt_kv_raft::{AppendEntriesResponse, MemoryRaftNode, RaftMessage, RaftNode};
+    use greenmqtt_kv_raft::{
+        AppendEntriesResponse, MemoryRaftNode, RaftClusterConfig, RaftMessage, RaftNode,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -1968,13 +2128,13 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(error.contains("blocked on catch-up"));
+        assert!(error.contains("entering joint config"));
         let pending = runtime
             .pending_reconfiguration("range-stage-catchup")
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(pending.phase, ReconfigurationPhase::Finalizing);
+        assert_eq!(pending.phase, ReconfigurationPhase::JointConsensus);
         assert!(pending.blocked_on_catch_up);
 
         let status = raft.status().await.unwrap();
@@ -2059,6 +2219,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replica_runtime_exposes_joint_consensus_pending_state() {
+        let engine = MemoryKvEngine::default();
+        engine
+            .bootstrap(greenmqtt_kv_engine::KvRangeBootstrap {
+                range_id: "range-joint-state".into(),
+                boundary: RangeBoundary::full(),
+            })
+            .await
+            .unwrap();
+        let space = Arc::<dyn greenmqtt_kv_engine::KvRangeSpace>::from(
+            engine.open_range("range-joint-state").await.unwrap(),
+        );
+        let raft = Arc::new(MemoryRaftNode::new(
+            1,
+            "range-joint-state",
+            RaftClusterConfig {
+                voters: vec![1, 2],
+                learners: vec![3],
+            },
+        ));
+        raft.recover().await.unwrap();
+        let host = Arc::new(MemoryKvRangeHost::default());
+        host.add_range(HostedRange {
+            descriptor: ReplicatedRangeDescriptor::new(
+                "range-joint-state",
+                ServiceShardKey::retain("tenant-a"),
+                RangeBoundary::full(),
+                1,
+                1,
+                Some(1),
+                vec![
+                    RangeReplica::new(1, ReplicaRole::Voter, ReplicaSyncState::Replicating),
+                    RangeReplica::new(2, ReplicaRole::Voter, ReplicaSyncState::Replicating),
+                    RangeReplica::new(3, ReplicaRole::Learner, ReplicaSyncState::Replicating),
+                ],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ),
+            raft: raft.clone(),
+            space,
+        })
+        .await
+        .unwrap();
+        let runtime = ReplicaRuntime::new(host, Arc::new(RecordingTransport::default()));
+        runtime
+            .change_replicas("range-joint-state", vec![2, 3], Vec::new())
+            .await
+            .unwrap();
+        let pending = runtime
+            .pending_reconfiguration("range-joint-state")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.phase, ReconfigurationPhase::JointConsensus);
+        assert_eq!(pending.old_voters, vec![1, 2]);
+        assert_eq!(pending.joint_voters, vec![1, 2, 3]);
+        assert_eq!(pending.target_voters, vec![2, 3]);
+        assert!(!pending.blocked_on_catch_up);
+    }
+
+    #[tokio::test]
     async fn replica_runtime_survives_repeated_replica_reconfiguration_cycles() {
         let engine = MemoryKvEngine::default();
         engine
@@ -2117,6 +2339,10 @@ mod tests {
             .unwrap();
             runtime
                 .change_replicas("range-reconfig-loop", vec![1, target], Vec::new())
+                .await
+                .unwrap();
+            runtime
+                .change_replicas("range-reconfig-loop", vec![1], Vec::new())
                 .await
                 .unwrap();
             runtime

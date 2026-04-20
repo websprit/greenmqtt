@@ -1901,9 +1901,11 @@ async fn range_control_service_persists_reconfiguration_state_into_metadata_regi
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(state.old_voters, vec![1]);
     assert_eq!(state.current_voters, vec![1]);
+    assert_eq!(state.joint_voters, vec![1, 2]);
     assert_eq!(state.pending_voters, vec![1, 2]);
-    assert_eq!(state.phase, Some(ReconfigurationPhase::Finalizing));
+    assert_eq!(state.phase, Some(ReconfigurationPhase::JointConsensus));
     assert!(state.blocked_on_catch_up);
 
     server.abort();

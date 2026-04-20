@@ -103,10 +103,23 @@ async fn mqtt_v5_session_balancer_recheck_disconnects_with_server_reference() {
     let mut connack = vec![0u8; connack_len];
     client.read_exact(&mut connack).await.unwrap();
 
-    assert_eq!(client.read_u8().await.unwrap() >> 4, PACKET_TYPE_DISCONNECT);
-    let disconnect_len = read_remaining_length_for_test(&mut client).await;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), client.read_u8())
+            .await
+            .expect("timed out waiting for registration takeover disconnect")
+            .unwrap()
+            >> 4,
+        PACKET_TYPE_DISCONNECT
+    );
+    let disconnect_len =
+        tokio::time::timeout(Duration::from_secs(1), read_remaining_length_for_test(&mut client))
+            .await
+            .expect("timed out waiting for disconnect remaining length");
     let mut disconnect = vec![0u8; disconnect_len];
-    client.read_exact(&mut disconnect).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut disconnect))
+        .await
+        .expect("timed out waiting for disconnect payload")
+        .unwrap();
     let disconnect = parse_v5_disconnect_packet(&disconnect);
     assert_eq!(disconnect.reason_code, 0x9C);
     assert_eq!(
@@ -296,6 +309,161 @@ async fn mqtt_v5_session_takeover_disconnects_stale_connection() {
     assert_eq!(second.read_u8().await.unwrap() >> 4, PACKET_TYPE_PINGRESP);
     let pingresp_len = read_remaining_length_for_test(&mut second).await;
     assert_eq!(pingresp_len, 0);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn mqtt_v5_session_registration_takeover_disconnects_live_session() {
+    let mut broker = test_broker();
+    Arc::get_mut(&mut broker)
+        .expect("broker should be uniquely owned before serve")
+        .set_session_registration_poll_interval(Duration::from_millis(10));
+    let bind = next_test_bind();
+    let server = tokio::spawn(serve_tcp(broker.clone(), bind));
+    sleep(Duration::from_millis(50)).await;
+
+    let properties = session_expiry_interval_property(60);
+    let mut client = connect_tcp_with_retry(bind).await.unwrap();
+    client
+        .write_all(&connect_packet_v5_with_properties(
+            "registration-takeover",
+            false,
+            &properties,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(client.read_u8().await.unwrap() >> 4, PACKET_TYPE_CONNACK);
+    let connack_len = read_remaining_length_for_test(&mut client).await;
+    let mut connack = vec![0u8; connack_len];
+    client.read_exact(&mut connack).await.unwrap();
+    let live_session = broker
+        .list_local_sessions()
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("live session must exist");
+    let identity = broker
+        .session_record(&live_session.session_id)
+        .await
+        .unwrap()
+        .expect("live session record")
+        .identity;
+
+    broker
+        .sessiondict
+        .register(SessionRecord {
+            session_id: "replacement".into(),
+            node_id: 1,
+            kind: SessionKind::Persistent,
+            identity,
+            session_expiry_interval_secs: Some(60),
+            expires_at_ms: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), client.read_u8())
+            .await
+            .expect("timed out waiting for registration redirect disconnect")
+            .unwrap()
+            >> 4,
+        PACKET_TYPE_DISCONNECT
+    );
+    let disconnect_len =
+        tokio::time::timeout(Duration::from_secs(1), read_remaining_length_for_test(&mut client))
+            .await
+            .expect("timed out waiting for disconnect remaining length");
+    let mut disconnect = vec![0u8; disconnect_len];
+    tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut disconnect))
+        .await
+        .expect("timed out waiting for disconnect payload")
+        .unwrap();
+    let disconnect = parse_v5_disconnect_packet(&disconnect);
+    assert_eq!(disconnect.reason_code, 0x8E);
+    assert_eq!(
+        disconnect.reason_string.as_deref(),
+        Some("session taken over")
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn mqtt_v5_session_registration_redirect_disconnects_with_server_reference() {
+    let mut broker = test_broker();
+    Arc::get_mut(&mut broker)
+        .expect("broker should be uniquely owned before serve")
+        .set_session_registration_poll_interval(Duration::from_millis(10));
+    broker.record_admin_audit(
+        "upsert_peer",
+        "peers",
+        std::collections::BTreeMap::from([
+            ("node_id".into(), "7".into()),
+            ("rpc_addr".into(), "mqtt://127.0.0.1:4883".into()),
+        ]),
+    );
+    let bind = next_test_bind();
+    let server = tokio::spawn(serve_tcp(broker.clone(), bind));
+    sleep(Duration::from_millis(50)).await;
+
+    let properties = session_expiry_interval_property(60);
+    let mut client = connect_tcp_with_retry(bind).await.unwrap();
+    client
+        .write_all(&connect_packet_v5_with_properties(
+            "registration-redirect",
+            false,
+            &properties,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(client.read_u8().await.unwrap() >> 4, PACKET_TYPE_CONNACK);
+    let connack_len = read_remaining_length_for_test(&mut client).await;
+    let mut connack = vec![0u8; connack_len];
+    client.read_exact(&mut connack).await.unwrap();
+    let live_session = broker
+        .list_local_sessions()
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("live session must exist");
+    let identity = broker
+        .session_record(&live_session.session_id)
+        .await
+        .unwrap()
+        .expect("live session record")
+        .identity;
+
+    broker
+        .sessiondict
+        .register(SessionRecord {
+            session_id: "redirect-owner".into(),
+            node_id: 7,
+            kind: SessionKind::Persistent,
+            identity,
+            session_expiry_interval_secs: Some(60),
+            expires_at_ms: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(client.read_u8().await.unwrap() >> 4, PACKET_TYPE_DISCONNECT);
+    let disconnect_len = read_remaining_length_for_test(&mut client).await;
+    let mut disconnect = vec![0u8; disconnect_len];
+    client.read_exact(&mut disconnect).await.unwrap();
+    let disconnect = parse_v5_disconnect_packet(&disconnect);
+    assert_eq!(disconnect.reason_code, 0x9C);
+    assert_eq!(
+        disconnect.reason_string.as_deref(),
+        Some("use another server")
+    );
+    assert_eq!(
+        disconnect.server_reference.as_deref(),
+        Some("mqtt://127.0.0.1:4883")
+    );
 
     server.abort();
 }

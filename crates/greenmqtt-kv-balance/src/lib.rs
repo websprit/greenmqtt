@@ -1804,11 +1804,15 @@ mod tests {
         registry
             .upsert_reconfiguration_state(greenmqtt_core::RangeReconfigurationState {
                 range_id: "stuck-range".into(),
+                old_voters: vec![7],
+                old_learners: vec![],
                 current_voters: vec![7],
                 current_learners: vec![],
+                joint_voters: vec![7, 8],
+                joint_learners: vec![],
                 pending_voters: vec![7, 8],
                 pending_learners: vec![],
-                phase: Some(greenmqtt_core::ReconfigurationPhase::Finalizing),
+                phase: Some(greenmqtt_core::ReconfigurationPhase::JointConsensus),
                 blocked_on_catch_up: true,
             })
             .await

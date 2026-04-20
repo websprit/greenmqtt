@@ -1408,6 +1408,19 @@ where
                 if keep_alive_timed_out(last_activity, keep_alive) {
                     break 'session Err(anyhow::anyhow!("keep alive timeout"));
                 }
+                if let Some(active_session) = protocol_session_state.active_session_id_cloned() {
+                    if let Some(control) = broker.take_pending_session_control(&active_session) {
+                        let packet = build_disconnect_packet_with_server_reference(
+                            protocol_level,
+                            Some(control.reason_code),
+                            include_problem_information.then_some(control.reason.as_str()),
+                            control.server_reference.as_deref(),
+                        );
+                        protocol_session_state.begin_disconnect(None);
+                        let _ = stream.write_bytes(&packet).await;
+                        break 'session Ok(());
+                    }
+                }
                 if let Some(identity) = protocol_session_state.current_identity_cloned() {
                     if let Some(redirection) = broker.client_balancer.need_redirect(&identity) {
                         let packet = build_disconnect_packet_with_server_reference(

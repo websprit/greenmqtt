@@ -329,6 +329,7 @@ pub struct BalancerState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ReconfigurationPhase {
     StagingLearners,
+    JointConsensus,
     Finalizing,
 }
 
@@ -336,9 +337,17 @@ pub enum ReconfigurationPhase {
 pub struct RangeReconfigurationState {
     pub range_id: RangeId,
     #[serde(default)]
+    pub old_voters: Vec<NodeId>,
+    #[serde(default)]
+    pub old_learners: Vec<NodeId>,
+    #[serde(default)]
     pub current_voters: Vec<NodeId>,
     #[serde(default)]
     pub current_learners: Vec<NodeId>,
+    #[serde(default)]
+    pub joint_voters: Vec<NodeId>,
+    #[serde(default)]
+    pub joint_learners: Vec<NodeId>,
     #[serde(default)]
     pub pending_voters: Vec<NodeId>,
     #[serde(default)]

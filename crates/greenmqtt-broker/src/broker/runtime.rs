@@ -91,6 +91,8 @@ where
             outbound_bandwidth_overrides: DashMap::new(),
             connect_debounce_window_ms: None,
             recent_connect_attempts: Arc::new(ShardedWillGenerations::default()),
+            pending_session_controls: Arc::new(ShardedPendingSessionControls::default()),
+            session_registration_poll_interval: Duration::from_secs(5),
         }
     }
 
@@ -148,6 +150,10 @@ where
 
     pub fn set_connect_debounce_window(&mut self, window: Duration) {
         self.connect_debounce_window_ms = Some(window.as_millis() as u64);
+    }
+
+    pub fn set_session_registration_poll_interval(&mut self, interval: Duration) {
+        self.session_registration_poll_interval = interval;
     }
 
     pub fn set_publish_rate_limit_per_connection(&mut self, rate_per_sec: u64, burst: u64) {

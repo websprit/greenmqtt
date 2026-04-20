@@ -84,7 +84,16 @@ impl SessionRegistrationManager {
         record: SessionRecord,
         kill_listener: Arc<dyn SessionKillListener>,
     ) -> anyhow::Result<SessionRegistrationHandle> {
-        self.directory.register(record.clone()).await?;
+        let (_, handle) = self.register_with_previous(record, kill_listener).await?;
+        Ok(handle)
+    }
+
+    pub async fn register_with_previous(
+        &self,
+        record: SessionRecord,
+        kill_listener: Arc<dyn SessionKillListener>,
+    ) -> anyhow::Result<(Option<SessionRecord>, SessionRegistrationHandle)> {
+        let previous = self.directory.register(record.clone()).await?;
         let state = Arc::new(RwLock::new(SessionRegistrationState::Registered));
         let (stop_tx, mut stop_rx) = watch::channel(false);
         let directory = self.directory.clone();
@@ -131,13 +140,16 @@ impl SessionRegistrationManager {
             Ok(())
         });
 
-        Ok(SessionRegistrationHandle {
-            record,
-            directory: self.directory.clone(),
-            state,
-            stop_tx,
-            task: Mutex::new(Some(task)),
-        })
+        Ok((
+            previous,
+            SessionRegistrationHandle {
+                record,
+                directory: self.directory.clone(),
+                state,
+                stop_tx,
+                task: Mutex::new(Some(task)),
+            },
+        ))
     }
 }
 
@@ -160,6 +172,11 @@ impl SessionRegistrationHandle {
 
     pub async fn stop(&self) -> anyhow::Result<()> {
         let _ = self.stop_tx.send(true);
+        let task = self
+            .task
+            .lock()
+            .expect("session registration poisoned")
+            .take();
         if self.state() == SessionRegistrationState::Registered {
             let current = self.directory.lookup_identity(&self.record.identity).await?;
             if current.as_ref().is_some_and(|current| {
@@ -172,7 +189,7 @@ impl SessionRegistrationHandle {
                 SessionRegistrationState::Stopped;
         }
 
-        if let Some(task) = self.task.lock().expect("session registration poisoned").take() {
+        if let Some(task) = task {
             match task.await {
                 Ok(result) => result?,
                 Err(error) if error.is_cancelled() => {}

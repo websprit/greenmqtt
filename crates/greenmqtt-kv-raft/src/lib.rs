@@ -71,6 +71,7 @@ pub struct RaftStatusSnapshot {
     pub applied_index: LogIndex,
     pub leader_node_id: Option<NodeId>,
     pub cluster_config: RaftClusterConfig,
+    pub config_transition: Option<RaftConfigTransitionState>,
     pub replica_progress: Vec<ReplicaProgressSnapshot>,
     pub latest_snapshot_index: Option<LogIndex>,
 }
@@ -90,6 +91,7 @@ pub struct StoredRaftState {
     pub applied_index: LogIndex,
     pub leader_node_id: Option<NodeId>,
     pub cluster_config: RaftClusterConfig,
+    pub config_transition: Option<RaftConfigTransitionState>,
     pub log: Vec<RaftLogEntry>,
     pub latest_snapshot: Option<RaftSnapshot>,
 }
@@ -99,6 +101,7 @@ pub struct StoredRaftHardState {
     pub current_term: Term,
     pub voted_for: Option<NodeId>,
     pub cluster_config: RaftClusterConfig,
+    pub config_transition: Option<RaftConfigTransitionState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -125,6 +128,25 @@ pub enum RaftConfigChange {
         voters: Vec<NodeId>,
         learners: Vec<NodeId>,
     },
+    EnterJointConsensus {
+        voters: Vec<NodeId>,
+        learners: Vec<NodeId>,
+    },
+    FinalizeJointConsensus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RaftConfigTransitionPhase {
+    JointConsensus,
+    Finalizing,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaftConfigTransitionState {
+    pub old_config: RaftClusterConfig,
+    pub joint_config: RaftClusterConfig,
+    pub final_config: RaftClusterConfig,
+    pub phase: RaftConfigTransitionPhase,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -335,6 +357,7 @@ impl RaftStateStore for RocksDbRaftStateStore {
             applied_index: progress_state.applied_index,
             leader_node_id: progress_state.leader_node_id,
             cluster_config: hard_state.cluster_config,
+            config_transition: hard_state.config_transition,
             log,
             latest_snapshot,
         }))
@@ -348,6 +371,7 @@ impl RaftStateStore for RocksDbRaftStateStore {
                 current_term: state.current_term,
                 voted_for: state.voted_for,
                 cluster_config: state.cluster_config.clone(),
+                config_transition: state.config_transition.clone(),
             })?,
         );
         batch.put(
@@ -425,6 +449,7 @@ struct MemoryRaftState {
     applied_index: LogIndex,
     leader_node_id: Option<NodeId>,
     cluster_config: RaftClusterConfig,
+    config_transition: Option<RaftConfigTransitionState>,
     log: Vec<RaftLogEntry>,
     latest_snapshot: Option<RaftSnapshot>,
     match_indexes: HashMap<NodeId, LogIndex>,
@@ -466,6 +491,7 @@ impl MemoryRaftNode {
                 applied_index: 0,
                 leader_node_id: None,
                 cluster_config,
+                config_transition: None,
                 log: Vec::new(),
                 latest_snapshot: None,
                 match_indexes: HashMap::from([(local_node_id, 0)]),
@@ -587,6 +613,32 @@ impl MemoryRaftNode {
 
     fn replica_caught_up_to_tail(state: &MemoryRaftState, node_id: NodeId) -> bool {
         Self::replica_match_index(state, node_id) >= Self::last_log_index(state)
+    }
+
+    fn cluster_config_union(
+        left: &RaftClusterConfig,
+        right: &RaftClusterConfig,
+    ) -> RaftClusterConfig {
+        let mut voters = left.voters.clone();
+        voters.extend(right.voters.iter().copied());
+        voters.sort_unstable();
+        voters.dedup();
+
+        let mut learners = left.learners.clone();
+        learners.extend(right.learners.iter().copied());
+        learners.retain(|node_id| !voters.contains(node_id));
+        learners.sort_unstable();
+        learners.dedup();
+
+        RaftClusterConfig { voters, learners }
+    }
+
+    fn config_caught_up_to_commit(state: &MemoryRaftState, config: &RaftClusterConfig) -> bool {
+        config
+            .voters
+            .iter()
+            .chain(config.learners.iter())
+            .all(|node_id| Self::replica_caught_up_to_commit(state, *node_id))
     }
 
     fn enqueue_newly_committed_entries(state: &mut MemoryRaftState, previous_commit: LogIndex) {
@@ -788,6 +840,7 @@ impl MemoryRaftNode {
             applied_index: state.applied_index,
             leader_node_id: state.leader_node_id,
             cluster_config: state.cluster_config.clone(),
+            config_transition: state.config_transition.clone(),
             log: state.log.clone(),
             latest_snapshot: state.latest_snapshot.clone(),
         }
@@ -857,6 +910,7 @@ impl RaftNode for MemoryRaftNode {
             applied_index: state.applied_index,
             leader_node_id: state.leader_node_id,
             cluster_config: state.cluster_config.clone(),
+            config_transition: state.config_transition.clone(),
             replica_progress: state
                 .cluster_config
                 .voters
@@ -1170,23 +1224,77 @@ impl RaftNode for MemoryRaftNode {
     async fn change_cluster_config(&self, change: RaftConfigChange) -> anyhow::Result<()> {
         let persisted = {
             let mut state = self.inner.lock().expect("raft state poisoned");
-            let (next_voters, next_learners) = match change {
+            match change {
                 RaftConfigChange::ReplaceVoters { voters } => {
-                    (voters, state.cluster_config.learners.clone())
+                    for node_id in &voters {
+                        anyhow::ensure!(
+                            Self::replica_caught_up_to_commit(&state, *node_id),
+                            "replica {node_id} is not caught up to commit index"
+                        );
+                    }
+                    state.cluster_config.voters = voters;
+                    state.config_transition = None;
                 }
                 RaftConfigChange::ReplaceLearners { learners } => {
-                    (state.cluster_config.voters.clone(), learners)
+                    state.cluster_config.learners = learners;
+                    state.config_transition = None;
                 }
-                RaftConfigChange::ReplaceCluster { voters, learners } => (voters, learners),
-            };
-            for node_id in &next_voters {
-                anyhow::ensure!(
-                    Self::replica_caught_up_to_commit(&state, *node_id),
-                    "replica {node_id} is not caught up to commit index"
-                );
+                RaftConfigChange::ReplaceCluster { voters, learners } => {
+                    for node_id in &voters {
+                        anyhow::ensure!(
+                            Self::replica_caught_up_to_commit(&state, *node_id),
+                            "replica {node_id} is not caught up to commit index"
+                        );
+                    }
+                    state.cluster_config.voters = voters;
+                    state.cluster_config.learners = learners;
+                    state.config_transition = None;
+                }
+                RaftConfigChange::EnterJointConsensus { voters, learners } => {
+                    anyhow::ensure!(
+                        state.config_transition.is_none(),
+                        "joint consensus change already in progress"
+                    );
+                    let final_config = RaftClusterConfig { voters, learners };
+                    let old_config = state.cluster_config.clone();
+                    let joint_config = Self::cluster_config_union(&old_config, &final_config);
+                    anyhow::ensure!(
+                        Self::config_caught_up_to_commit(&state, &joint_config),
+                        "joint config is not caught up to commit index"
+                    );
+                    state.cluster_config = joint_config.clone();
+                    state.config_transition = Some(RaftConfigTransitionState {
+                        old_config,
+                        joint_config,
+                        final_config,
+                        phase: RaftConfigTransitionPhase::JointConsensus,
+                    });
+                }
+                RaftConfigChange::FinalizeJointConsensus => {
+                    let transition = state
+                        .config_transition
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("no joint consensus change in progress"))?;
+                    anyhow::ensure!(
+                        Self::config_caught_up_to_commit(&state, &transition.old_config),
+                        "old config has not satisfied joint catch-up"
+                    );
+                    anyhow::ensure!(
+                        Self::config_caught_up_to_commit(&state, &transition.final_config),
+                        "final config has not satisfied joint catch-up"
+                    );
+                    if state
+                        .leader_node_id
+                        .is_some_and(|leader| !transition.final_config.voters.contains(&leader))
+                    {
+                        anyhow::bail!(
+                            "current leader must transfer before leaving the finalized voter set"
+                        );
+                    }
+                    state.cluster_config = transition.final_config;
+                    state.config_transition = None;
+                }
             }
-            state.cluster_config.voters = next_voters;
-            state.cluster_config.learners = next_learners;
             if state
                 .leader_node_id
                 .is_some_and(|leader| !state.cluster_config.voters.contains(&leader))
@@ -1244,6 +1352,7 @@ impl RaftNode for MemoryRaftNode {
                 state.applied_index = restored.applied_index;
                 state.leader_node_id = restored.leader_node_id;
                 state.cluster_config = restored.cluster_config;
+                state.config_transition = restored.config_transition;
                 state.log = restored.log;
                 state.latest_snapshot = restored.latest_snapshot;
             } else if let Some((snapshot_term, snapshot_index)) = state
@@ -1337,8 +1446,8 @@ impl RaftNode for MemoryRaftNode {
 mod tests {
     use super::{
         AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, MemoryRaftNode,
-        MemoryRaftStateStore, RaftClusterConfig, RaftConfigChange, RaftMessage, RaftNode,
-        RaftNodeRole, RaftSnapshot, RaftStateStore, RequestVoteRequest, RequestVoteResponse,
+        MemoryRaftStateStore, RaftClusterConfig, RaftConfigChange, RaftConfigTransitionPhase,
+        RaftMessage, RaftNode, RaftNodeRole, RaftSnapshot, RaftStateStore, RequestVoteRequest, RequestVoteResponse,
         RocksDbRaftStateStore,
     };
     use bytes::Bytes;
@@ -2263,6 +2372,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn joint_consensus_transition_survives_restart() {
+        let store = Arc::new(MemoryRaftStateStore::default());
+        let node = MemoryRaftNode::with_state_store(
+            1,
+            "range-joint-restart",
+            RaftClusterConfig {
+                voters: vec![1, 2],
+                learners: Vec::new(),
+            },
+            store.clone(),
+        );
+        node.recover().await.unwrap();
+        node.change_cluster_config(RaftConfigChange::EnterJointConsensus {
+            voters: vec![2, 3],
+            learners: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+        let restarted = MemoryRaftNode::with_state_store(
+            1,
+            "range-joint-restart",
+            RaftClusterConfig::default(),
+            store,
+        );
+        restarted.recover().await.unwrap();
+        let status = restarted.status().await.unwrap();
+        let transition = status.config_transition.expect("joint transition");
+        assert_eq!(status.cluster_config.voters, vec![1, 2, 3]);
+        assert_eq!(transition.old_config.voters, vec![1, 2]);
+        assert_eq!(transition.final_config.voters, vec![2, 3]);
+        assert_eq!(transition.phase, RaftConfigTransitionPhase::JointConsensus);
+    }
+
+    #[tokio::test]
+    async fn joint_consensus_rejects_repeated_enter_requests() {
+        let node = MemoryRaftNode::new(
+            1,
+            "range-joint-repeat",
+            RaftClusterConfig {
+                voters: vec![1, 2],
+                learners: Vec::new(),
+            },
+        );
+        node.recover().await.unwrap();
+        node.change_cluster_config(RaftConfigChange::EnterJointConsensus {
+            voters: vec![2, 3],
+            learners: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+        let error = node
+            .change_cluster_config(RaftConfigChange::EnterJointConsensus {
+                voters: vec![2, 3],
+                learners: Vec::new(),
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("already in progress"));
+    }
+
+    #[tokio::test]
+    async fn joint_consensus_blocks_finalizing_away_current_leader() {
+        let node = MemoryRaftNode::new(
+            1,
+            "range-joint-leader",
+            RaftClusterConfig {
+                voters: vec![1, 2],
+                learners: Vec::new(),
+            },
+        );
+        node.recover().await.unwrap();
+        elect_local_leader(&node).await;
+        node.change_cluster_config(RaftConfigChange::EnterJointConsensus {
+            voters: vec![2, 3],
+            learners: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+        let error = node
+            .change_cluster_config(RaftConfigChange::FinalizeJointConsensus)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("transfer before leaving"));
+        assert!(node.status().await.unwrap().config_transition.is_some());
+    }
+
+    #[tokio::test]
     async fn three_replica_reference_soak_survives_restarts_and_repeated_replication() {
         let leader_store = Arc::new(MemoryRaftStateStore::default());
         let follower2_store = Arc::new(MemoryRaftStateStore::default());
@@ -2526,6 +2727,7 @@ mod tests {
                         voters: vec![1, 2, 3],
                         learners: vec![4],
                     },
+                    config_transition: None,
                     log: vec![
                         super::RaftLogEntry {
                             term: 2,

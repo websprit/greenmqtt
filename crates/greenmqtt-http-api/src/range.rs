@@ -195,6 +195,10 @@ where
             "staging-learners",
             "Replica change accepted; new targets are being staged as learners first.",
         ),
+        Some(greenmqtt_core::ReconfigurationPhase::JointConsensus) => (
+            "joint-consensus",
+            "Replica change is in joint configuration; both the old and target voter sets must catch up before finalize.",
+        ),
         Some(greenmqtt_core::ReconfigurationPhase::Finalizing) => (
             "finalizing",
             "Replica change accepted; waiting for catch-up before finalizing the target config.",

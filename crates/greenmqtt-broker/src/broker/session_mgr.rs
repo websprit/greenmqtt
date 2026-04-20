@@ -6,6 +6,10 @@ use greenmqtt_core::{
     PublishRequest, SessionId, SessionKind, SessionRecord,
 };
 use greenmqtt_plugin_api::{AclProvider, AuthProvider, EventHook};
+use greenmqtt_sessiondict::{
+    SessionKillListener, SessionKillNotification, SessionOwnerResolver,
+    SessionRegistrationHandle, SessionRegistrationManager,
+};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -13,6 +17,51 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{sleep, Duration};
+
+#[derive(Clone)]
+struct BrokerSessionOwnerResolver {
+    local_node_id: NodeId,
+    local_server_reference: Option<String>,
+    admin_audit: Arc<RwLock<VecDeque<AdminAuditEntry>>>,
+}
+
+impl SessionOwnerResolver for BrokerSessionOwnerResolver {
+    fn server_reference(&self, node_id: u64) -> Option<String> {
+        if node_id == self.local_node_id {
+            return self.local_server_reference.clone();
+        }
+        desired_peer_registry(self.admin_audit.read().expect("broker poisoned").iter())
+            .get(&node_id)
+            .cloned()
+    }
+}
+
+struct BrokerSessionKillListener {
+    session_id: String,
+    controls: Arc<ShardedPendingSessionControls>,
+}
+
+#[async_trait]
+impl SessionKillListener for BrokerSessionKillListener {
+    async fn on_kill(&self, notification: SessionKillNotification) -> anyhow::Result<()> {
+        let (reason_code, reason) = if notification.server_reference.is_some() {
+            (0x9C, "use another server".to_string())
+        } else if notification.current_owner.is_some() {
+            (0x8E, "session taken over".to_string())
+        } else {
+            (0x8E, "session killed".to_string())
+        };
+        self.controls.insert(
+            self.session_id.clone(),
+            PendingSessionControl {
+                reason_code,
+                reason,
+                server_reference: notification.server_reference,
+            },
+        );
+        Ok(())
+    }
+}
 
 struct SessionConnectPlan {
     session_present: bool,
@@ -74,11 +123,29 @@ where
         })
     }
 
-    async fn register_connected_session(
+    fn session_registration_manager(&self) -> SessionRegistrationManager {
+        SessionRegistrationManager::new(self.sessiondict.clone())
+            .with_poll_interval(self.session_registration_poll_interval)
+            .with_owner_resolver(Arc::new(BrokerSessionOwnerResolver {
+                local_node_id: self.config.node_id,
+                local_server_reference: self.config.server_reference.clone(),
+                admin_audit: self.admin_audit.clone(),
+            }))
+    }
+
+    async fn register_live_session(
         &self,
         session: SessionRecord,
-    ) -> anyhow::Result<Option<SessionRecord>> {
-        self.sessiondict.register(session).await
+    ) -> anyhow::Result<(Option<SessionRecord>, Arc<SessionRegistrationHandle>)> {
+        let listener = Arc::new(BrokerSessionKillListener {
+            session_id: session.session_id.clone(),
+            controls: self.pending_session_controls.clone(),
+        });
+        let (replaced, registration) = self
+            .session_registration_manager()
+            .register_with_previous(session, listener)
+            .await?;
+        Ok((replaced, Arc::new(registration)))
     }
 
     async fn persist_disconnected_session(
@@ -100,6 +167,13 @@ where
     pub(crate) fn cancel_delayed_will_for_identity(&self, identity: &ClientIdentity) {
         self.pending_will_generations
             .remove(&Self::will_identity_key(identity));
+    }
+
+    pub(crate) fn take_pending_session_control(
+        &self,
+        session_id: &str,
+    ) -> Option<PendingSessionControl> {
+        self.pending_session_controls.remove(session_id)
     }
 
     async fn cancel_delayed_will_for_session(&self, session_id: &str) -> anyhow::Result<()> {
@@ -209,7 +283,7 @@ where
             expires_at_ms: None,
         };
 
-        let replaced = self.register_connected_session(session.clone()).await?;
+        let (replaced, registration) = self.register_live_session(session.clone()).await?;
         let mut carried_local_deliveries = Vec::new();
         if let Some(previous) = &replaced {
             let removed = self.local_sessions.remove(&previous.session_id);
@@ -258,6 +332,7 @@ where
         let state = LocalSessionState {
             record: session.clone(),
             session_epoch: local_session_epoch,
+            registration,
         };
         let carried_pending_deliveries = self.local_deliveries.pending_len(&session.session_id);
         self.local_sessions
@@ -394,6 +469,7 @@ where
             self.note_local_session_removed(state, pending);
             self.tenant_resources
                 .release_connection(&state.record.identity.tenant_id);
+            state.registration.stop().await?;
             self.inbox.detach(&state.record.session_id).await?;
             self.hooks.on_disconnect(&state.record).await?;
         }
@@ -462,6 +538,7 @@ where
         self.note_local_session_removed(&state, pending_deliveries);
         self.tenant_resources
             .release_connection(&state.record.identity.tenant_id);
+        state.registration.stop().await?;
         self.inbox.detach(&state.record.session_id).await?;
         let queued_deliveries = self.local_deliveries.drain(&state.record.session_id);
         if matches!(state.record.kind, SessionKind::Persistent) {
@@ -900,6 +977,7 @@ where
         if let Some(state) = removed.as_ref() {
             let pending = self.local_deliveries.pending_len(&session_id);
             self.note_local_session_removed(state, pending);
+            state.registration.stop().await?;
         }
         self.local_deliveries.drain(&session_id);
         Ok(())
@@ -921,7 +999,9 @@ where
         if let Some(state) = removed.as_ref() {
             let pending = self.local_deliveries.pending_len(&session_id);
             self.note_local_session_removed(state, pending);
+            state.registration.stop().await?;
         }
+        self.pending_session_controls.remove(&session_id);
         self.local_deliveries.drain(&session_id);
         Ok(())
     }

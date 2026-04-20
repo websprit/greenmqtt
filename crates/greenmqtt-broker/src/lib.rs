@@ -14,13 +14,16 @@ use greenmqtt_dist::{DistHandle, DistRouter};
 use greenmqtt_inbox::{InboxHandle, InboxService};
 use greenmqtt_plugin_api::{AllowAllAcl, AuthProvider, NoopEventHook};
 use greenmqtt_retain::{RetainHandle, RetainService};
-use greenmqtt_sessiondict::{SessionDictHandle, SessionDirectory};
+use greenmqtt_sessiondict::{
+    SessionDictHandle, SessionDirectory, SessionRegistrationHandle,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use tokio::sync::Semaphore;
 
 pub struct BrokerConfig {
@@ -91,10 +94,11 @@ struct DesiredPeerState {
     active: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct LocalSessionState {
     record: SessionRecord,
     session_epoch: u64,
+    registration: Arc<SessionRegistrationHandle>,
 }
 
 struct ShardedLocalSessions {
@@ -113,6 +117,17 @@ fn shard_index_for_session(session_id: &str, shard_count: usize) -> usize {
 
 struct ShardedWillGenerations {
     shards: Vec<RwLock<HashMap<String, u64>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingSessionControl {
+    reason_code: u8,
+    reason: String,
+    server_reference: Option<String>,
+}
+
+struct ShardedPendingSessionControls {
+    shards: Vec<RwLock<HashMap<SessionId, PendingSessionControl>>>,
 }
 
 impl Default for ShardedWillGenerations {
@@ -190,6 +205,44 @@ impl ShardedWillGenerations {
             removed += before.saturating_sub(guard.len());
         }
         removed
+    }
+}
+
+impl Default for ShardedPendingSessionControls {
+    fn default() -> Self {
+        Self::new(32)
+    }
+}
+
+impl ShardedPendingSessionControls {
+    fn new(shard_count: usize) -> Self {
+        Self {
+            shards: (0..shard_count)
+                .map(|_| RwLock::new(HashMap::new()))
+                .collect(),
+        }
+    }
+
+    fn shard_index(&self, session_id: &str) -> usize {
+        shard_index_for_session(session_id, self.shards.len())
+    }
+
+    fn shard(&self, session_id: &str) -> &RwLock<HashMap<SessionId, PendingSessionControl>> {
+        &self.shards[self.shard_index(session_id)]
+    }
+
+    fn insert(&self, session_id: SessionId, control: PendingSessionControl) {
+        self.shard(&session_id)
+            .write()
+            .expect("broker poisoned")
+            .insert(session_id, control);
+    }
+
+    fn remove(&self, session_id: &str) -> Option<PendingSessionControl> {
+        self.shard(session_id)
+            .write()
+            .expect("broker poisoned")
+            .remove(session_id)
     }
 }
 
@@ -451,6 +504,8 @@ pub struct BrokerRuntime<A, C = AllowAllAcl, H = NoopEventHook> {
     outbound_bandwidth_overrides: DashMap<String, (u64, u64)>,
     connect_debounce_window_ms: Option<u64>,
     recent_connect_attempts: Arc<ShardedWillGenerations>,
+    pending_session_controls: Arc<ShardedPendingSessionControls>,
+    session_registration_poll_interval: Duration,
 }
 
 pub type DefaultBroker = BrokerRuntime<greenmqtt_plugin_api::AllowAllAuth>;

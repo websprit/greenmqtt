@@ -598,13 +598,17 @@ message ReplicaLagRecord {
 }
 
 message RangeReconfigurationRecord {
-  repeated uint64 current_voters = 1;
-  repeated uint64 current_learners = 2;
-  repeated uint64 pending_voters = 3;
-  repeated uint64 pending_learners = 4;
-  string phase = 5;
-  bool has_phase = 6;
-  bool blocked_on_catch_up = 7;
+  repeated uint64 old_voters = 1;
+  repeated uint64 old_learners = 2;
+  repeated uint64 current_voters = 3;
+  repeated uint64 current_learners = 4;
+  repeated uint64 joint_voters = 5;
+  repeated uint64 joint_learners = 6;
+  repeated uint64 pending_voters = 7;
+  repeated uint64 pending_learners = 8;
+  string phase = 9;
+  bool has_phase = 10;
+  bool blocked_on_catch_up = 11;
 }
 
 message RangeHealthRecord {
