@@ -24,39 +24,66 @@ pub trait RetainService: Send + Sync {
         topic_filter: &str,
     ) -> anyhow::Result<Vec<RetainedMessage>>;
     async fn retained_count(&self) -> anyhow::Result<usize>;
-}
-
-pub async fn retain_expire_all(
-    retain: &dyn RetainService,
-    tenant_id: &str,
-) -> anyhow::Result<usize> {
-    let retained = retain.list_tenant_retained(tenant_id).await?;
-    let removed = retained.len();
-    for message in retained {
-        retain
-            .retain(RetainedMessage {
+    async fn preview_tenant_gc(&self, tenant_id: &str) -> anyhow::Result<RetainMaintenanceResult> {
+        let scanned = self.list_tenant_retained(tenant_id).await?.len();
+        Ok(RetainMaintenanceResult {
+            tenant_id: tenant_id.to_string(),
+            scanned,
+            removed: 0,
+            refreshed: 0,
+        })
+    }
+    async fn run_tenant_gc(&self, tenant_id: &str) -> anyhow::Result<RetainMaintenanceResult> {
+        self.preview_tenant_gc(tenant_id).await
+    }
+    async fn expire_all_tenant(&self, tenant_id: &str) -> anyhow::Result<RetainMaintenanceResult> {
+        let retained = self.list_tenant_retained(tenant_id).await?;
+        let removed = retained.len();
+        for message in retained {
+            self.retain(RetainedMessage {
                 tenant_id: message.tenant_id,
                 topic: message.topic,
                 payload: Vec::new().into(),
                 qos: 0,
             })
             .await?;
+        }
+        Ok(RetainMaintenanceResult {
+            tenant_id: tenant_id.to_string(),
+            scanned: removed,
+            removed,
+            refreshed: 0,
+        })
     }
-    Ok(removed)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainMaintenanceResult {
+    pub tenant_id: String,
+    pub scanned: usize,
+    pub removed: usize,
+    pub refreshed: usize,
+}
+
+pub async fn retain_expire_all(
+    retain: &dyn RetainService,
+    tenant_id: &str,
+) -> anyhow::Result<RetainMaintenanceResult> {
+    retain.expire_all_tenant(tenant_id).await
 }
 
 pub async fn retain_tenant_gc_preview(
     retain: &dyn RetainService,
     tenant_id: &str,
-) -> anyhow::Result<usize> {
-    Ok(retain.list_tenant_retained(tenant_id).await?.len())
+) -> anyhow::Result<RetainMaintenanceResult> {
+    retain.preview_tenant_gc(tenant_id).await
 }
 
 pub async fn retain_tenant_gc_run(
     retain: &dyn RetainService,
     tenant_id: &str,
-) -> anyhow::Result<usize> {
-    retain_tenant_gc_preview(retain, tenant_id).await
+) -> anyhow::Result<RetainMaintenanceResult> {
+    retain.run_tenant_gc(tenant_id).await
 }
 
 #[derive(Clone, Default)]
@@ -325,6 +352,16 @@ impl RetainService for RetainHandle {
     async fn retained_count(&self) -> anyhow::Result<usize> {
         Ok(self.inner.read().expect("retain poisoned").total_retained)
     }
+
+    async fn run_tenant_gc(&self, tenant_id: &str) -> anyhow::Result<RetainMaintenanceResult> {
+        let scanned = self.list_tenant_retained(tenant_id).await?.len();
+        Ok(RetainMaintenanceResult {
+            tenant_id: tenant_id.to_string(),
+            scanned,
+            removed: 0,
+            refreshed: scanned,
+        })
+    }
 }
 
 #[async_trait]
@@ -468,6 +505,16 @@ impl RetainService for PersistentRetainHandle {
         }
         self.store.count_retained().await
     }
+
+    async fn run_tenant_gc(&self, tenant_id: &str) -> anyhow::Result<RetainMaintenanceResult> {
+        let refreshed = self.list_tenant_retained(tenant_id).await?.len();
+        Ok(RetainMaintenanceResult {
+            tenant_id: tenant_id.to_string(),
+            scanned: refreshed,
+            removed: 0,
+            refreshed,
+        })
+    }
 }
 
 #[async_trait]
@@ -595,6 +642,26 @@ impl RetainService for ReplicatedRetainHandle {
         }
         Ok(total)
     }
+
+    async fn preview_tenant_gc(&self, tenant_id: &str) -> anyhow::Result<RetainMaintenanceResult> {
+        let scanned = self.list_tenant_retained(tenant_id).await?.len();
+        Ok(RetainMaintenanceResult {
+            tenant_id: tenant_id.to_string(),
+            scanned,
+            removed: 0,
+            refreshed: 0,
+        })
+    }
+
+    async fn run_tenant_gc(&self, tenant_id: &str) -> anyhow::Result<RetainMaintenanceResult> {
+        let refreshed = self.warm_tenant_cache(tenant_id).await?;
+        Ok(RetainMaintenanceResult {
+            tenant_id: tenant_id.to_string(),
+            scanned: refreshed,
+            removed: 0,
+            refreshed,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -653,13 +720,19 @@ impl RetainBalancePolicy for ThresholdRetainBalancePolicy {
 
 #[async_trait::async_trait]
 pub trait RetainMaintenance: Send + Sync {
-    async fn refresh_tenant(&self, tenant_id: &str) -> anyhow::Result<usize>;
+    async fn run_tenant_gc(&self, tenant_id: &str) -> anyhow::Result<RetainMaintenanceResult>;
 }
 
 #[async_trait::async_trait]
 impl RetainMaintenance for ReplicatedRetainHandle {
-    async fn refresh_tenant(&self, tenant_id: &str) -> anyhow::Result<usize> {
-        self.warm_tenant_cache(tenant_id).await
+    async fn run_tenant_gc(&self, tenant_id: &str) -> anyhow::Result<RetainMaintenanceResult> {
+        let refreshed = self.warm_tenant_cache(tenant_id).await?;
+        Ok(RetainMaintenanceResult {
+            tenant_id: tenant_id.to_string(),
+            scanned: refreshed,
+            removed: 0,
+            refreshed,
+        })
     }
 }
 
@@ -673,8 +746,8 @@ impl RetainMaintenanceWorker {
         Self { maintenance }
     }
 
-    pub async fn refresh_tenant(&self, tenant_id: &str) -> anyhow::Result<usize> {
-        self.maintenance.refresh_tenant(tenant_id).await
+    pub async fn run_tenant_gc(&self, tenant_id: &str) -> anyhow::Result<RetainMaintenanceResult> {
+        self.maintenance.run_tenant_gc(tenant_id).await
     }
 
     pub fn spawn_tenant_refresh(
@@ -687,7 +760,7 @@ impl RetainMaintenanceWorker {
             let mut ticker = tokio::time::interval(interval);
             loop {
                 ticker.tick().await;
-                let _ = worker.refresh_tenant(&tenant_id).await?;
+                let _ = worker.run_tenant_gc(&tenant_id).await?;
             }
         })
     }
@@ -718,9 +791,10 @@ impl Lifecycle for PersistentRetainHandle {
 #[cfg(test)]
 mod tests {
     use super::{
-        retain_tenant_shard, retained_message_shard, PersistentRetainHandle,
-        ReplicatedRetainHandle, RetainBalanceAction, RetainBalancePolicy, RetainHandle,
-        RetainMaintenanceWorker, RetainService, RetainTenantStats, ThresholdRetainBalancePolicy,
+        retain_expire_all, retain_tenant_gc_preview, retain_tenant_shard, retained_message_shard,
+        PersistentRetainHandle, ReplicatedRetainHandle, RetainBalanceAction, RetainBalancePolicy,
+        RetainHandle, RetainMaintenanceWorker, RetainService, RetainTenantStats,
+        ThresholdRetainBalancePolicy,
     };
     use async_trait::async_trait;
     use bytes::Bytes;
@@ -1868,10 +1942,35 @@ mod tests {
             .unwrap();
 
         let worker = RetainMaintenanceWorker::new(retain.clone());
-        assert_eq!(worker.refresh_tenant("t1").await.unwrap(), 1);
+        let result = worker.run_tenant_gc("t1").await.unwrap();
+        assert_eq!(result.scanned, 1);
+        assert_eq!(result.refreshed, 1);
         let task = worker.spawn_tenant_refresh("t1".into(), Duration::from_millis(1));
         tokio::time::sleep(Duration::from_millis(3)).await;
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn retain_gc_preview_does_not_mutate_state_and_expire_all_clears_tenant() {
+        let retain = RetainHandle::default();
+        retain
+            .retain(RetainedMessage {
+                tenant_id: "t1".into(),
+                topic: "alerts/a".into(),
+                payload: b"up".to_vec().into(),
+                qos: 1,
+            })
+            .await
+            .unwrap();
+
+        let preview = retain_tenant_gc_preview(&retain, "t1").await.unwrap();
+        assert_eq!(preview.scanned, 1);
+        assert_eq!(preview.removed, 0);
+        assert_eq!(retain.list_tenant_retained("t1").await.unwrap().len(), 1);
+
+        let expired = retain_expire_all(&retain, "t1").await.unwrap();
+        assert_eq!(expired.removed, 1);
+        assert!(retain.list_tenant_retained("t1").await.unwrap().is_empty());
     }
 
     #[tokio::test]

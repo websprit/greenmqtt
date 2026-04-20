@@ -6,7 +6,8 @@ use super::{
     configured_webhook, durable_services, execute_range_command_with_endpoint,
     listener_specs_from_env, parse_acl_rules, parse_bench_scenario, parse_bench_scenarios,
     parse_bridge_rules, parse_compare_backends, parse_identity_matchers, parse_listener_specs,
-    parse_topic_rewrite_rules, range_command_request, redis_services, render_shard_response_text,
+    parse_topic_rewrite_rules, range_command_request, redis_services, render_range_lookup_text,
+    render_shard_response_text,
     replicated_range_clients, resolved_state_mode, run_bench, run_compare_bench, run_compare_soak,
     run_dist_maintenance_tick, run_inbox_maintenance_tick, run_profile_bench,
     run_retain_maintenance_tick, run_shard_command, run_soak, shard_command_request,
@@ -1086,8 +1087,6 @@ fn inbox_maintenance_tick_expires_tenant_state_and_proposes_hot_tenant_actions()
             &InboxMaintenanceConfig {
                 tenants: vec!["hot".into()],
                 interval: Duration::from_secs(30),
-                retry_delay: Duration::from_millis(5),
-                max_retries: 1,
                 policy: ThresholdInboxBalancePolicy {
                     max_subscriptions: 1,
                     max_offline_messages: 1,
@@ -4133,4 +4132,14 @@ fn configured_control_plane_runtime_rejects_invalid_desired_ranges_json() {
             },
         );
     });
+}
+
+#[test]
+fn render_range_lookup_text_distinguishes_metadata_fallback() {
+    let text = render_range_lookup_text(
+        r#"{"source":"metadata_fallback","health":null,"descriptor":{"id":"range-a"},"reconfiguration":null}"#,
+    )
+    .unwrap();
+    assert!(text.contains("source=metadata_fallback"));
+    assert!(text.contains("range_id=range-a"));
 }

@@ -5,6 +5,7 @@ use greenmqtt_core::{
     ClientIdentity, ConnectReply, ConnectRequest, InflightMessage, NodeId, OfflineMessage,
     PublishRequest, SessionId, SessionKind, SessionRecord,
 };
+use greenmqtt_inbox::{inbox_send_lwt, DelayedLwtPublish, DelayedLwtSink, InboxLwtResult};
 use greenmqtt_plugin_api::{AclProvider, AuthProvider, EventHook};
 use greenmqtt_sessiondict::{
     SessionKillListener, SessionKillNotification, SessionOwnerResolver, SessionRegistrationHandle,
@@ -39,6 +40,28 @@ impl SessionOwnerResolver for BrokerSessionOwnerResolver {
 struct BrokerSessionKillListener {
     session_id: String,
     controls: Arc<ShardedPendingSessionControls>,
+}
+
+struct BrokerDelayedLwtSink<A, C, H> {
+    broker: Arc<BrokerRuntime<A, C, H>>,
+    identity: ClientIdentity,
+    session_id: String,
+}
+
+#[async_trait]
+impl<A, C, H> DelayedLwtSink for BrokerDelayedLwtSink<A, C, H>
+where
+    A: AuthProvider + Send + Sync + 'static,
+    C: AclProvider + Send + Sync + 'static,
+    H: EventHook + Send + Sync + 'static,
+{
+    async fn send_lwt(&self, publish: &DelayedLwtPublish) -> anyhow::Result<()> {
+        let _ = self
+            .broker
+            .publish_as_identity(&self.identity, &self.session_id, publish.publish.clone())
+            .await?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -177,6 +200,7 @@ where
     }
 
     async fn cancel_delayed_will_for_session(&self, session_id: &str) -> anyhow::Result<()> {
+        self.inbox.clear_delayed_lwt(&session_id.to_string()).await?;
         let identity = if let Some(state) = self.local_sessions.get_cloned(session_id) {
             Some(state.record.identity)
         } else {
@@ -217,6 +241,16 @@ where
         let generation = self.next_will_seq.fetch_add(1, Ordering::SeqCst);
         self.pending_will_generations
             .insert(key.clone(), generation);
+        self.inbox
+            .register_delayed_lwt(
+                generation,
+                DelayedLwtPublish {
+                    tenant_id: identity.tenant_id.clone(),
+                    session_id: session_id.to_string(),
+                    publish: will.clone(),
+                },
+            )
+            .await?;
         let broker = Arc::clone(self);
         let session_id = session_id.to_string();
         tokio::spawn(async move {
@@ -227,11 +261,23 @@ where
                 return;
             }
             broker.pending_will_generations.remove(&key);
-            if let Err(error) = broker
-                .publish_as_identity(&identity, &session_id, will)
-                .await
-            {
-                eprintln!("greenmqtt delayed will publish error: {error:#}");
+            let sink = BrokerDelayedLwtSink {
+                broker: Arc::clone(&broker),
+                identity: identity.clone(),
+                session_id: session_id.clone(),
+            };
+            match inbox_send_lwt(broker.inbox.as_ref(), &session_id, generation, &sink).await {
+                Ok(InboxLwtResult::Ok)
+                | Ok(InboxLwtResult::NoInbox)
+                | Ok(InboxLwtResult::NoLwt)
+                | Ok(InboxLwtResult::NoDetach)
+                | Ok(InboxLwtResult::Conflict) => {}
+                Ok(result) => {
+                    eprintln!("greenmqtt delayed will publish result: {result:?}");
+                }
+                Err(error) => {
+                    eprintln!("greenmqtt delayed will publish error: {error:#}");
+                }
             }
         });
         Ok(())
@@ -284,6 +330,7 @@ where
         };
 
         let (replaced, registration) = self.register_live_session(session.clone()).await?;
+        self.inbox.clear_delayed_lwt(&session.session_id).await?;
         let mut carried_local_deliveries = Vec::new();
         if let Some(previous) = &replaced {
             let removed = self.local_sessions.remove(&previous.session_id);

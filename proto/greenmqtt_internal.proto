@@ -335,11 +335,17 @@ message InboxStatsReply {
 message InboxSendLwtRequest {
   string tenant_id = 1;
   string session_id = 2;
-  string topic = 3;
-  bytes payload = 4;
-  uint32 qos = 5;
-  bool retain = 6;
-  PublishProperties properties = 7;
+  uint64 generation = 3;
+  string topic = 4;
+  bytes payload = 5;
+  uint32 qos = 6;
+  bool retain = 7;
+  PublishProperties properties = 8;
+}
+
+message InboxSendLwtReply {
+  string code = 1;
+  string message = 2;
 }
 
 message InboxExpireAllRequest {
@@ -364,6 +370,13 @@ message RetainExpireAllRequest {
 
 message RetainTenantGcRequest {
   string tenant_id = 1;
+}
+
+message RetainMaintenanceReply {
+  string tenant_id = 1;
+  uint64 scanned = 2;
+  uint64 removed = 3;
+  uint64 refreshed = 4;
 }
 
 message ShardSnapshotRequest {
@@ -779,7 +792,7 @@ service InboxService {
   rpc ListInflight(InboxListMessagesRequest) returns (InboxFetchInflightReply);
   rpc FetchInflight(InboxFetchInflightRequest) returns (InboxFetchInflightReply);
   rpc Stats(.google.protobuf.Empty) returns (InboxStatsReply);
-  rpc SendLwt(InboxSendLwtRequest) returns (.google.protobuf.Empty);
+  rpc SendLwt(InboxSendLwtRequest) returns (InboxSendLwtReply);
   rpc ExpireAll(InboxExpireAllRequest) returns (InboxMaintenanceReply);
   rpc TenantGcPreview(InboxTenantGcRequest) returns (InboxMaintenanceReply);
   rpc TenantGcRun(InboxTenantGcRequest) returns (InboxMaintenanceReply);
@@ -790,9 +803,9 @@ service RetainService {
   rpc Write(RetainWriteRequest) returns (.google.protobuf.Empty);
   rpc Match(RetainMatchRequest) returns (RetainMatchReply);
   rpc CountRetained(.google.protobuf.Empty) returns (CountReply);
-  rpc ExpireAll(RetainExpireAllRequest) returns (CountReply);
-  rpc TenantGcPreview(RetainTenantGcRequest) returns (CountReply);
-  rpc TenantGcRun(RetainTenantGcRequest) returns (CountReply);
+  rpc ExpireAll(RetainExpireAllRequest) returns (RetainMaintenanceReply);
+  rpc TenantGcPreview(RetainTenantGcRequest) returns (RetainMaintenanceReply);
+  rpc TenantGcRun(RetainTenantGcRequest) returns (RetainMaintenanceReply);
 }
 
 service BrokerPeerService {

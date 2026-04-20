@@ -423,6 +423,25 @@ where
             .await
     }
 
+    pub async fn publish_for_session(
+        &self,
+        session_id: &str,
+        request: PublishRequest,
+    ) -> anyhow::Result<PublishOutcome> {
+        if let Some(publisher) = self.local_sessions.get_cloned(session_id) {
+            return self
+                .publish_as_identity(&publisher.record.identity, session_id, request)
+                .await;
+        }
+        let record = self
+            .sessiondict
+            .lookup_session(session_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("session not found"))?;
+        self.publish_as_identity(&record.identity, session_id, request)
+            .await
+    }
+
     pub(crate) async fn publish_as_identity(
         &self,
         identity: &ClientIdentity,

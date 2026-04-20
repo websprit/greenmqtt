@@ -3,7 +3,7 @@ use crate::{
     NoopDeliverySink, PeriodicAntiEntropyReconciler, PersistentMetadataRegistry,
     RaftTransportGrpcClient, RangeAdminGrpcClient, RangeControlGrpcClient,
     ReplicatedMetadataRegistry, RetainGrpcClient, RoutedRangeControlGrpcClient, RpcGovernedService,
-    RpcRuntime, RpcServiceKind, RpcTrafficGovernor, RpcTrafficGovernorConfig,
+    RpcRuntime, RpcServiceKind, RpcTrafficGovernor, RpcTrafficGovernorConfig, RpcTrafficRules,
     SessionDictGrpcClient, StaticPeerForwarder, StaticServiceEndpointRegistry,
 };
 use async_trait::async_trait;
@@ -294,6 +294,49 @@ async fn rpc_governor_returns_structured_retryable_overload_status() {
 }
 
 #[tokio::test]
+async fn rpc_governor_runtime_rule_update_takes_effect_immediately() {
+    let governor = Arc::new(RpcTrafficGovernor::new(RpcTrafficGovernorConfig {
+        dist_max_in_flight: 1,
+        retry_after_ms: 100,
+        ..RpcTrafficGovernorConfig::default()
+    }));
+    let service = RpcGovernedService::new(
+        BlockingGrpcService {
+            started: Arc::new(Notify::new()),
+            release: watch::channel(true).1,
+        },
+        governor.service(RpcServiceKind::Dist),
+    );
+    let mut service = service;
+    let response = service
+        .call(tonic::codegen::http::Request::new(()))
+        .await
+        .unwrap();
+    assert!(response.headers().get("grpc-status").is_none());
+
+    governor
+        .service(RpcServiceKind::Dist)
+        .set_runtime_rules(RpcTrafficRules {
+            max_in_flight: 0,
+            retry_after_ms: 321,
+            tenant_prefix_limits: BTreeMap::from([("demo".into(), 1usize)]),
+            preferred_endpoints: vec!["http://127.0.0.1:50051".into()],
+            server_group_tags: vec!["edge".into()],
+        });
+    let overloaded = service
+        .call(tonic::codegen::http::Request::new(()))
+        .await
+        .unwrap();
+    assert_eq!(
+        overloaded
+            .headers()
+            .get("x-greenmqtt-retry-after-ms")
+            .and_then(|value| value.to_str().ok()),
+        Some("321")
+    );
+}
+
+#[tokio::test]
 async fn routed_range_control_client_backs_off_from_overloaded_endpoint() {
     let registry = Arc::new(StaticServiceEndpointRegistry::default());
     let metadata_bind = "127.0.0.1:50122".parse().unwrap();
@@ -372,6 +415,7 @@ async fn routed_range_control_client_backs_off_from_overloaded_endpoint() {
         "http://127.0.0.1:50122",
         "http://127.0.0.1:50123",
         Duration::from_millis(250),
+        None,
     )
     .await
     .unwrap();
@@ -618,11 +662,14 @@ async fn grpc_round_trip_for_internal_services() {
 async fn inbox_rpc_supports_delayed_lwt_dispatch() {
     let bind = "127.0.0.1:50124".parse().unwrap();
     let sink = Arc::new(RecordingLwtSink::default());
+    let inbox = Arc::new(InboxHandle::default());
+    inbox.attach(&"s1".to_string()).await.unwrap();
+    inbox.detach(&"s1".to_string()).await.unwrap();
     let server = tokio::spawn(
         RpcRuntime {
             sessiondict: Arc::new(SessionDictHandle::default()),
             dist: Arc::new(DistHandle::default()),
-            inbox: Arc::new(InboxHandle::default()),
+            inbox: inbox.clone(),
             retain: Arc::new(RetainHandle::default()),
             peer_sink: Arc::new(NoopDeliverySink),
             assignment_registry: None,
@@ -637,8 +684,8 @@ async fn inbox_rpc_supports_delayed_lwt_dispatch() {
     let client = InboxGrpcClient::connect("http://127.0.0.1:50124")
         .await
         .unwrap();
-    client
-        .send_lwt(DelayedLwtPublish {
+    let reply = client
+        .send_lwt(1, DelayedLwtPublish {
             tenant_id: "demo".into(),
             session_id: "s1".into(),
             publish: PublishRequest {
@@ -651,6 +698,7 @@ async fn inbox_rpc_supports_delayed_lwt_dispatch() {
         })
         .await
         .unwrap();
+    assert_eq!(reply.code, "Ok");
 
     let publishes = sink.publishes.lock().expect("lwt sink poisoned");
     assert_eq!(publishes.len(), 1);
@@ -756,8 +804,10 @@ async fn inbox_and_retain_rpc_support_tenant_expire_and_gc_operations() {
     let retain_client = RetainGrpcClient::connect("http://127.0.0.1:50125")
         .await
         .unwrap();
-    assert_eq!(retain_client.tenant_gc_preview("demo").await.unwrap(), 1);
-    assert_eq!(retain_client.expire_all("demo").await.unwrap(), 1);
+    let preview = retain_client.tenant_gc_preview("demo").await.unwrap();
+    assert_eq!(preview.scanned, 1);
+    let expired = retain_client.expire_all("demo").await.unwrap();
+    assert_eq!(expired.removed, 1);
     assert!(retain.match_topic("demo", "#").await.unwrap().is_empty());
     server.abort();
 }

@@ -4,7 +4,10 @@ use crate::state::{
     remove_tenant_subscription, subscription_index_key, tenant_topic_shared_subscription_key,
     InboxState,
 };
-use crate::{publish_properties_expired_at, InboxExpiryStats, InboxService};
+use crate::{
+    delayed_lwt_result_from_error, publish_properties_expired_at, DelayedLwtPublish,
+    DelayedLwtSink, InboxExpiryStats, InboxLwtResult, InboxService, RegisteredDelayedLwt,
+};
 use async_trait::async_trait;
 use greenmqtt_core::{InflightMessage, Lifecycle, OfflineMessage, SessionId, Subscription};
 use greenmqtt_storage::{InboxStore, InflightStore, SubscriptionStore};
@@ -104,6 +107,65 @@ impl InboxService for InboxHandle {
             .active_sessions
             .insert(session_id.clone(), false);
         Ok(())
+    }
+
+    async fn register_delayed_lwt(
+        &self,
+        generation: u64,
+        publish: DelayedLwtPublish,
+    ) -> anyhow::Result<()> {
+        let session_id = publish.session_id.clone();
+        let mut guard = self.inner.write().expect("inbox poisoned");
+        guard
+            .active_sessions
+            .entry(session_id.clone())
+            .or_insert(true);
+        guard
+            .delayed_lwts
+            .insert(session_id, RegisteredDelayedLwt { generation, publish });
+        Ok(())
+    }
+
+    async fn clear_delayed_lwt(&self, session_id: &SessionId) -> anyhow::Result<()> {
+        self.inner
+            .write()
+            .expect("inbox poisoned")
+            .delayed_lwts
+            .remove(session_id);
+        Ok(())
+    }
+
+    async fn send_delayed_lwt(
+        &self,
+        session_id: &SessionId,
+        generation: u64,
+        sink: &dyn DelayedLwtSink,
+    ) -> anyhow::Result<InboxLwtResult> {
+        let registered = {
+            let guard = self.inner.read().expect("inbox poisoned");
+            let attached = guard.active_sessions.get(session_id).copied();
+            let registered = guard.delayed_lwts.get(session_id).cloned();
+            match (attached, registered) {
+                (None, None) => return Ok(InboxLwtResult::NoInbox),
+                (_, None) => return Ok(InboxLwtResult::NoLwt),
+                (_, Some(registered)) if registered.generation != generation => {
+                    return Ok(InboxLwtResult::Conflict)
+                }
+                (Some(true), Some(_)) => return Ok(InboxLwtResult::NoDetach),
+                (_, Some(registered)) => registered,
+            }
+        };
+        match sink.send_lwt(&registered.publish).await {
+            Ok(()) => {
+                self.inner
+                    .write()
+                    .expect("inbox poisoned")
+                    .delayed_lwts
+                    .remove(session_id);
+                Ok(InboxLwtResult::Ok)
+            }
+            Err(error) => Ok(delayed_lwt_result_from_error(&error)),
+        }
     }
 
     async fn subscribe(&self, subscription: Subscription) -> anyhow::Result<()> {
@@ -221,6 +283,7 @@ impl InboxService for InboxHandle {
     async fn purge_session(&self, session_id: &SessionId) -> anyhow::Result<()> {
         let mut guard = self.inner.write().expect("inbox poisoned");
         guard.active_sessions.remove(session_id);
+        guard.delayed_lwts.remove(session_id);
         let removed = guard.subscriptions.remove(session_id).unwrap_or_default();
         guard
             .subscriptions_by_session_topic
@@ -1230,6 +1293,65 @@ impl InboxService for PersistentInboxHandle {
         Ok(())
     }
 
+    async fn register_delayed_lwt(
+        &self,
+        generation: u64,
+        publish: DelayedLwtPublish,
+    ) -> anyhow::Result<()> {
+        let session_id = publish.session_id.clone();
+        let mut guard = self.inner.write().expect("inbox poisoned");
+        guard
+            .active_sessions
+            .entry(session_id.clone())
+            .or_insert(true);
+        guard
+            .delayed_lwts
+            .insert(session_id, RegisteredDelayedLwt { generation, publish });
+        Ok(())
+    }
+
+    async fn clear_delayed_lwt(&self, session_id: &SessionId) -> anyhow::Result<()> {
+        self.inner
+            .write()
+            .expect("inbox poisoned")
+            .delayed_lwts
+            .remove(session_id);
+        Ok(())
+    }
+
+    async fn send_delayed_lwt(
+        &self,
+        session_id: &SessionId,
+        generation: u64,
+        sink: &dyn DelayedLwtSink,
+    ) -> anyhow::Result<InboxLwtResult> {
+        let registered = {
+            let guard = self.inner.read().expect("inbox poisoned");
+            let attached = guard.active_sessions.get(session_id).copied();
+            let registered = guard.delayed_lwts.get(session_id).cloned();
+            match (attached, registered) {
+                (None, None) => return Ok(InboxLwtResult::NoInbox),
+                (_, None) => return Ok(InboxLwtResult::NoLwt),
+                (_, Some(registered)) if registered.generation != generation => {
+                    return Ok(InboxLwtResult::Conflict)
+                }
+                (Some(true), Some(_)) => return Ok(InboxLwtResult::NoDetach),
+                (_, Some(registered)) => registered,
+            }
+        };
+        match sink.send_lwt(&registered.publish).await {
+            Ok(()) => {
+                self.inner
+                    .write()
+                    .expect("inbox poisoned")
+                    .delayed_lwts
+                    .remove(session_id);
+                Ok(InboxLwtResult::Ok)
+            }
+            Err(error) => Ok(delayed_lwt_result_from_error(&error)),
+        }
+    }
+
     async fn purge_session(&self, session_id: &SessionId) -> anyhow::Result<()> {
         self.subscription_store
             .purge_session_subscriptions(session_id)
@@ -1239,6 +1361,7 @@ impl InboxService for PersistentInboxHandle {
 
         let mut guard = self.inner.write().expect("inbox poisoned");
         guard.active_sessions.remove(session_id);
+        guard.delayed_lwts.remove(session_id);
         let removed = guard.subscriptions.remove(session_id).unwrap_or_default();
         guard
             .subscriptions_by_session_topic

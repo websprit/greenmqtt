@@ -5,14 +5,15 @@ use axum::{
 use greenmqtt_broker::BrokerRuntime;
 use greenmqtt_core::{
     ClusterNodeMembership, ControlCommandExecutionState, ControlCommandRecord,
-    ControlCommandReflectionState, ControlPlaneRegistry, NodeId, ReplicatedRangeDescriptor,
-    ServiceKind,
+    ControlCommandReflectionState, ControlPlaneRegistry, NodeId, RangeReconfigurationState,
+    ReplicatedRangeDescriptor, ServiceKind,
 };
 use greenmqtt_kv_server::{RangeHealthSnapshot, ReplicaRuntime, ZombieRangeSnapshot};
 use greenmqtt_plugin_api::{AclProvider, AuthProvider, EventHook};
 use greenmqtt_rpc::{RangeAdminGrpcClient, RangeControlGrpcClient};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::{ApiError, RangeListQuery};
@@ -37,6 +38,17 @@ pub struct RangeActionReply {
     pub range_id: Option<String>,
     pub left_range_id: Option<String>,
     pub right_range_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RangeLookupReply {
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<RangeHealthSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descriptor: Option<ReplicatedRangeDescriptor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconfiguration: Option<RangeReconfigurationState>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -77,6 +89,8 @@ struct RemoteRangeControlTarget {
     endpoint: String,
     client: RangeControlGrpcClient,
 }
+
+static MANUAL_COMMAND_SEQ: AtomicU64 = AtomicU64::new(1);
 
 fn require_range_runtime(
     runtime: Option<Arc<ReplicaRuntime>>,
@@ -282,24 +296,95 @@ fn matches_range_filters(health: &RangeHealthSnapshot, query: &RangeListQuery) -
     if query.pending_only && health.reconfiguration.phase.is_none() {
         return false;
     }
-    if let Some(owner_node_id) = query.owner_node_id {
-        if health.leader_node_id != Some(owner_node_id) {
-            return false;
-        }
-    }
-    if let Some(tenant_id) = query.tenant_id.as_deref() {
-        if !health.range_id.contains(tenant_id) {
-            return false;
-        }
-    }
-    if let Some(service_kind) = query.service_kind.as_deref() {
-        if !format!("{:?}", health.lifecycle).to_ascii_lowercase().contains(&service_kind.to_ascii_lowercase())
-            && !health.range_id.to_ascii_lowercase().contains(&service_kind.to_ascii_lowercase())
-        {
+    if let Some(leader_node_id) = query.leader_node_id {
+        if health.leader_node_id != Some(leader_node_id) {
             return false;
         }
     }
     true
+}
+
+fn parse_command_target_shard(target: &str) -> Option<greenmqtt_core::ServiceShardKey> {
+    let mut parts = target.splitn(3, ':');
+    let kind = match parts.next()? {
+        "SessionDict" => greenmqtt_core::ServiceShardKind::SessionDict,
+        "Inbox" => greenmqtt_core::ServiceShardKind::Inbox,
+        "Inflight" => greenmqtt_core::ServiceShardKind::Inflight,
+        "Dist" => greenmqtt_core::ServiceShardKind::Dist,
+        "Retain" => greenmqtt_core::ServiceShardKind::Retain,
+        _ => return None,
+    };
+    Some(greenmqtt_core::ServiceShardKey {
+        kind,
+        tenant_id: parts.next()?.to_string(),
+        scope: parts.next()?.to_string(),
+    })
+}
+
+async fn range_matches_structured_filters(
+    registry: Option<&Arc<dyn ControlPlaneRegistry>>,
+    health: &RangeHealthSnapshot,
+    query: &RangeListQuery,
+) -> Result<bool, ApiError> {
+    let Some(registry) = registry else {
+        return Ok(query.owner_node_id.is_none() && query.tenant_id.is_none() && query.service_kind.is_none());
+    };
+    let Some(descriptor) = registry
+        .resolve_range(&health.range_id)
+        .await
+        .map_err(ApiError::from)?
+    else {
+        return Ok(false);
+    };
+    if let Some(owner_node_id) = query.owner_node_id {
+        let assignment = registry
+            .resolve_assignment(&descriptor.shard)
+            .await
+            .map_err(ApiError::from)?;
+        if assignment
+            .as_ref()
+            .map(|assignment| assignment.owner_node_id())
+            != Some(owner_node_id)
+        {
+            return Ok(false);
+        }
+    }
+    if let Some(tenant_id) = query.tenant_id.as_deref() {
+        if descriptor.shard.tenant_id != tenant_id {
+            return Ok(false);
+        }
+    }
+    if let Some(service_kind) = query.service_kind.as_deref() {
+        if !format!("{:?}", descriptor.shard.kind).eq_ignore_ascii_case(service_kind) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+async fn metadata_fallback_health(
+    registry: &Arc<dyn ControlPlaneRegistry>,
+) -> Result<Vec<RangeHealthSnapshot>, ApiError> {
+    let mut ranges = Vec::new();
+    for descriptor in registry.list_ranges(None).await.map_err(ApiError::from)? {
+        ranges.push(RangeHealthSnapshot {
+            range_id: descriptor.id.clone(),
+            lifecycle: descriptor.lifecycle.clone(),
+            role: greenmqtt_kv_raft::RaftNodeRole::Follower,
+            current_term: 0,
+            leader_node_id: descriptor.leader_node_id,
+            commit_index: descriptor.commit_index,
+            applied_index: descriptor.applied_index,
+            latest_snapshot_index: None,
+            replica_lag: Vec::new(),
+            reconfiguration: registry
+                .resolve_reconfiguration_state(&descriptor.id)
+                .await
+                .map_err(ApiError::from)?
+                .unwrap_or_default(),
+        });
+    }
+    Ok(ranges)
 }
 
 async fn record_manual_range_command(
@@ -307,11 +392,26 @@ async fn record_manual_range_command(
     operation: &str,
     range_id: &str,
     issued_by: &str,
+    mode: &str,
+    target: Option<(u64, String)>,
 ) -> Result<Option<String>, ApiError> {
     let Some(registry) = registry else {
         return Ok(None);
     };
-    let command_id = format!("manual:{operation}:{range_id}");
+    let correlation_id = format!("manual:{operation}:{range_id}");
+    let command_id = format!(
+        "{correlation_id}:{}:{}",
+        crate::admin::current_time_ms(),
+        MANUAL_COMMAND_SEQ.fetch_add(1, Ordering::SeqCst)
+    );
+    let mut payload = BTreeMap::from([
+        ("correlation_id".into(), correlation_id),
+        ("mode".into(), mode.to_string()),
+    ]);
+    if let Some((target_node_id, target_endpoint)) = target {
+        payload.insert("target_node_id".into(), target_node_id.to_string());
+        payload.insert("target_endpoint".into(), target_endpoint);
+    }
     registry
         .upsert_control_command(ControlCommandRecord {
             command_id: command_id.clone(),
@@ -320,7 +420,7 @@ async fn record_manual_range_command(
             issued_at_ms: crate::admin::current_time_ms(),
             issued_by: issued_by.to_string(),
             attempt_count: 0,
-            payload: BTreeMap::new(),
+            payload,
             execution_state: ControlCommandExecutionState::Applied,
             reflection_state: ControlCommandReflectionState::Pending,
             last_error: None,
@@ -352,17 +452,52 @@ where
     } else {
         None
     };
-    let entries = aggregate_range_health(range_runtime, range_routing)
-        .await?
-        .into_iter()
-        .filter(|health| {
-            command_target
-                .as_ref()
-                .map(|target| health.range_id == *target)
-                .unwrap_or(true)
-        })
-        .filter(|health| matches_range_filters(health, &query))
-        .collect();
+    let command_target_shard = command_target
+        .as_deref()
+        .and_then(parse_command_target_shard);
+    let mut entries = Vec::new();
+    let live_entries = aggregate_range_health(range_runtime, range_routing.clone())
+        .await
+        .unwrap_or_default();
+    let source_entries = if live_entries.is_empty() {
+        if let Some(registry) = range_routing.as_ref() {
+            metadata_fallback_health(registry).await?
+        } else {
+            Vec::new()
+        }
+    } else {
+        live_entries
+    };
+    for health in source_entries.into_iter() {
+        if let Some(target) = command_target.as_deref() {
+            if health.range_id != target {
+                if let Some(shard) = command_target_shard.as_ref() {
+                    let Some(registry) = range_routing.as_ref() else {
+                        continue;
+                    };
+                    let Some(descriptor) = registry
+                        .resolve_range(&health.range_id)
+                        .await
+                        .map_err(ApiError::from)?
+                    else {
+                        continue;
+                    };
+                    if descriptor.shard != *shard {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            }
+        }
+        if !matches_range_filters(&health, &query) {
+            continue;
+        }
+        if !range_matches_structured_filters(range_routing.as_ref(), &health, &query).await? {
+            continue;
+        }
+        entries.push(health);
+    }
     Ok(Json(entries))
 }
 
@@ -371,7 +506,7 @@ pub(crate) async fn get_range<A, C, H>(
     Extension(range_runtime): Extension<Option<Arc<ReplicaRuntime>>>,
     State(_broker): State<Arc<BrokerRuntime<A, C, H>>>,
     Path(range_id): Path<String>,
-) -> Result<Json<Option<RangeHealthSnapshot>>, ApiError>
+) -> Result<Json<Option<RangeLookupReply>>, ApiError>
 where
     A: AuthProvider + 'static,
     C: AclProvider + 'static,
@@ -382,7 +517,12 @@ where
         .into_iter()
         .find(|entry| entry.range_id == range_id);
     if snapshot.is_some() {
-        return Ok(Json(snapshot));
+        return Ok(Json(Some(RangeLookupReply {
+            source: "live".into(),
+            health: snapshot,
+            descriptor: None,
+            reconfiguration: None,
+        })));
     }
     let fallback = if let Some(registry) = range_routing {
         if let Some(descriptor) = registry
@@ -390,21 +530,14 @@ where
             .await
             .map_err(ApiError::from)?
         {
-            Some(RangeHealthSnapshot {
-                range_id: descriptor.id,
-                lifecycle: descriptor.lifecycle,
-                role: greenmqtt_kv_raft::RaftNodeRole::Follower,
-                current_term: 0,
-                leader_node_id: descriptor.leader_node_id,
-                commit_index: descriptor.commit_index,
-                applied_index: descriptor.applied_index,
-                latest_snapshot_index: None,
-                replica_lag: Vec::new(),
+            Some(RangeLookupReply {
+                source: "metadata_fallback".into(),
+                health: None,
+                descriptor: Some(descriptor),
                 reconfiguration: registry
                     .resolve_reconfiguration_state(&range_id)
                     .await
-                    .map_err(ApiError::from)?
-                    .unwrap_or_default(),
+                    .map_err(ApiError::from)?,
             })
         } else {
             None
@@ -457,11 +590,19 @@ where
         "ranges",
         BTreeMap::from([("range_id".into(), range_id.clone())]),
     );
-    let command_id =
-        record_manual_range_command(range_routing.as_ref(), "bootstrap", &range_id, "http").await?;
+    let mode = if target.is_some() { "forwarded" } else { "local" };
+    let command_id = record_manual_range_command(
+        range_routing.as_ref(),
+        "bootstrap",
+        &range_id,
+        "http",
+        mode,
+        target.clone(),
+    )
+    .await?;
     Ok(Json(range_action_reply(
         "bootstrap",
-        if target.is_some() { "forwarded" } else { "local" },
+        mode,
         "bootstrapped",
         "Range bootstrapped and marked serving.",
         target,
@@ -540,6 +681,8 @@ where
         "change_replicas",
         &range_id,
         "http",
+        if target.is_some() { "forwarded" } else { "local" },
+        target.clone(),
     )
     .await?;
     Ok(Json(range_action_reply(
@@ -596,6 +739,8 @@ where
         "transfer_leadership",
         &range_id,
         "http",
+        if target.is_some() { "forwarded" } else { "local" },
+        target.clone(),
     )
     .await?;
     Ok(Json(range_action_reply(
@@ -647,8 +792,15 @@ where
         "ranges",
         BTreeMap::from([("range_id".into(), range_id.clone())]),
     );
-    let command_id =
-        record_manual_range_command(range_routing.as_ref(), "recover", &range_id, "http").await?;
+    let command_id = record_manual_range_command(
+        range_routing.as_ref(),
+        "recover",
+        &range_id,
+        "http",
+        if target.is_some() { "forwarded" } else { "local" },
+        target.clone(),
+    )
+    .await?;
     Ok(Json(range_action_reply(
         "recover",
         if target.is_some() { "forwarded" } else { "local" },
@@ -698,8 +850,15 @@ where
         "ranges",
         BTreeMap::from([("range_id".into(), range_id.clone())]),
     );
-    let command_id =
-        record_manual_range_command(range_routing.as_ref(), "split", &range_id, "http").await?;
+    let command_id = record_manual_range_command(
+        range_routing.as_ref(),
+        "split",
+        &range_id,
+        "http",
+        if target.is_some() { "forwarded" } else { "local" },
+        target.clone(),
+    )
+    .await?;
     Ok(Json(range_action_reply(
         "split",
         if target.is_some() { "forwarded" } else { "local" },
@@ -756,8 +915,15 @@ where
         "ranges",
         BTreeMap::from([("range_id".into(), range_id.clone())]),
     );
-    let command_id =
-        record_manual_range_command(range_routing.as_ref(), "merge", &range_id, "http").await?;
+    let command_id = record_manual_range_command(
+        range_routing.as_ref(),
+        "merge",
+        &range_id,
+        "http",
+        if target.is_some() { "forwarded" } else { "local" },
+        target.clone(),
+    )
+    .await?;
     Ok(Json(range_action_reply(
         "merge",
         if target.is_some() { "forwarded" } else { "local" },
@@ -806,8 +972,15 @@ where
         "ranges",
         BTreeMap::from([("range_id".into(), range_id.clone())]),
     );
-    let command_id =
-        record_manual_range_command(range_routing.as_ref(), "drain", &range_id, "http").await?;
+    let command_id = record_manual_range_command(
+        range_routing.as_ref(),
+        "drain",
+        &range_id,
+        "http",
+        if target.is_some() { "forwarded" } else { "local" },
+        target.clone(),
+    )
+    .await?;
     Ok(Json(range_action_reply(
         "drain",
         if target.is_some() { "forwarded" } else { "local" },
@@ -856,8 +1029,15 @@ where
         "ranges",
         BTreeMap::from([("range_id".into(), range_id.clone())]),
     );
-    let command_id =
-        record_manual_range_command(range_routing.as_ref(), "retire", &range_id, "http").await?;
+    let command_id = record_manual_range_command(
+        range_routing.as_ref(),
+        "retire",
+        &range_id,
+        "http",
+        if target.is_some() { "forwarded" } else { "local" },
+        target.clone(),
+    )
+    .await?;
     Ok(Json(range_action_reply(
         "retire",
         if target.is_some() { "forwarded" } else { "local" },

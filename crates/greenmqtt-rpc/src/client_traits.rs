@@ -235,6 +235,30 @@ impl InboxService for InboxGrpcClient {
         Ok(())
     }
 
+    async fn register_delayed_lwt(
+        &self,
+        _generation: u64,
+        _publish: greenmqtt_inbox::DelayedLwtPublish,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("register_delayed_lwt is not supported over InboxGrpcClient")
+    }
+
+    async fn clear_delayed_lwt(
+        &self,
+        _session_id: &greenmqtt_core::SessionId,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn send_delayed_lwt(
+        &self,
+        _session_id: &greenmqtt_core::SessionId,
+        _generation: u64,
+        _sink: &dyn greenmqtt_inbox::DelayedLwtSink,
+    ) -> anyhow::Result<greenmqtt_inbox::InboxLwtResult> {
+        anyhow::bail!("send_delayed_lwt is not supported over InboxGrpcClient")
+    }
+
     async fn purge_session(&self, session_id: &greenmqtt_core::SessionId) -> anyhow::Result<()> {
         let mut client = self.inner.lock().await;
         client

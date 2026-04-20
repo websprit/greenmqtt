@@ -49,8 +49,8 @@ use greenmqtt_rpc::{
     DistGrpcClient, InboxGrpcClient, KvRangeGrpcClient, KvRangeGrpcExecutorFactory,
     MetadataGrpcClient, MetadataPlaneLayout, NoopReplicaTransport, PersistentMetadataRegistry,
     RangeControlGrpcClient, ReplicatedMetadataRegistry, RetainGrpcClient,
-    RoutedRangeControlGrpcClient, RpcRuntime, SessionDictGrpcClient, StaticPeerForwarder,
-    StaticServiceEndpointRegistry,
+    RoutedRangeControlGrpcClient, RpcRuntime, RpcTrafficGovernor, RpcTrafficGovernorConfig,
+    SessionDictGrpcClient, StaticPeerForwarder, StaticServiceEndpointRegistry,
 };
 use greenmqtt_sessiondict::{
     PersistentSessionDictHandle, ReplicatedSessionDictHandle, SessionDictHandle, SessionDirectory,
@@ -415,6 +415,9 @@ struct ShardActionEnvelope {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RangeCliCommand {
+    Inspect {
+        range_id: String,
+    },
     Bootstrap {
         descriptor: ReplicatedRangeDescriptor,
     },
@@ -589,6 +592,18 @@ async fn execute_range_command_with_endpoint(
     endpoint: &str,
 ) -> anyhow::Result<String> {
     let (command, output_mode) = range_command_request(args)?;
+    if let RangeCliCommand::Inspect { range_id } = command {
+        let addr = std::env::var("GREENMQTT_HTTP_BIND")
+            .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
+            .parse::<SocketAddr>()?;
+        let response = http_request_body(addr, "GET", &format!("/v1/ranges/{range_id}"), None)?;
+        return match output_mode {
+            OutputMode::Json => Ok(response),
+            OutputMode::Text => {
+                Ok(render_range_lookup_text(&response)?)
+            }
+        };
+    }
     let client = RangeControlGrpcClient::connect(endpoint.to_string()).await?;
     let routed_client = RoutedRangeControlGrpcClient::connect(
         range_metadata_endpoint(endpoint)?,
@@ -793,6 +808,7 @@ async fn execute_range_command_with_endpoint(
                 right_range_id: None,
             }
         }
+        RangeCliCommand::Inspect { .. } => unreachable!("inspect is handled before gRPC execution"),
     };
     match output_mode {
         OutputMode::Json => Ok(serde_json::to_string(&reply)?),
@@ -942,6 +958,21 @@ fn render_range_response_text(reply: &RangeCliReply) -> String {
     }
 }
 
+fn render_range_lookup_text(body: &str) -> anyhow::Result<String> {
+    let value: serde_json::Value = serde_json::from_str(body)?;
+    let source = value
+        .get("source")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let range = value
+        .get("health")
+        .and_then(|value| value.get("range_id"))
+        .or_else(|| value.get("descriptor").and_then(|value| value.get("id")))
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    Ok(format!("ok operation=inspect source={source} range_id={range}"))
+}
+
 fn range_command_request(
     mut args: impl Iterator<Item = String>,
 ) -> anyhow::Result<(RangeCliCommand, OutputMode)> {
@@ -949,6 +980,25 @@ fn range_command_request(
         .next()
         .ok_or_else(|| anyhow::anyhow!("missing range subcommand"))?;
     match subcommand.as_str() {
+        "inspect" => {
+            let range_id = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("missing range_id"))?;
+            let mut output = output_mode();
+            while let Some(flag) = args.next() {
+                match flag.as_str() {
+                    "--output" => {
+                        output = parse_output_mode(
+                            &args
+                                .next()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --output"))?,
+                        )?
+                    }
+                    _ => anyhow::bail!("unknown range inspect flag: {flag}"),
+                }
+            }
+            Ok((RangeCliCommand::Inspect { range_id }, output))
+        }
         "bootstrap" => {
             let mut range_id = None;
             let mut kind = None;
@@ -1771,6 +1821,9 @@ async fn main() -> anyhow::Result<()> {
         let rpc_bind: SocketAddr = std::env::var("GREENMQTT_RPC_BIND")
             .unwrap_or_else(|_| "127.0.0.1:50051".to_string())
             .parse()?;
+        let rpc_governor = Arc::new(RpcTrafficGovernor::new(
+            RpcTrafficGovernorConfig::from_env()?,
+        ));
         println!("greenmqtt state grpc listening on {rpc_bind}");
         RpcRuntime {
             sessiondict: default_sessiondict,
@@ -1783,7 +1836,7 @@ async fn main() -> anyhow::Result<()> {
             range_runtime: local_range_runtime,
             inbox_lwt_sink: None,
         }
-        .serve(rpc_bind)
+        .serve_with_governor(rpc_bind, rpc_governor)
         .await?;
         return Ok(());
     }
@@ -2083,6 +2136,9 @@ async fn main() -> anyhow::Result<()> {
             ))
             .await?;
         let metrics_handle = PrometheusBuilder::new().install_recorder()?;
+        let rpc_governor = Arc::new(RpcTrafficGovernor::new(
+            RpcTrafficGovernorConfig::from_env()?,
+        ));
         let http = if let Some(range_runtime) = local_range_runtime.clone() {
             HttpApi::with_peers_shards_metrics_and_ranges(
                 broker.clone(),
@@ -2093,6 +2149,7 @@ async fn main() -> anyhow::Result<()> {
                 metrics_handle,
                 http_bind,
             )
+            .with_rpc_governor(rpc_governor.clone())
         } else {
             HttpApi::with_peers_shards_and_metrics(
                 broker.clone(),
@@ -2102,6 +2159,7 @@ async fn main() -> anyhow::Result<()> {
                 metrics_handle,
                 http_bind,
             )
+            .with_rpc_governor(rpc_governor.clone())
         };
         let rpc = RpcRuntime {
             sessiondict: broker.sessiondict.clone(),
@@ -2118,7 +2176,7 @@ async fn main() -> anyhow::Result<()> {
         };
         let mut tasks = JoinSet::new();
         tasks.spawn(async move { http.start().await });
-        tasks.spawn(async move { rpc.serve(rpc_bind).await });
+        tasks.spawn(async move { rpc.serve_with_governor(rpc_bind, rpc_governor).await });
         if let (Some(dist_runtime), Some(dist_maintenance)) = (
             replicated_dist_runtime_handle(state_endpoint.as_deref()).await?,
             configured_dist_maintenance()?,

@@ -597,32 +597,48 @@ impl ProtoInboxService for InboxRpc {
     async fn send_lwt(
         &self,
         request: Request<InboxSendLwtRequest>,
-    ) -> Result<Response<()>, Status> {
+    ) -> Result<Response<InboxSendLwtReply>, Status> {
         let sink = self
             .lwt_sink
             .as_ref()
             .ok_or_else(|| Status::unavailable("delayed lwt sink unavailable"))?;
         let request = request.into_inner();
-        inbox_send_lwt(
-            sink.as_ref(),
-            &DelayedLwtPublish {
-                tenant_id: request.tenant_id,
-                session_id: request.session_id,
-                publish: greenmqtt_core::PublishRequest {
-                    topic: request.topic,
-                    payload: request.payload.into(),
-                    qos: request.qos as u8,
-                    retain: request.retain,
-                    properties: greenmqtt_proto::from_proto_publish_properties(
-                        request.properties.unwrap_or_default(),
-                    ),
+        self.inner
+            .register_delayed_lwt(
+                request.generation,
+                DelayedLwtPublish {
+                    tenant_id: request.tenant_id,
+                    session_id: request.session_id.clone(),
+                    publish: greenmqtt_core::PublishRequest {
+                        topic: request.topic,
+                        payload: request.payload.into(),
+                        qos: request.qos as u8,
+                        retain: request.retain,
+                        properties: greenmqtt_proto::from_proto_publish_properties(
+                            request.properties.unwrap_or_default(),
+                        ),
+                    },
                 },
-            },
+            )
+            .await
+            .map_err(internal_status)?;
+        let result = inbox_send_lwt(
+            self.inner.as_ref(),
+            &request.session_id,
+            request.generation,
+            sink.as_ref(),
         )
         .await
         .map_err(internal_status)?;
-        counter!("greenmqtt_inbox_delayed_lwt_dispatch_total").increment(1);
-        Ok(Response::new(()))
+        counter!(
+            "greenmqtt_inbox_delayed_lwt_dispatch_total",
+            "code" => format!("{result:?}")
+        )
+        .increment(1);
+        Ok(Response::new(InboxSendLwtReply {
+            code: format!("{result:?}"),
+            message: format!("delayed lwt result: {result:?}"),
+        }))
     }
 
     async fn expire_all(
@@ -765,39 +781,34 @@ impl RetainService for RetainRpc {
     async fn expire_all(
         &self,
         request: Request<RetainExpireAllRequest>,
-    ) -> Result<Response<CountReply>, Status> {
-        let removed = retain_expire_all(self.inner.as_ref(), &request.into_inner().tenant_id)
+    ) -> Result<Response<RetainMaintenanceReply>, Status> {
+        let result = retain_expire_all(self.inner.as_ref(), &request.into_inner().tenant_id)
             .await
             .map_err(internal_status)?;
         counter!("greenmqtt_retain_expire_sweep_total", "action" => "expire_all").increment(1);
-        Ok(Response::new(CountReply {
-            count: removed as u64,
-        }))
+        Ok(Response::new(retain_maintenance_reply(&result)))
     }
 
     async fn tenant_gc_preview(
         &self,
         request: Request<RetainTenantGcRequest>,
-    ) -> Result<Response<CountReply>, Status> {
-        let count = retain_tenant_gc_preview(self.inner.as_ref(), &request.into_inner().tenant_id)
+    ) -> Result<Response<RetainMaintenanceReply>, Status> {
+        let result =
+            retain_tenant_gc_preview(self.inner.as_ref(), &request.into_inner().tenant_id)
             .await
             .map_err(internal_status)?;
-        Ok(Response::new(CountReply {
-            count: count as u64,
-        }))
+        Ok(Response::new(retain_maintenance_reply(&result)))
     }
 
     async fn tenant_gc_run(
         &self,
         request: Request<RetainTenantGcRequest>,
-    ) -> Result<Response<CountReply>, Status> {
-        let count = retain_tenant_gc_run(self.inner.as_ref(), &request.into_inner().tenant_id)
+    ) -> Result<Response<RetainMaintenanceReply>, Status> {
+        let result = retain_tenant_gc_run(self.inner.as_ref(), &request.into_inner().tenant_id)
             .await
             .map_err(internal_status)?;
         counter!("greenmqtt_retain_expire_sweep_total", "action" => "tenant_gc").increment(1);
-        Ok(Response::new(CountReply {
-            count: count as u64,
-        }))
+        Ok(Response::new(retain_maintenance_reply(&result)))
     }
 }
 

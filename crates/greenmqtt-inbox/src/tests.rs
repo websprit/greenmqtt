@@ -1,8 +1,8 @@
 use super::{
-    inbox_session_shard, inbox_tenant_scan_shard, inflight_session_shard,
+    inbox_send_lwt, inbox_session_shard, inbox_tenant_scan_shard, inflight_session_shard,
     inflight_tenant_scan_shard, subscription_shard, DelayedLwtPublish, InboxBalanceAction,
     InboxBalancePolicy, InboxBatchScheduler, InboxDelayTaskRunner, InboxDelayedTask,
-    InboxDelayedTaskHandler, InboxExpiryStats, InboxHandle, InboxInflightCommit,
+    InboxDelayedTaskHandler, InboxExpiryStats, InboxHandle, InboxInflightCommit, InboxLwtResult,
     InboxMaintenanceWorker, InboxService, InboxTenantStats, InboxUnsubscribeSpec,
     PersistentInboxHandle, ReplicatedInboxHandle, TenantInboxGcRunner, ThresholdInboxBalancePolicy,
     OFFLINE_KEY_PREFIX,
@@ -2513,6 +2513,17 @@ impl super::DelayedLwtSink for RecordingLwtSink {
     }
 }
 
+struct ErrorLwtSink {
+    message: &'static str,
+}
+
+#[async_trait]
+impl super::DelayedLwtSink for ErrorLwtSink {
+    async fn send_lwt(&self, _publish: &DelayedLwtPublish) -> anyhow::Result<()> {
+        anyhow::bail!(self.message)
+    }
+}
+
 #[tokio::test]
 async fn inbox_delay_task_runner_retries_then_completes() {
     let handler = Arc::new(RecordingDelayedHandler::default());
@@ -2800,6 +2811,88 @@ async fn inbox_maintenance_worker_runs_gc_and_delayed_lwt() {
         lwt_sink.sessions.lock().expect("sink poisoned").as_slice(),
         ["s1"]
     );
+}
+
+#[tokio::test]
+async fn inbox_send_lwt_returns_typed_results() {
+    let inbox: Arc<dyn InboxService> = Arc::new(InboxHandle::default());
+    let session_id = "s1".to_string();
+    let publish = DelayedLwtPublish {
+        tenant_id: "t1".into(),
+        session_id: session_id.clone(),
+        publish: PublishRequest {
+            topic: "clients/s1/will".into(),
+            payload: b"gone".to_vec().into(),
+            qos: 1,
+            retain: false,
+            properties: PublishProperties::default(),
+        },
+    };
+
+    assert_eq!(
+        inbox_send_lwt(inbox.as_ref(), &session_id, 1, &RecordingLwtSink::default())
+            .await
+            .unwrap(),
+        InboxLwtResult::NoInbox
+    );
+
+    inbox.attach(&session_id).await.unwrap();
+    assert_eq!(
+        inbox_send_lwt(inbox.as_ref(), &session_id, 1, &RecordingLwtSink::default())
+            .await
+            .unwrap(),
+        InboxLwtResult::NoLwt
+    );
+
+    inbox.register_delayed_lwt(1, publish.clone()).await.unwrap();
+    assert_eq!(
+        inbox_send_lwt(inbox.as_ref(), &session_id, 2, &RecordingLwtSink::default())
+            .await
+            .unwrap(),
+        InboxLwtResult::Conflict
+    );
+    assert_eq!(
+        inbox_send_lwt(inbox.as_ref(), &session_id, 1, &RecordingLwtSink::default())
+            .await
+            .unwrap(),
+        InboxLwtResult::NoDetach
+    );
+
+    inbox.detach(&session_id).await.unwrap();
+    assert_eq!(
+        inbox_send_lwt(
+            inbox.as_ref(),
+            &session_id,
+            1,
+            &ErrorLwtSink {
+                message: "dist try later"
+            },
+        )
+        .await
+        .unwrap(),
+        InboxLwtResult::DistTryLater
+    );
+    assert_eq!(
+        inbox_send_lwt(
+            inbox.as_ref(),
+            &session_id,
+            1,
+            &ErrorLwtSink {
+                message: "retain try later"
+            },
+        )
+        .await
+        .unwrap(),
+        InboxLwtResult::RetainTryLater
+    );
+    let sink = RecordingLwtSink::default();
+    assert_eq!(
+        inbox_send_lwt(inbox.as_ref(), &session_id, 1, &sink)
+            .await
+            .unwrap(),
+        InboxLwtResult::Ok
+    );
+    assert_eq!(sink.sessions.lock().expect("sink poisoned").as_slice(), ["s1"]);
 }
 
 #[tokio::test]

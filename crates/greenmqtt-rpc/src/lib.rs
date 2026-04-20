@@ -48,7 +48,8 @@ use greenmqtt_proto::internal::{
     InboxFetchRequest, InboxListAllSubscriptionsRequest, InboxListMessagesRequest,
     InboxListSubscriptionsReply, InboxListSubscriptionsRequest, InboxLookupSubscriptionReply,
     InboxLookupSubscriptionRequest, InboxMaintenanceReply, InboxPurgeSessionRequest,
-    InboxSendLwtRequest, InboxStageInflightRequest, InboxStatsReply, InboxSubscribeRequest,
+    InboxSendLwtReply, InboxSendLwtRequest, InboxStageInflightRequest, InboxStatsReply,
+    InboxSubscribeRequest,
     InboxTenantGcRequest, InboxUnsubscribeReply, InboxUnsubscribeRequest, KvRangeApplyRequest,
     KvRangeCheckpointReply, KvRangeCheckpointRequest, KvRangeGetReply, KvRangeGetRequest,
     KvRangeScanReply, KvRangeScanRequest, KvRangeSnapshotReply, KvRangeSnapshotRequest,
@@ -63,8 +64,8 @@ use greenmqtt_proto::internal::{
     RangeReconfigurationRecord, RangeRecordReply, RangeRecoverRequest, RangeRetireRequest,
     RangeSplitReply, RangeSplitRequest, RangeTransferLeadershipRequest, RangeUpsertRequest,
     RegisterSessionReply, RegisterSessionRequest, RemoveRouteRequest, RemoveSessionRoutesReply,
-    RemoveSessionRoutesRequest, ReplicaLagRecord, RetainExpireAllRequest, RetainMatchReply,
-    RetainMatchRequest, RetainTenantGcRequest, RetainWriteRequest, RouteRangeRequest,
+    RemoveSessionRoutesRequest, ReplicaLagRecord, RetainExpireAllRequest, RetainMaintenanceReply,
+    RetainMatchReply, RetainMatchRequest, RetainTenantGcRequest, RetainWriteRequest, RouteRangeRequest,
     SessionExistRecord, SessionExistReply, SessionExistRequest, ShardSnapshotChunk,
     ShardSnapshotRequest, UnregisterSessionRequest, ZombieRangeListReply, ZombieRangeRecord,
 };
@@ -97,7 +98,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
 use tonic::transport::{Channel, Server};
 use tonic::{Request, Response, Status};
@@ -184,6 +185,7 @@ where
 fn overload_response(
     governor: &ServiceTrafficGovernor,
 ) -> tonic::codegen::http::Response<tonic::body::Body> {
+    let rules = governor.effective_rules();
     tonic::codegen::http::Response::builder()
         .status(tonic::codegen::http::StatusCode::OK)
         .header(
@@ -196,13 +198,13 @@ fn overload_response(
             format!(
                 "rpc/overloaded service={} retry_after_ms={}",
                 governor.service.as_str(),
-                governor.retry_after_ms
+                rules.retry_after_ms
             ),
         )
         .header("x-greenmqtt-service", governor.service.as_str())
         .header(
             "x-greenmqtt-retry-after-ms",
-            governor.retry_after_ms.to_string(),
+            rules.retry_after_ms.to_string(),
         )
         .body(tonic::body::Body::empty())
         .expect("valid overload response")
@@ -226,6 +228,17 @@ fn inbox_preview_reply(preview: InboxTenantGcPreview) -> InboxMaintenanceReply {
         preview.offline_messages,
         preview.inflight_messages,
     )
+}
+
+fn retain_maintenance_reply(
+    result: &greenmqtt_retain::RetainMaintenanceResult,
+) -> RetainMaintenanceReply {
+    RetainMaintenanceReply {
+        tenant_id: result.tenant_id.clone(),
+        scanned: result.scanned as u64,
+        removed: result.removed as u64,
+        refreshed: result.refreshed as u64,
+    }
 }
 
 #[derive(Clone)]
@@ -266,7 +279,7 @@ impl RpcServiceKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RpcServiceLoadSnapshot {
     pub service: &'static str,
     pub current_in_flight: usize,
@@ -274,6 +287,31 @@ pub struct RpcServiceLoadSnapshot {
     pub overload_count: u64,
     pub retry_after_ms: u64,
     pub last_overload_ms: Option<u64>,
+    pub rules_source: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RpcTrafficRules {
+    pub max_in_flight: usize,
+    pub retry_after_ms: u64,
+    pub tenant_prefix_limits: BTreeMap<String, usize>,
+    pub preferred_endpoints: Vec<String>,
+    pub server_group_tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RpcServiceRulesSnapshot {
+    pub service: &'static str,
+    pub source: &'static str,
+    pub effective: RpcTrafficRules,
+    pub runtime_override: Option<RpcTrafficRules>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RpcEndpointSnapshot {
+    pub endpoint: String,
+    pub last_overload_ms: Option<u64>,
+    pub backoff_until_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -436,14 +474,40 @@ impl RpcTrafficGovernor {
         ]
         .to_vec()
     }
+
+    pub fn service_by_name(&self, service: &str) -> Option<Arc<ServiceTrafficGovernor>> {
+        match service.to_ascii_lowercase().as_str() {
+            "sessiondict" => Some(self.sessiondict.clone()),
+            "dist" => Some(self.dist.clone()),
+            "inbox" => Some(self.inbox.clone()),
+            "retain" => Some(self.retain.clone()),
+            "metadata" => Some(self.metadata.clone()),
+            "kvrange" => Some(self.kvrange.clone()),
+            "rangecontrol" => Some(self.rangecontrol.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn rules_snapshots(&self) -> Vec<RpcServiceRulesSnapshot> {
+        [
+            self.sessiondict.rules_snapshot(),
+            self.dist.rules_snapshot(),
+            self.inbox.rules_snapshot(),
+            self.retain.rules_snapshot(),
+            self.metadata.rules_snapshot(),
+            self.kvrange.rules_snapshot(),
+            self.rangecontrol.rules_snapshot(),
+        ]
+        .to_vec()
+    }
 }
 
 #[derive(Debug)]
 pub struct ServiceTrafficGovernor {
     service: RpcServiceKind,
-    max_in_flight: usize,
-    retry_after_ms: u64,
-    permits: Arc<Semaphore>,
+    env_rules: RpcTrafficRules,
+    runtime_rules: Arc<RwLock<Option<RpcTrafficRules>>>,
+    endpoint_snapshots: Arc<RwLock<BTreeMap<String, RpcEndpointSnapshot>>>,
     current_in_flight: AtomicUsize,
     overload_count: AtomicU64,
     last_overload_ms: AtomicU64,
@@ -453,9 +517,15 @@ impl ServiceTrafficGovernor {
     fn new(service: RpcServiceKind, max_in_flight: usize, retry_after_ms: u64) -> Self {
         Self {
             service,
-            max_in_flight,
-            retry_after_ms,
-            permits: Arc::new(Semaphore::new(max_in_flight)),
+            env_rules: RpcTrafficRules {
+                max_in_flight,
+                retry_after_ms,
+                tenant_prefix_limits: BTreeMap::new(),
+                preferred_endpoints: Vec::new(),
+                server_group_tags: Vec::new(),
+            },
+            runtime_rules: Arc::new(RwLock::new(None)),
+            endpoint_snapshots: Arc::new(RwLock::new(BTreeMap::new())),
             current_in_flight: AtomicUsize::new(0),
             overload_count: AtomicU64::new(0),
             last_overload_ms: AtomicU64::new(0),
@@ -463,12 +533,22 @@ impl ServiceTrafficGovernor {
     }
 
     fn try_acquire(self: &Arc<Self>) -> Option<ServiceTrafficPermit> {
-        let permit = self.permits.clone().try_acquire_owned().ok()?;
-        self.current_in_flight.fetch_add(1, Ordering::SeqCst);
-        Some(ServiceTrafficPermit {
-            governor: self.clone(),
-            permit,
-        })
+        let max_in_flight = self.effective_rules().max_in_flight;
+        loop {
+            let current = self.current_in_flight.load(Ordering::SeqCst);
+            if current >= max_in_flight {
+                return None;
+            }
+            if self
+                .current_in_flight
+                .compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return Some(ServiceTrafficPermit {
+                    governor: self.clone(),
+                });
+            }
+        }
     }
 
     fn record_overload(&self) {
@@ -477,27 +557,96 @@ impl ServiceTrafficGovernor {
             .store(current_time_ms(), Ordering::SeqCst);
     }
 
-    fn snapshot(&self) -> RpcServiceLoadSnapshot {
+    pub fn snapshot(&self) -> RpcServiceLoadSnapshot {
         let last_overload_ms = self.last_overload_ms.load(Ordering::SeqCst);
+        let rules_source = if self.runtime_rules.read().expect("rpc governor poisoned").is_some() {
+            "runtime"
+        } else {
+            "env"
+        };
+        let effective = self.effective_rules();
         RpcServiceLoadSnapshot {
             service: self.service.as_str(),
             current_in_flight: self.current_in_flight.load(Ordering::SeqCst),
-            max_in_flight: self.max_in_flight,
+            max_in_flight: effective.max_in_flight,
             overload_count: self.overload_count.load(Ordering::SeqCst),
-            retry_after_ms: self.retry_after_ms,
+            retry_after_ms: effective.retry_after_ms,
             last_overload_ms: (last_overload_ms != 0).then_some(last_overload_ms),
+            rules_source,
+        }
+    }
+
+    pub fn effective_rules(&self) -> RpcTrafficRules {
+        self.runtime_rules
+            .read()
+            .expect("rpc governor poisoned")
+            .clone()
+            .unwrap_or_else(|| self.env_rules.clone())
+    }
+
+    pub fn runtime_rules(&self) -> Option<RpcTrafficRules> {
+        self.runtime_rules
+            .read()
+            .expect("rpc governor poisoned")
+            .clone()
+    }
+
+    pub fn set_runtime_rules(&self, rules: RpcTrafficRules) {
+        *self.runtime_rules.write().expect("rpc governor poisoned") = Some(rules);
+    }
+
+    pub fn clear_runtime_rules(&self) {
+        *self.runtime_rules.write().expect("rpc governor poisoned") = None;
+    }
+
+    pub fn note_endpoint_overload(&self, endpoint: &str, retry_after_ms: u64) {
+        let now = current_time_ms();
+        self.endpoint_snapshots
+            .write()
+            .expect("rpc governor poisoned")
+            .insert(
+                endpoint.to_string(),
+                RpcEndpointSnapshot {
+                    endpoint: endpoint.to_string(),
+                    last_overload_ms: Some(now),
+                    backoff_until_ms: Some(now + retry_after_ms),
+                },
+            );
+    }
+
+    pub fn clear_endpoint_backoff(&self, endpoint: &str) {
+        self.endpoint_snapshots
+            .write()
+            .expect("rpc governor poisoned")
+            .remove(endpoint);
+    }
+
+    pub fn endpoint_snapshots(&self) -> Vec<RpcEndpointSnapshot> {
+        self.endpoint_snapshots
+            .read()
+            .expect("rpc governor poisoned")
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    pub fn rules_snapshot(&self) -> RpcServiceRulesSnapshot {
+        let runtime_override = self.runtime_rules();
+        RpcServiceRulesSnapshot {
+            service: self.service.as_str(),
+            source: if runtime_override.is_some() { "runtime" } else { "env" },
+            effective: self.effective_rules(),
+            runtime_override,
         }
     }
 }
 
 struct ServiceTrafficPermit {
     governor: Arc<ServiceTrafficGovernor>,
-    permit: OwnedSemaphorePermit,
 }
 
 impl Drop for ServiceTrafficPermit {
     fn drop(&mut self) {
-        let _ = &self.permit;
         self.governor
             .current_in_flight
             .fetch_sub(1, Ordering::SeqCst);
@@ -562,6 +711,7 @@ pub struct RoutedRangeControlGrpcClient {
     fallback_endpoint: String,
     endpoint_backoff: Arc<Mutex<HashMap<String, Instant>>>,
     overload_backoff: Duration,
+    service_governor: Option<Arc<ServiceTrafficGovernor>>,
 }
 
 #[derive(Clone, Default)]

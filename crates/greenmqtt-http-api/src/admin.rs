@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use axum::{
     extract::{Path, Query, State},
     Extension,
@@ -9,10 +10,16 @@ use greenmqtt_core::{
     InflightMessage, OfflineMessage, PublishRequest, RetainedMessage, RouteRecord, TenantQuota,
     TenantUsageSnapshot,
 };
+use greenmqtt_inbox::{inbox_send_lwt, DelayedLwtPublish, DelayedLwtSink};
 use greenmqtt_plugin_api::{AclProvider, AuthProvider, EventHook};
+use greenmqtt_rpc::{
+    RpcEndpointSnapshot, RpcServiceLoadSnapshot, RpcServiceRulesSnapshot, RpcTrafficGovernor,
+    RpcTrafficRules,
+};
 use metrics::counter;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::{ApiError, MessageListQuery, PurgeReply, RouteListQuery};
@@ -23,6 +30,8 @@ pub(crate) fn current_time_ms() -> u64 {
         .expect("clock went backwards")
         .as_millis() as u64
 }
+
+static CONTROL_COMMAND_EVENT_SEQ: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RetainDeleteQuery {
@@ -62,7 +71,14 @@ pub struct TenantQuotaResponse {
 pub struct InboxSendLwtBody {
     pub tenant_id: String,
     pub session_id: String,
+    pub generation: u64,
     pub publish: PublishRequest,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct InboxLwtResponse {
+    pub code: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -76,6 +92,14 @@ pub struct InboxMaintenanceResponse {
     pub subscriptions: usize,
     pub offline_messages: usize,
     pub inflight_messages: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RetainMaintenanceResponse {
+    pub tenant_id: String,
+    pub scanned: usize,
+    pub removed: usize,
+    pub refreshed: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -94,6 +118,16 @@ pub struct ControlCommandFailBody {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ControlCommandPruneQuery {
     pub older_than_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RpcServiceLandscapeResponse {
+    pub service: String,
+    pub current_in_flight: usize,
+    pub overload_count: u64,
+    pub preferred_endpoints: Vec<String>,
+    pub server_group_tags: Vec<String>,
+    pub endpoint_snapshots: Vec<RpcEndpointSnapshot>,
 }
 
 pub(crate) async fn list_admin_audit<A, C, H>(
@@ -119,6 +153,91 @@ where
         entries.retain(|entry| entry.action.starts_with("shard_"));
     }
     Ok(Json(entries))
+}
+
+pub(crate) async fn list_rpc_services<A, C, H>(
+    Extension(rpc_governor): Extension<Option<Arc<RpcTrafficGovernor>>>,
+    State(_broker): State<Arc<BrokerRuntime<A, C, H>>>,
+) -> Result<Json<Vec<RpcServiceLoadSnapshot>>, ApiError>
+where
+    A: AuthProvider + 'static,
+    C: AclProvider + 'static,
+    H: EventHook + 'static,
+{
+    Ok(Json(
+        rpc_governor
+            .map(|governor| governor.snapshots())
+            .unwrap_or_default(),
+    ))
+}
+
+pub(crate) async fn get_rpc_service_rules<A, C, H>(
+    Extension(rpc_governor): Extension<Option<Arc<RpcTrafficGovernor>>>,
+    Path(service): Path<String>,
+    State(_broker): State<Arc<BrokerRuntime<A, C, H>>>,
+) -> Result<Json<Option<RpcServiceRulesSnapshot>>, ApiError>
+where
+    A: AuthProvider + 'static,
+    C: AclProvider + 'static,
+    H: EventHook + 'static,
+{
+    let Some(governor) = rpc_governor else {
+        return Ok(Json(None));
+    };
+    Ok(Json(
+        governor
+            .service_by_name(&service)
+            .map(|service| service.rules_snapshot()),
+    ))
+}
+
+pub(crate) async fn put_rpc_service_rules<A, C, H>(
+    Extension(rpc_governor): Extension<Option<Arc<RpcTrafficGovernor>>>,
+    Path(service): Path<String>,
+    State(_broker): State<Arc<BrokerRuntime<A, C, H>>>,
+    Json(rules): Json<RpcTrafficRules>,
+) -> Result<Json<Option<RpcServiceRulesSnapshot>>, ApiError>
+where
+    A: AuthProvider + 'static,
+    C: AclProvider + 'static,
+    H: EventHook + 'static,
+{
+    let Some(governor) = rpc_governor else {
+        return Ok(Json(None));
+    };
+    let Some(service_governor) = governor.service_by_name(&service) else {
+        return Ok(Json(None));
+    };
+    service_governor.set_runtime_rules(rules);
+    Ok(Json(Some(service_governor.rules_snapshot())))
+}
+
+pub(crate) async fn get_rpc_service_landscape<A, C, H>(
+    Extension(rpc_governor): Extension<Option<Arc<RpcTrafficGovernor>>>,
+    Path(service): Path<String>,
+    State(_broker): State<Arc<BrokerRuntime<A, C, H>>>,
+) -> Result<Json<Option<RpcServiceLandscapeResponse>>, ApiError>
+where
+    A: AuthProvider + 'static,
+    C: AclProvider + 'static,
+    H: EventHook + 'static,
+{
+    let Some(governor) = rpc_governor else {
+        return Ok(Json(None));
+    };
+    let Some(service_governor) = governor.service_by_name(&service) else {
+        return Ok(Json(None));
+    };
+    let snapshot = service_governor.snapshot();
+    let rules = service_governor.effective_rules();
+    Ok(Json(Some(RpcServiceLandscapeResponse {
+        service,
+        current_in_flight: snapshot.current_in_flight,
+        overload_count: snapshot.overload_count,
+        preferred_endpoints: rules.preferred_endpoints,
+        server_group_tags: rules.server_group_tags,
+        endpoint_snapshots: service_governor.endpoint_snapshots(),
+    })))
 }
 
 fn matches_control_command_query(
@@ -200,18 +319,35 @@ where
     let Some(registry) = range_routing else {
         return Ok(Json(None));
     };
-    let Some(mut record) = registry
+    let Some(record) = registry
         .resolve_control_command(&command_id)
         .await
         .map_err(ApiError::from)?
     else {
         return Ok(Json(None));
     };
-    record.execution_state = ControlCommandExecutionState::Issued;
-    record.reflection_state = ControlCommandReflectionState::Pending;
-    record.last_error = None;
+    let retried = ControlCommandRecord {
+        command_id: format!(
+            "retry:{}:{}:{}",
+            command_id,
+            current_time_ms(),
+            CONTROL_COMMAND_EVENT_SEQ.fetch_add(1, Ordering::SeqCst)
+        ),
+        command_type: format!("retry:{}", record.command_type),
+        target_range_or_shard: record.target_range_or_shard.clone(),
+        issued_at_ms: current_time_ms(),
+        issued_by: "http-retry".into(),
+        attempt_count: 0,
+        payload: BTreeMap::from([
+            ("retry_of".into(), record.command_id.clone()),
+            ("parent_command_id".into(), record.command_id.clone()),
+        ]),
+        execution_state: ControlCommandExecutionState::Issued,
+        reflection_state: ControlCommandReflectionState::Pending,
+        last_error: None,
+    };
     registry
-        .upsert_control_command(record.clone())
+        .upsert_control_command(retried.clone())
         .await
         .map_err(ApiError::from)?;
     broker.record_admin_audit(
@@ -219,7 +355,7 @@ where
         "control_commands",
         BTreeMap::from([("command_id".into(), command_id)]),
     );
-    Ok(Json(Some(record)))
+    Ok(Json(Some(retried)))
 }
 
 pub(crate) async fn fail_control_command<A, C, H>(
@@ -236,18 +372,32 @@ where
     let Some(registry) = range_routing else {
         return Ok(Json(None));
     };
-    let Some(mut record) = registry
+    let Some(record) = registry
         .resolve_control_command(&command_id)
         .await
         .map_err(ApiError::from)?
     else {
         return Ok(Json(None));
     };
-    record.execution_state = ControlCommandExecutionState::TerminalFailed;
-    record.reflection_state = ControlCommandReflectionState::Unreflected;
-    record.last_error = body.last_error.or_else(|| Some("manually marked terminal".into()));
+    let failed = ControlCommandRecord {
+        command_id: format!(
+            "fail:{}:{}:{}",
+            command_id,
+            current_time_ms(),
+            CONTROL_COMMAND_EVENT_SEQ.fetch_add(1, Ordering::SeqCst)
+        ),
+        command_type: format!("manual_fail:{}", record.command_type),
+        target_range_or_shard: record.target_range_or_shard.clone(),
+        issued_at_ms: current_time_ms(),
+        issued_by: "http-fail".into(),
+        attempt_count: 0,
+        payload: BTreeMap::from([("parent_command_id".into(), record.command_id.clone())]),
+        execution_state: ControlCommandExecutionState::TerminalFailed,
+        reflection_state: ControlCommandReflectionState::Unreflected,
+        last_error: body.last_error.or_else(|| Some("manually marked terminal".into())),
+    };
     registry
-        .upsert_control_command(record.clone())
+        .upsert_control_command(failed.clone())
         .await
         .map_err(ApiError::from)?;
     broker.record_admin_audit(
@@ -255,7 +405,7 @@ where
         "control_commands",
         BTreeMap::from([("command_id".into(), command_id)]),
     );
-    Ok(Json(Some(record)))
+    Ok(Json(Some(failed)))
 }
 
 pub(crate) async fn prune_control_commands<A, C, H>(
@@ -374,26 +524,69 @@ where
 pub(crate) async fn send_inbox_lwt<A, C, H>(
     State(broker): State<Arc<BrokerRuntime<A, C, H>>>,
     Json(body): Json<InboxSendLwtBody>,
-) -> Result<Json<PurgeReply>, ApiError>
+) -> Result<Json<InboxLwtResponse>, ApiError>
 where
     A: AuthProvider + 'static,
     C: AclProvider + 'static,
     H: EventHook + 'static,
 {
+    struct BrokerLwtSink<A, C, H> {
+        broker: Arc<BrokerRuntime<A, C, H>>,
+        session_id: String,
+    }
+    #[async_trait]
+    impl<A, C, H> DelayedLwtSink for BrokerLwtSink<A, C, H>
+    where
+        A: AuthProvider + 'static,
+        C: AclProvider + 'static,
+        H: EventHook + 'static,
+    {
+        async fn send_lwt(&self, publish: &DelayedLwtPublish) -> anyhow::Result<()> {
+            let _ = self
+                .broker
+                .publish_for_session(&self.session_id, publish.publish.clone())
+                .await?;
+            Ok(())
+        }
+    }
     broker
-        .publish(&body.session_id, body.publish)
+        .inbox
+        .register_delayed_lwt(
+            body.generation,
+            DelayedLwtPublish {
+                tenant_id: body.tenant_id.clone(),
+                session_id: body.session_id.clone(),
+                publish: body.publish.clone(),
+            },
+        )
         .await
         .map_err(ApiError::from)?;
-    counter!("greenmqtt_inbox_delayed_lwt_dispatch_total").increment(1);
+    let result = inbox_send_lwt(
+        broker.inbox.as_ref(),
+        &body.session_id,
+        body.generation,
+        &BrokerLwtSink {
+            broker: broker.clone(),
+            session_id: body.session_id.clone(),
+        },
+    )
+    .await
+    .map_err(ApiError::from)?;
+    counter!("greenmqtt_inbox_delayed_lwt_dispatch_total", "code" => format!("{result:?}"))
+        .increment(1);
     broker.record_admin_audit(
         "inbox_send_lwt",
         "inbox",
         BTreeMap::from([
             ("tenant_id".into(), body.tenant_id),
             ("session_id".into(), body.session_id),
+            ("code".into(), format!("{result:?}")),
         ]),
     );
-    Ok(Json(PurgeReply { removed: 1 }))
+    Ok(Json(InboxLwtResponse {
+        code: format!("{result:?}"),
+        message: format!("delayed lwt result: {result:?}"),
+    }))
 }
 
 pub(crate) async fn expire_inbox_tenant<A, C, H>(
@@ -501,13 +694,13 @@ where
 pub(crate) async fn expire_retain_tenant<A, C, H>(
     State(broker): State<Arc<BrokerRuntime<A, C, H>>>,
     Query(query): Query<TenantOnlyQuery>,
-) -> Result<Json<PurgeReply>, ApiError>
+) -> Result<Json<RetainMaintenanceResponse>, ApiError>
 where
     A: AuthProvider + 'static,
     C: AclProvider + 'static,
     H: EventHook + 'static,
 {
-    let removed = greenmqtt_retain::retain_expire_all(broker.retain.as_ref(), &query.tenant_id)
+    let result = greenmqtt_retain::retain_expire_all(broker.retain.as_ref(), &query.tenant_id)
         .await
         .map_err(ApiError::from)?;
     counter!("greenmqtt_retain_expire_sweep_total", "action" => "expire_all").increment(1);
@@ -515,39 +708,49 @@ where
         "retain_expire_all",
         "retain",
         BTreeMap::from([
-            ("tenant_id".into(), query.tenant_id),
-            ("removed".into(), removed.to_string()),
+            ("tenant_id".into(), result.tenant_id.clone()),
+            ("removed".into(), result.removed.to_string()),
         ]),
     );
-    Ok(Json(PurgeReply { removed }))
+    Ok(Json(RetainMaintenanceResponse {
+        tenant_id: result.tenant_id,
+        scanned: result.scanned,
+        removed: result.removed,
+        refreshed: result.refreshed,
+    }))
 }
 
 pub(crate) async fn preview_retain_tenant_gc<A, C, H>(
     State(broker): State<Arc<BrokerRuntime<A, C, H>>>,
     Query(query): Query<TenantOnlyQuery>,
-) -> Result<Json<PurgeReply>, ApiError>
+) -> Result<Json<RetainMaintenanceResponse>, ApiError>
 where
     A: AuthProvider + 'static,
     C: AclProvider + 'static,
     H: EventHook + 'static,
 {
-    let removed =
+    let result =
         greenmqtt_retain::retain_tenant_gc_preview(broker.retain.as_ref(), &query.tenant_id)
             .await
             .map_err(ApiError::from)?;
-    Ok(Json(PurgeReply { removed }))
+    Ok(Json(RetainMaintenanceResponse {
+        tenant_id: result.tenant_id,
+        scanned: result.scanned,
+        removed: result.removed,
+        refreshed: result.refreshed,
+    }))
 }
 
 pub(crate) async fn run_retain_tenant_gc<A, C, H>(
     State(broker): State<Arc<BrokerRuntime<A, C, H>>>,
     Query(query): Query<TenantOnlyQuery>,
-) -> Result<Json<PurgeReply>, ApiError>
+) -> Result<Json<RetainMaintenanceResponse>, ApiError>
 where
     A: AuthProvider + 'static,
     C: AclProvider + 'static,
     H: EventHook + 'static,
 {
-    let removed = greenmqtt_retain::retain_tenant_gc_run(broker.retain.as_ref(), &query.tenant_id)
+    let result = greenmqtt_retain::retain_tenant_gc_run(broker.retain.as_ref(), &query.tenant_id)
         .await
         .map_err(ApiError::from)?;
     counter!("greenmqtt_retain_expire_sweep_total", "action" => "tenant_gc").increment(1);
@@ -555,11 +758,17 @@ where
         "retain_tenant_gc",
         "retain",
         BTreeMap::from([
-            ("tenant_id".into(), query.tenant_id),
-            ("removed".into(), removed.to_string()),
+            ("tenant_id".into(), result.tenant_id.clone()),
+            ("removed".into(), result.removed.to_string()),
+            ("refreshed".into(), result.refreshed.to_string()),
         ]),
     );
-    Ok(Json(PurgeReply { removed }))
+    Ok(Json(RetainMaintenanceResponse {
+        tenant_id: result.tenant_id,
+        scanned: result.scanned,
+        removed: result.removed,
+        refreshed: result.refreshed,
+    }))
 }
 
 pub(crate) async fn purge_routes<A, C, H>(

@@ -1,9 +1,12 @@
 use greenmqtt_core::{InflightMessage, OfflineMessage, SessionId, Subscription};
 use std::collections::HashMap;
 
+use crate::RegisteredDelayedLwt;
+
 #[derive(Default)]
 pub(crate) struct InboxState {
     pub(crate) active_sessions: HashMap<String, bool>,
+    pub(crate) delayed_lwts: HashMap<String, RegisteredDelayedLwt>,
     pub(crate) subscriptions: HashMap<String, Vec<Subscription>>,
     pub(crate) subscriptions_by_session_topic: HashMap<(String, String), Vec<Subscription>>,
     pub(crate) subscriptions_by_tenant: HashMap<String, Vec<Subscription>>,

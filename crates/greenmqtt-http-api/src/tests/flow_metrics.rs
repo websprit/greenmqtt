@@ -121,6 +121,65 @@ async fn http_publish_and_drain_deliveries() {
 }
 
 #[tokio::test]
+async fn http_inbox_send_lwt_returns_typed_result_and_records_metrics_and_audit() {
+    let metrics = test_prometheus_handle();
+    let broker = broker();
+    let session = broker
+        .connect(ConnectRequest {
+            identity: ClientIdentity {
+                tenant_id: "demo".into(),
+                user_id: "alice".into(),
+                client_id: "lwt".into(),
+            },
+            node_id: 1,
+            kind: SessionKind::Persistent,
+            clean_start: true,
+            session_expiry_interval_secs: Some(60),
+        })
+        .await
+        .unwrap();
+    let app = HttpApi::router(broker.clone());
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/inbox/lwt")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&crate::admin::InboxSendLwtBody {
+                        tenant_id: "demo".into(),
+                        session_id: session.session.session_id.clone(),
+                        generation: 1,
+                        publish: PublishRequest {
+                            topic: "clients/lwt/status".into(),
+                            payload: b"bye".to_vec().into(),
+                            qos: 1,
+                            retain: false,
+                            properties: PublishProperties::default(),
+                        },
+                    })
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let reply: crate::admin::InboxLwtResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(reply.code, "NoDetach");
+
+    let audit = broker.list_admin_audit(None);
+    assert!(audit.iter().any(|entry| {
+        entry.action == "inbox_send_lwt"
+            && entry.details.get("code").map(String::as_str) == Some("NoDetach")
+    }));
+    let rendered = metrics.render();
+    assert!(rendered.contains("greenmqtt_inbox_delayed_lwt_dispatch_total"));
+    assert!(rendered.contains("code=\"NoDetach\""));
+}
+
+#[tokio::test]
 async fn http_publish_respects_topic_rewrite_hook() {
     let broker = Arc::new(BrokerRuntime::with_plugins(
         BrokerConfig {
@@ -531,8 +590,8 @@ async fn http_retain_gc_run_records_metrics_and_audit() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    let reply: PurgeReply = serde_json::from_slice(&body).unwrap();
-    assert_eq!(reply.removed, 1);
+    let reply: crate::admin::RetainMaintenanceResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(reply.refreshed, 1);
 
     let audit = broker.list_admin_audit(None);
     assert!(audit.iter().any(|entry| entry.action == "retain_tenant_gc"));
@@ -633,6 +692,91 @@ async fn http_metrics_supports_tenant_scoped_gauges() {
     assert!(text.contains("greenmqtt_tenant_route_bytes{tenant_id=\"demo\"} "));
     assert!(text.contains("greenmqtt_tenant_subscription_bytes{tenant_id=\"demo\"} "));
     assert!(text.contains("greenmqtt_tenant_retained_bytes{tenant_id=\"demo\"} "));
+}
+
+#[tokio::test]
+async fn http_rpc_governance_rules_and_landscape_are_runtime_configurable() {
+    let broker = broker();
+    let governor = Arc::new(greenmqtt_rpc::RpcTrafficGovernor::new(
+        greenmqtt_rpc::RpcTrafficGovernorConfig::default(),
+    ));
+    let app = HttpApi::router_with_rpc_governor(broker, Some(governor.clone()));
+
+    let response = app
+        .clone()
+        .oneshot(Request::get("/v1/rpc/services").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let services: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(services
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|service| service.get("service").and_then(|v| v.as_str()) == Some("dist")));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::put("/v1/rpc/services/dist/rules")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&greenmqtt_rpc::RpcTrafficRules {
+                        max_in_flight: 0,
+                        retry_after_ms: 321,
+                        tenant_prefix_limits: BTreeMap::from([("demo".into(), 1usize)]),
+                        preferred_endpoints: vec!["http://127.0.0.1:50051".into()],
+                        server_group_tags: vec!["edge".into()],
+                    })
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    governor
+        .service(greenmqtt_rpc::RpcServiceKind::Dist)
+        .note_endpoint_overload("http://127.0.0.1:50051", 321);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/v1/rpc/services/dist/rules")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let rules: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let rules = rules.as_object().unwrap();
+    assert_eq!(rules.get("source").and_then(|v| v.as_str()), Some("runtime"));
+    assert_eq!(
+        rules
+            .get("effective")
+            .and_then(|v| v.get("max_in_flight"))
+            .and_then(|v| v.as_u64()),
+        Some(0)
+    );
+
+    let response = app
+        .oneshot(
+            Request::get("/v1/rpc/services/dist/landscape")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let landscape: Option<crate::admin::RpcServiceLandscapeResponse> =
+        serde_json::from_slice(&body).unwrap();
+    let landscape = landscape.unwrap();
+    assert_eq!(landscape.service, "dist");
+    assert_eq!(landscape.preferred_endpoints, vec!["http://127.0.0.1:50051"]);
+    assert_eq!(landscape.server_group_tags, vec!["edge"]);
+    assert_eq!(landscape.endpoint_snapshots.len(), 1);
 }
 
 #[tokio::test]

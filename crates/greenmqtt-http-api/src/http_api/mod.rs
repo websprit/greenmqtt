@@ -8,6 +8,7 @@ use greenmqtt_broker::{BrokerRuntime, PeerRegistry};
 use greenmqtt_core::{ControlPlaneRegistry, Lifecycle, ShardControlRegistry};
 use greenmqtt_kv_server::ReplicaRuntime;
 use greenmqtt_plugin_api::{AclProvider, AuthProvider, EventHook};
+use greenmqtt_rpc::RpcTrafficGovernor;
 use metrics_exporter_prometheus::PrometheusHandle;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -19,6 +20,7 @@ pub struct HttpApi<A, C, H> {
     shards: Option<Arc<dyn ShardControlRegistry>>,
     range_routing: Option<Arc<dyn ControlPlaneRegistry>>,
     range_runtime: Option<Arc<ReplicaRuntime>>,
+    rpc_governor: Option<Arc<RpcTrafficGovernor>>,
     metrics: Option<PrometheusHandle>,
     bind: SocketAddr,
 }
@@ -36,6 +38,7 @@ where
             shards: None,
             range_routing: None,
             range_runtime: None,
+            rpc_governor: None,
             metrics: None,
             bind,
         }
@@ -52,6 +55,7 @@ where
             shards: None,
             range_routing: None,
             range_runtime: None,
+            rpc_governor: None,
             metrics: None,
             bind,
         }
@@ -71,6 +75,7 @@ where
             shards: Some(shards),
             range_routing: Some(range_routing),
             range_runtime: None,
+            rpc_governor: None,
             metrics: Some(metrics),
             bind,
         }
@@ -91,6 +96,7 @@ where
             shards: Some(shards),
             range_routing: Some(range_routing),
             range_runtime: Some(range_runtime),
+            rpc_governor: None,
             metrics: Some(metrics),
             bind,
         }
@@ -108,20 +114,26 @@ where
             shards: None,
             range_routing: None,
             range_runtime: None,
+            rpc_governor: None,
             metrics: Some(metrics),
             bind,
         }
     }
 
+    pub fn with_rpc_governor(mut self, governor: Arc<RpcTrafficGovernor>) -> Self {
+        self.rpc_governor = Some(governor);
+        self
+    }
+
     pub fn router(broker: Arc<BrokerRuntime<A, C, H>>) -> Router {
-        Self::router_with_peers_shards_metrics_and_ranges(broker, None, None, None, None, None)
+        Self::router_with_all(broker, None, None, None, None, None, None)
     }
 
     pub fn router_with_peers(
         broker: Arc<BrokerRuntime<A, C, H>>,
         peers: Option<Arc<dyn PeerRegistry>>,
     ) -> Router {
-        Self::router_with_peers_shards_metrics_and_ranges(broker, peers, None, None, None, None)
+        Self::router_with_all(broker, peers, None, None, None, None, None)
     }
 
     pub fn router_with_peers_and_metrics(
@@ -129,7 +141,14 @@ where
         peers: Option<Arc<dyn PeerRegistry>>,
         metrics: Option<PrometheusHandle>,
     ) -> Router {
-        Self::router_with_peers_shards_metrics_and_ranges(broker, peers, None, None, None, metrics)
+        Self::router_with_all(broker, peers, None, None, None, None, metrics)
+    }
+
+    pub fn router_with_rpc_governor(
+        broker: Arc<BrokerRuntime<A, C, H>>,
+        rpc_governor: Option<Arc<RpcTrafficGovernor>>,
+    ) -> Router {
+        Self::router_with_all(broker, None, None, None, None, rpc_governor, None)
     }
 
     pub fn router_with_peers_shards_and_metrics(
@@ -139,11 +158,12 @@ where
         range_routing: Option<Arc<dyn ControlPlaneRegistry>>,
         metrics: Option<PrometheusHandle>,
     ) -> Router {
-        Self::router_with_peers_shards_metrics_and_ranges(
+        Self::router_with_all(
             broker,
             peers,
             shards,
             range_routing,
+            None,
             None,
             metrics,
         )
@@ -155,6 +175,26 @@ where
         shards: Option<Arc<dyn ShardControlRegistry>>,
         range_routing: Option<Arc<dyn ControlPlaneRegistry>>,
         range_runtime: Option<Arc<ReplicaRuntime>>,
+        metrics: Option<PrometheusHandle>,
+    ) -> Router {
+        Self::router_with_all(
+            broker,
+            peers,
+            shards,
+            range_routing,
+            range_runtime,
+            None,
+            metrics,
+        )
+    }
+
+    fn router_with_all(
+        broker: Arc<BrokerRuntime<A, C, H>>,
+        peers: Option<Arc<dyn PeerRegistry>>,
+        shards: Option<Arc<dyn ShardControlRegistry>>,
+        range_routing: Option<Arc<dyn ControlPlaneRegistry>>,
+        range_runtime: Option<Arc<ReplicaRuntime>>,
+        rpc_governor: Option<Arc<RpcTrafficGovernor>>,
         metrics: Option<PrometheusHandle>,
     ) -> Router {
         Router::new()
@@ -209,6 +249,16 @@ where
             )
             .route("/v1/ranges/{range_id}/drain", post(super::range::drain_range))
             .route("/v1/audit", get(super::admin::list_admin_audit))
+            .route("/v1/rpc/services", get(super::admin::list_rpc_services))
+            .route(
+                "/v1/rpc/services/{service}/rules",
+                get(super::admin::get_rpc_service_rules)
+                    .put(super::admin::put_rpc_service_rules),
+            )
+            .route(
+                "/v1/rpc/services/{service}/landscape",
+                get(super::admin::get_rpc_service_landscape),
+            )
             .route(
                 "/v1/control-commands",
                 get(super::admin::list_control_commands)
@@ -335,6 +385,7 @@ where
             .layer(Extension(shards))
             .layer(Extension(range_routing))
             .layer(Extension(range_runtime))
+            .layer(Extension(rpc_governor))
             .layer(Extension(metrics))
             .with_state(broker)
     }
@@ -351,12 +402,13 @@ where
         let listener = tokio::net::TcpListener::bind(self.bind).await?;
         axum::serve(
             listener,
-            Self::router_with_peers_shards_metrics_and_ranges(
+            Self::router_with_all(
                 self.broker.clone(),
                 self.peers.clone(),
                 self.shards.clone(),
                 self.range_routing.clone(),
                 self.range_runtime.clone(),
+                self.rpc_governor.clone(),
                 self.metrics.clone(),
             ),
         )

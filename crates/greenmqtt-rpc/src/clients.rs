@@ -684,12 +684,17 @@ impl InboxGrpcClient {
             + snapshot.inflight_messages.len())
     }
 
-    pub async fn send_lwt(&self, publish: DelayedLwtPublish) -> anyhow::Result<()> {
+    pub async fn send_lwt(
+        &self,
+        generation: u64,
+        publish: DelayedLwtPublish,
+    ) -> anyhow::Result<InboxSendLwtReply> {
         let mut client = self.inner.lock().await;
-        client
+        Ok(client
             .send_lwt(InboxSendLwtRequest {
                 tenant_id: publish.tenant_id,
                 session_id: publish.session_id,
+                generation,
                 topic: publish.publish.topic,
                 payload: publish.publish.payload.to_vec(),
                 qos: publish.publish.qos as u32,
@@ -698,8 +703,8 @@ impl InboxGrpcClient {
                     &publish.publish.properties,
                 )),
             })
-            .await?;
-        Ok(())
+            .await?
+            .into_inner())
     }
 
     pub async fn expire_all(
@@ -1012,37 +1017,40 @@ impl RetainGrpcClient {
         Ok(source_checksum)
     }
 
-    pub async fn expire_all(&self, tenant_id: &str) -> anyhow::Result<usize> {
+    pub async fn expire_all(&self, tenant_id: &str) -> anyhow::Result<RetainMaintenanceReply> {
         let mut client = self.inner.lock().await;
-        let reply = client
+        Ok(client
             .expire_all(RetainExpireAllRequest {
                 tenant_id: tenant_id.to_string(),
             })
             .await?
-            .into_inner();
-        Ok(reply.count as usize)
+            .into_inner())
     }
 
-    pub async fn tenant_gc_preview(&self, tenant_id: &str) -> anyhow::Result<usize> {
+    pub async fn tenant_gc_preview(
+        &self,
+        tenant_id: &str,
+    ) -> anyhow::Result<RetainMaintenanceReply> {
         let mut client = self.inner.lock().await;
-        let reply = client
+        Ok(client
             .tenant_gc_preview(RetainTenantGcRequest {
                 tenant_id: tenant_id.to_string(),
             })
             .await?
-            .into_inner();
-        Ok(reply.count as usize)
+            .into_inner())
     }
 
-    pub async fn tenant_gc_run(&self, tenant_id: &str) -> anyhow::Result<usize> {
+    pub async fn tenant_gc_run(
+        &self,
+        tenant_id: &str,
+    ) -> anyhow::Result<RetainMaintenanceReply> {
         let mut client = self.inner.lock().await;
-        let reply = client
+        Ok(client
             .tenant_gc_run(RetainTenantGcRequest {
                 tenant_id: tenant_id.to_string(),
             })
             .await?
-            .into_inner();
-        Ok(reply.count as usize)
+            .into_inner())
     }
 }
 
@@ -1688,6 +1696,7 @@ impl RoutedRangeControlGrpcClient {
             metadata_endpoint,
             fallback_endpoint,
             Duration::from_millis(DEFAULT_RPC_RETRY_AFTER_MS),
+            None,
         )
         .await
     }
@@ -1696,12 +1705,14 @@ impl RoutedRangeControlGrpcClient {
         metadata_endpoint: impl Into<String>,
         fallback_endpoint: impl Into<String>,
         overload_backoff: Duration,
+        service_governor: Option<Arc<ServiceTrafficGovernor>>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             metadata: MetadataGrpcClient::connect(metadata_endpoint.into()).await?,
             fallback_endpoint: fallback_endpoint.into(),
             endpoint_backoff: Arc::new(Mutex::new(HashMap::new())),
             overload_backoff,
+            service_governor,
         })
     }
 
@@ -1839,6 +1850,9 @@ impl RoutedRangeControlGrpcClient {
             endpoint.to_string(),
             Instant::now() + Duration::from_millis(retry_after_ms),
         );
+        if let Some(governor) = &self.service_governor {
+            governor.note_endpoint_overload(endpoint, retry_after_ms);
+        }
     }
 
     pub async fn bootstrap_range(

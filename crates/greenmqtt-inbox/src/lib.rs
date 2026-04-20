@@ -6,9 +6,9 @@ use greenmqtt_core::{
 };
 use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter};
 use greenmqtt_kv_engine::KvMutation;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::task::JoinHandle;
 
@@ -16,6 +16,18 @@ use tokio::task::JoinHandle;
 pub trait InboxService: Send + Sync {
     async fn attach(&self, session_id: &SessionId) -> anyhow::Result<()>;
     async fn detach(&self, session_id: &SessionId) -> anyhow::Result<()>;
+    async fn register_delayed_lwt(
+        &self,
+        generation: u64,
+        publish: DelayedLwtPublish,
+    ) -> anyhow::Result<()>;
+    async fn clear_delayed_lwt(&self, session_id: &SessionId) -> anyhow::Result<()>;
+    async fn send_delayed_lwt(
+        &self,
+        session_id: &SessionId,
+        generation: u64,
+        sink: &dyn DelayedLwtSink,
+    ) -> anyhow::Result<InboxLwtResult>;
     async fn purge_session(&self, session_id: &SessionId) -> anyhow::Result<()>;
     async fn purge_session_subscriptions_only(
         &self,
@@ -403,6 +415,24 @@ pub struct DelayedLwtPublish {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredDelayedLwt {
+    pub generation: u64,
+    pub publish: DelayedLwtPublish,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboxLwtResult {
+    Ok,
+    NoInbox,
+    Conflict,
+    NoDetach,
+    NoLwt,
+    DistTryLater,
+    RetainTryLater,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InboxDelayedTask {
     ExpireSession { session_id: SessionId, now_ms: u64 },
     ExpireTenant { tenant_id: String, now_ms: u64 },
@@ -526,10 +556,23 @@ pub trait DelayedLwtSink: Send + Sync {
 }
 
 pub async fn inbox_send_lwt(
+    inbox: &dyn InboxService,
+    session_id: &SessionId,
+    generation: u64,
     sink: &dyn DelayedLwtSink,
-    publish: &DelayedLwtPublish,
-) -> anyhow::Result<()> {
-    sink.send_lwt(publish).await
+) -> anyhow::Result<InboxLwtResult> {
+    inbox.send_delayed_lwt(session_id, generation, sink).await
+}
+
+pub(crate) fn delayed_lwt_result_from_error(error: &anyhow::Error) -> InboxLwtResult {
+    let message = error.to_string().to_ascii_lowercase();
+    if message.contains("dist") && message.contains("try later") {
+        InboxLwtResult::DistTryLater
+    } else if message.contains("retain") && message.contains("try later") {
+        InboxLwtResult::RetainTryLater
+    } else {
+        InboxLwtResult::Error
+    }
 }
 
 pub async fn inbox_expire_all(
@@ -804,6 +847,8 @@ pub struct ReplicatedInboxHandle {
     router: Arc<dyn KvRangeRouter>,
     executor: Arc<dyn KvRangeExecutor>,
     next_seq: Arc<AtomicU64>,
+    active_sessions: Arc<RwLock<HashMap<String, bool>>>,
+    delayed_lwts: Arc<RwLock<HashMap<String, RegisteredDelayedLwt>>>,
 }
 
 impl ReplicatedInboxHandle {
@@ -812,6 +857,8 @@ impl ReplicatedInboxHandle {
             router,
             executor,
             next_seq: Arc::new(AtomicU64::new(0)),
+            active_sessions: Arc::new(RwLock::new(HashMap::new())),
+            delayed_lwts: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -1099,15 +1146,96 @@ pub fn inflight_tenant_scan_shard(tenant_id: &str) -> ServiceShardKey {
 
 #[async_trait]
 impl InboxService for ReplicatedInboxHandle {
-    async fn attach(&self, _session_id: &SessionId) -> anyhow::Result<()> {
+    async fn attach(&self, session_id: &SessionId) -> anyhow::Result<()> {
+        self.active_sessions
+            .write()
+            .expect("replicated inbox poisoned")
+            .insert(session_id.clone(), true);
         Ok(())
     }
 
-    async fn detach(&self, _session_id: &SessionId) -> anyhow::Result<()> {
+    async fn detach(&self, session_id: &SessionId) -> anyhow::Result<()> {
+        self.active_sessions
+            .write()
+            .expect("replicated inbox poisoned")
+            .insert(session_id.clone(), false);
         Ok(())
+    }
+
+    async fn register_delayed_lwt(
+        &self,
+        generation: u64,
+        publish: DelayedLwtPublish,
+    ) -> anyhow::Result<()> {
+        let session_id = publish.session_id.clone();
+        self.active_sessions
+            .write()
+            .expect("replicated inbox poisoned")
+            .entry(session_id.clone())
+            .or_insert(true);
+        self.delayed_lwts
+            .write()
+            .expect("replicated inbox poisoned")
+            .insert(session_id, RegisteredDelayedLwt { generation, publish });
+        Ok(())
+    }
+
+    async fn clear_delayed_lwt(&self, session_id: &SessionId) -> anyhow::Result<()> {
+        self.delayed_lwts
+            .write()
+            .expect("replicated inbox poisoned")
+            .remove(session_id);
+        Ok(())
+    }
+
+    async fn send_delayed_lwt(
+        &self,
+        session_id: &SessionId,
+        generation: u64,
+        sink: &dyn DelayedLwtSink,
+    ) -> anyhow::Result<InboxLwtResult> {
+        let attached = self
+            .active_sessions
+            .read()
+            .expect("replicated inbox poisoned")
+            .get(session_id)
+            .copied();
+        let registered = self
+            .delayed_lwts
+            .read()
+            .expect("replicated inbox poisoned")
+            .get(session_id)
+            .cloned();
+        let registered = match (attached, registered) {
+            (None, None) => return Ok(InboxLwtResult::NoInbox),
+            (_, None) => return Ok(InboxLwtResult::NoLwt),
+            (_, Some(registered)) if registered.generation != generation => {
+                return Ok(InboxLwtResult::Conflict)
+            }
+            (Some(true), Some(_)) => return Ok(InboxLwtResult::NoDetach),
+            (_, Some(registered)) => registered,
+        };
+        match sink.send_lwt(&registered.publish).await {
+            Ok(()) => {
+                self.delayed_lwts
+                    .write()
+                    .expect("replicated inbox poisoned")
+                    .remove(session_id);
+                Ok(InboxLwtResult::Ok)
+            }
+            Err(error) => Ok(delayed_lwt_result_from_error(&error)),
+        }
     }
 
     async fn purge_session(&self, session_id: &SessionId) -> anyhow::Result<()> {
+        self.active_sessions
+            .write()
+            .expect("replicated inbox poisoned")
+            .remove(session_id);
+        self.delayed_lwts
+            .write()
+            .expect("replicated inbox poisoned")
+            .remove(session_id);
         let subscriptions = self.list_subscriptions(session_id).await?;
         let offline = self.peek(session_id).await?;
         let inflight = self.fetch_inflight(session_id).await?;
