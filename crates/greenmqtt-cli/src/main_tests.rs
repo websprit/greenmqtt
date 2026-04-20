@@ -330,6 +330,7 @@ fn configured_services_can_run_under_global_replicated_state_mode() {
                 peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
                 assignment_registry: Some(registry),
                 range_host: Some(host),
+            range_runtime: None,
             }
             .serve(bind),
         );
@@ -503,6 +504,7 @@ fn broker_can_use_replicated_service_clients_under_global_state_mode() {
                 peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
                 assignment_registry: Some(registry),
                 range_host: Some(host),
+            range_runtime: None,
             }
             .serve(bind),
         );
@@ -687,6 +689,8 @@ fn configured_retain_service_survives_leader_failover() {
                 peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
                 assignment_registry: Some(registry.clone()),
                 range_host: None,
+            range_runtime: None,
+                range_runtime: None,
             }
             .serve(metadata_bind),
         );
@@ -724,6 +728,7 @@ fn configured_retain_service_survives_leader_failover() {
                 peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
                 assignment_registry: Some(registry.clone()),
                 range_host: Some(host_1),
+            range_runtime: None,
             }
             .serve(retain_bind_1),
         );
@@ -761,6 +766,7 @@ fn configured_retain_service_survives_leader_failover() {
                 peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
                 assignment_registry: Some(registry.clone()),
                 range_host: Some(host_2),
+            range_runtime: None,
             }
             .serve(retain_bind_2),
         );
@@ -973,6 +979,7 @@ fn broker_can_continue_after_retain_leader_move_under_replicated_state_mode() {
                 peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
                 assignment_registry: Some(registry.clone()),
                 range_host: None,
+            range_runtime: None,
             }
             .serve(metadata_bind),
         );
@@ -985,6 +992,7 @@ fn broker_can_continue_after_retain_leader_move_under_replicated_state_mode() {
                 peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
                 assignment_registry: Some(registry.clone()),
                 range_host: Some(stable_host),
+            range_runtime: None,
             }
             .serve(stable_bind),
         );
@@ -1022,6 +1030,7 @@ fn broker_can_continue_after_retain_leader_move_under_replicated_state_mode() {
                 peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
                 assignment_registry: Some(registry.clone()),
                 range_host: Some(retain_host_1),
+            range_runtime: None,
             }
             .serve(retain_bind_1),
         );
@@ -1059,6 +1068,7 @@ fn broker_can_continue_after_retain_leader_move_under_replicated_state_mode() {
                 peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
                 assignment_registry: Some(registry.clone()),
                 range_host: Some(retain_host_2),
+            range_runtime: None,
             }
             .serve(retain_bind_2),
         );

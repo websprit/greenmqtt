@@ -132,6 +132,70 @@ pub(crate) fn offline_message_matches(left: &OfflineMessage, right: &OfflineMess
         && left.from_session_id == right.from_session_id
 }
 
+pub(crate) fn remove_cached_offline_message(
+    state: &mut InboxState,
+    message: &OfflineMessage,
+) -> bool {
+    let mut removed = false;
+    let remove_session = if let Some(messages) = state.offline_messages.get_mut(&message.session_id) {
+        let before = messages.len();
+        messages.retain(|current| !offline_message_matches(current, message));
+        removed = messages.len() != before;
+        messages.is_empty()
+    } else {
+        false
+    };
+    if remove_session {
+        state.offline_messages.remove(&message.session_id);
+    }
+    let remove_tenant =
+        if let Some(messages) = state.offline_messages_by_tenant.get_mut(&message.tenant_id) {
+            messages.retain(|current| !offline_message_matches(current, message));
+            messages.is_empty()
+        } else {
+            false
+        };
+    if remove_tenant {
+        state.offline_messages_by_tenant.remove(&message.tenant_id);
+    }
+    if removed {
+        state.total_offline_messages = state.total_offline_messages.saturating_sub(1);
+    }
+    removed
+}
+
+pub(crate) fn remove_cached_inflight_message(
+    state: &mut InboxState,
+    message: &InflightMessage,
+) -> bool {
+    let mut removed = false;
+    let remove_session =
+        if let Some(messages) = state.inflight_messages.get_mut(&message.session_id) {
+            removed = messages.remove(&message.packet_id).is_some();
+            messages.is_empty()
+        } else {
+            false
+        };
+    if remove_session {
+        state.inflight_messages.remove(&message.session_id);
+    }
+    let remove_tenant = if let Some(messages) = state.inflight_messages_by_tenant.get_mut(&message.tenant_id) {
+        messages.retain(|current| {
+            !(current.session_id == message.session_id && current.packet_id == message.packet_id)
+        });
+        messages.is_empty()
+    } else {
+        false
+    };
+    if remove_tenant {
+        state.inflight_messages_by_tenant.remove(&message.tenant_id);
+    }
+    if removed {
+        state.total_inflight_messages = state.total_inflight_messages.saturating_sub(1);
+    }
+    removed
+}
+
 pub(crate) fn remove_cached_tenant_offline(state: &mut InboxState, tenant_id: &str) -> usize {
     let removed = state
         .offline_messages_by_tenant

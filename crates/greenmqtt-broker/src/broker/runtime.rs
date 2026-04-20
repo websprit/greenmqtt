@@ -1,5 +1,6 @@
 use super::admission::AdmissionController;
 use super::metrics::BrokerMetrics;
+use super::pressure::PressureLevel;
 use super::session_mgr::{load_admin_audit, now_millis, session_expired};
 use crate::*;
 use async_trait::async_trait;
@@ -105,6 +106,19 @@ where
 
     pub fn set_max_online_sessions(&mut self, limit: usize) {
         self.admission.set_max_online_sessions(limit);
+    }
+
+    pub fn set_connection_rate_limit(&mut self, limit_per_sec: usize) {
+        self.admission.set_connection_rate_limit(limit_per_sec);
+    }
+
+    pub(crate) fn allow_connection_attempt(&self) -> bool {
+        self.admission.allow_connection_attempt()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_connection_rate_window(&self) {
+        self.admission.reset_connection_rate_window();
     }
 
     pub(crate) fn connect_pressure_exceeded(&self) -> bool {
@@ -238,6 +252,10 @@ where
 
     pub fn memory_pressure_level(&self) -> u8 {
         self.admission.current_pressure_level() as u8
+    }
+
+    pub(crate) fn current_pressure_level(&self) -> PressureLevel {
+        self.admission.current_pressure_level()
     }
 
     #[allow(clippy::too_many_arguments)]

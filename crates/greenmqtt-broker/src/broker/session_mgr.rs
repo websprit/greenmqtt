@@ -14,6 +14,11 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{sleep, Duration};
 
+struct SessionConnectPlan {
+    session_present: bool,
+    session_id: SessionId,
+}
+
 impl<A, C, H> BrokerRuntime<A, C, H>
 where
     A: AuthProvider,
@@ -38,6 +43,58 @@ where
             "{}:{}:{}",
             identity.tenant_id, identity.user_id, identity.client_id
         )
+    }
+
+    async fn plan_session_connect(
+        &self,
+        request: &ConnectRequest,
+    ) -> anyhow::Result<SessionConnectPlan> {
+        let mut existing = self.sessiondict.lookup_identity(&request.identity).await?;
+        if let Some(record) = existing.as_ref() {
+            if request.clean_start || session_expired(record) {
+                self.purge_session_state(&record.session_id).await?;
+                existing = None;
+            }
+        }
+        let session_present = matches!(request.kind, SessionKind::Persistent)
+            && !request.clean_start
+            && existing.is_some();
+        let session_id = if matches!(request.kind, SessionKind::Persistent) && !request.clean_start
+        {
+            existing
+                .as_ref()
+                .map(|record| record.session_id.clone())
+                .unwrap_or_else(|| self.next_session_id(&request.identity))
+        } else {
+            self.next_session_id(&request.identity)
+        };
+        Ok(SessionConnectPlan {
+            session_present,
+            session_id,
+        })
+    }
+
+    async fn register_connected_session(
+        &self,
+        session: SessionRecord,
+    ) -> anyhow::Result<Option<SessionRecord>> {
+        self.sessiondict.register(session).await
+    }
+
+    async fn persist_disconnected_session(
+        &self,
+        state: &LocalSessionState,
+        expiry_override_secs: Option<u32>,
+    ) -> anyhow::Result<SessionRecord> {
+        let mut persisted = state.record.clone();
+        persisted.session_expiry_interval_secs = updated_session_expiry_interval(
+            persisted.session_expiry_interval_secs,
+            expiry_override_secs,
+        );
+        persisted.expires_at_ms =
+            session_expiration_deadline_ms(persisted.session_expiry_interval_secs);
+        self.sessiondict.register(persisted.clone()).await?;
+        Ok(persisted)
     }
 
     pub(crate) fn cancel_delayed_will_for_identity(&self, identity: &ClientIdentity) {
@@ -137,26 +194,10 @@ where
             .tenant_resources
             .reserve_connection(&request.identity.tenant_id)?;
         self.cancel_delayed_will_for_identity(&request.identity);
-
-        let mut existing = self.sessiondict.lookup_identity(&request.identity).await?;
-        if let Some(record) = existing.as_ref() {
-            if request.clean_start || session_expired(record) {
-                self.purge_session_state(&record.session_id).await?;
-                existing = None;
-            }
-        }
-        let session_present = matches!(request.kind, SessionKind::Persistent)
-            && !request.clean_start
-            && existing.is_some();
+        let connect_plan = self.plan_session_connect(&request).await?;
+        let session_present = connect_plan.session_present;
         let session = SessionRecord {
-            session_id: if matches!(request.kind, SessionKind::Persistent) && !request.clean_start {
-                existing
-                    .as_ref()
-                    .map(|record| record.session_id.clone())
-                    .unwrap_or_else(|| self.next_session_id(&request.identity))
-            } else {
-                self.next_session_id(&request.identity)
-            },
+            session_id: connect_plan.session_id,
             node_id: request.node_id,
             kind: request.kind.clone(),
             identity: request.identity.clone(),
@@ -168,7 +209,7 @@ where
             expires_at_ms: None,
         };
 
-        let replaced = self.sessiondict.register(session.clone()).await?;
+        let replaced = self.register_connected_session(session.clone()).await?;
         let mut carried_local_deliveries = Vec::new();
         if let Some(previous) = &replaced {
             let removed = self.local_sessions.remove(&previous.session_id);
@@ -385,14 +426,8 @@ where
                     })
                     .await?;
             }
-            let mut persisted = state.record.clone();
-            persisted.session_expiry_interval_secs = updated_session_expiry_interval(
-                persisted.session_expiry_interval_secs,
-                expiry_override_secs,
-            );
-            persisted.expires_at_ms =
-                session_expiration_deadline_ms(persisted.session_expiry_interval_secs);
-            self.sessiondict.register(persisted).await?;
+            self.persist_disconnected_session(&state, expiry_override_secs)
+                .await?;
         }
         if matches!(state.record.kind, SessionKind::Transient) {
             self.cleanup_transient_session(&state.record.session_id)

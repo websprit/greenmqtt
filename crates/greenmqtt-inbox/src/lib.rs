@@ -1,12 +1,16 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use greenmqtt_core::{
-    InflightMessage, OfflineMessage, ServiceShardKey, ServiceShardKind, SessionId, Subscription,
+    InflightMessage, InflightPhase, OfflineMessage, PublishProperties, PublishRequest, RangeBoundary,
+    ServiceShardKey, ServiceShardKind, SessionId, Subscription,
 };
 use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter};
 use greenmqtt_kv_engine::KvMutation;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::task::JoinHandle;
 
 #[async_trait]
 pub trait InboxService: Send + Sync {
@@ -306,6 +310,29 @@ pub trait InboxService: Send + Sync {
         }
         Ok(())
     }
+    async fn promote_inflight_release(
+        &self,
+        session_id: &SessionId,
+        packet_id: u16,
+    ) -> anyhow::Result<bool> {
+        let Some(mut message) = self
+            .fetch_inflight(session_id)
+            .await?
+            .into_iter()
+            .find(|message| message.packet_id == packet_id)
+        else {
+            return Ok(false);
+        };
+        if message.qos != 2 {
+            return Ok(false);
+        }
+        if message.phase == InflightPhase::Release {
+            return Ok(true);
+        }
+        message.phase = InflightPhase::Release;
+        self.stage_inflight(message).await?;
+        Ok(true)
+    }
     async fn ack_inflight(&self, session_id: &SessionId, packet_id: u16) -> anyhow::Result<()>;
     async fn ack_inflight_batch(
         &self,
@@ -330,6 +357,393 @@ pub trait InboxService: Send + Sync {
     async fn subscription_count(&self) -> anyhow::Result<usize>;
     async fn offline_count(&self) -> anyhow::Result<usize>;
     async fn inflight_count(&self) -> anyhow::Result<usize>;
+    async fn expire_messages(&self, now_ms: u64) -> anyhow::Result<InboxExpiryStats> {
+        let _ = now_ms;
+        Ok(InboxExpiryStats::default())
+    }
+    async fn expire_tenant_messages(
+        &self,
+        tenant_id: &str,
+        now_ms: u64,
+    ) -> anyhow::Result<InboxExpiryStats> {
+        let _ = tenant_id;
+        let _ = now_ms;
+        Ok(InboxExpiryStats::default())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InboxExpiryStats {
+    pub offline_messages: usize,
+    pub inflight_messages: usize,
+}
+
+impl InboxExpiryStats {
+    pub fn total(self) -> usize {
+        self.offline_messages + self.inflight_messages
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.total() == 0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelayedLwtPublish {
+    pub tenant_id: String,
+    pub session_id: SessionId,
+    pub publish: PublishRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InboxDelayedTask {
+    ExpireSession { session_id: SessionId, now_ms: u64 },
+    ExpireTenant { tenant_id: String, now_ms: u64 },
+    SendLwt(DelayedLwtPublish),
+}
+
+#[async_trait]
+pub trait InboxDelayedTaskHandler: Send + Sync {
+    async fn expire_session(
+        &self,
+        session_id: &SessionId,
+        now_ms: u64,
+    ) -> anyhow::Result<InboxExpiryStats>;
+    async fn expire_tenant(
+        &self,
+        tenant_id: &str,
+        now_ms: u64,
+    ) -> anyhow::Result<InboxExpiryStats>;
+    async fn send_lwt(&self, publish: &DelayedLwtPublish) -> anyhow::Result<()>;
+}
+
+#[derive(Clone)]
+pub struct InboxDelayTaskRunner {
+    handler: Arc<dyn InboxDelayedTaskHandler>,
+    max_retries: usize,
+    retry_delay: Duration,
+}
+
+impl InboxDelayTaskRunner {
+    pub fn new(
+        handler: Arc<dyn InboxDelayedTaskHandler>,
+        max_retries: usize,
+        retry_delay: Duration,
+    ) -> Self {
+        Self {
+            handler,
+            max_retries,
+            retry_delay,
+        }
+    }
+
+    async fn run_once(&self, task: &InboxDelayedTask) -> anyhow::Result<()> {
+        match task {
+            InboxDelayedTask::ExpireSession { session_id, now_ms } => {
+                let _ = self.handler.expire_session(session_id, *now_ms).await?;
+            }
+            InboxDelayedTask::ExpireTenant { tenant_id, now_ms } => {
+                let _ = self.handler.expire_tenant(tenant_id, *now_ms).await?;
+            }
+            InboxDelayedTask::SendLwt(publish) => {
+                self.handler.send_lwt(publish).await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn run_with_retry(&self, task: InboxDelayedTask) -> anyhow::Result<()> {
+        let mut attempts = 0usize;
+        loop {
+            match self.run_once(&task).await {
+                Ok(()) => return Ok(()),
+                Err(error) if attempts < self.max_retries => {
+                    attempts += 1;
+                    tokio::time::sleep(self.retry_delay).await;
+                    let _ = error;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    pub fn schedule(&self, task: InboxDelayedTask, delay: Duration) -> JoinHandle<anyhow::Result<()>> {
+        let runner = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            runner.run_with_retry(task).await
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct InboxServiceDelayHandler {
+    inbox: Arc<dyn InboxService>,
+    lwt_sink: Arc<dyn DelayedLwtSink>,
+}
+
+impl InboxServiceDelayHandler {
+    pub fn new(inbox: Arc<dyn InboxService>, lwt_sink: Arc<dyn DelayedLwtSink>) -> Self {
+        Self { inbox, lwt_sink }
+    }
+}
+
+#[async_trait]
+impl InboxDelayedTaskHandler for InboxServiceDelayHandler {
+    async fn expire_session(
+        &self,
+        session_id: &SessionId,
+        now_ms: u64,
+    ) -> anyhow::Result<InboxExpiryStats> {
+        let _ = session_id;
+        self.inbox.expire_messages(now_ms).await
+    }
+
+    async fn expire_tenant(
+        &self,
+        tenant_id: &str,
+        now_ms: u64,
+    ) -> anyhow::Result<InboxExpiryStats> {
+        self.inbox.expire_tenant_messages(tenant_id, now_ms).await
+    }
+
+    async fn send_lwt(&self, publish: &DelayedLwtPublish) -> anyhow::Result<()> {
+        self.lwt_sink.send_lwt(publish).await
+    }
+}
+
+#[async_trait]
+pub trait DelayedLwtSink: Send + Sync {
+    async fn send_lwt(&self, publish: &DelayedLwtPublish) -> anyhow::Result<()>;
+}
+
+#[derive(Clone)]
+pub struct TenantInboxGcRunner {
+    inbox: Arc<dyn InboxService>,
+}
+
+impl TenantInboxGcRunner {
+    pub fn new(inbox: Arc<dyn InboxService>) -> Self {
+        Self { inbox }
+    }
+
+    pub async fn run_tenant(&self, tenant_id: &str, now_ms: u64) -> anyhow::Result<InboxExpiryStats> {
+        self.inbox.expire_tenant_messages(tenant_id, now_ms).await
+    }
+
+    pub async fn run_all(&self, now_ms: u64) -> anyhow::Result<InboxExpiryStats> {
+        self.inbox.expire_messages(now_ms).await
+    }
+
+    pub fn spawn_tenant(
+        &self,
+        tenant_id: String,
+        interval: Duration,
+        now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
+    ) -> JoinHandle<anyhow::Result<()>> {
+        let runner = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                let _ = runner.run_tenant(&tenant_id, now_ms()).await?;
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxUnsubscribeSpec {
+    pub session_id: SessionId,
+    pub topic_filter: String,
+    pub shared_group: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxInflightCommit {
+    pub session_id: SessionId,
+    pub packet_ids: Vec<u16>,
+}
+
+#[derive(Clone)]
+pub struct InboxBatchScheduler {
+    inbox: Arc<dyn InboxService>,
+}
+
+impl InboxBatchScheduler {
+    pub fn new(inbox: Arc<dyn InboxService>) -> Self {
+        Self { inbox }
+    }
+
+    pub async fn attach_all(&self, session_ids: &[SessionId]) -> anyhow::Result<()> {
+        for session_id in session_ids {
+            self.inbox.attach(session_id).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn detach_all(&self, session_ids: &[SessionId]) -> anyhow::Result<()> {
+        for session_id in session_ids {
+            self.inbox.detach(session_id).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn fetch_all(
+        &self,
+        session_ids: &[SessionId],
+    ) -> anyhow::Result<BTreeMap<SessionId, Vec<OfflineMessage>>> {
+        let mut fetched = BTreeMap::new();
+        for session_id in session_ids {
+            fetched.insert(session_id.clone(), self.inbox.fetch(session_id).await?);
+        }
+        Ok(fetched)
+    }
+
+    pub async fn commit_all(&self, commits: &[InboxInflightCommit]) -> anyhow::Result<()> {
+        for commit in commits {
+            self.inbox
+                .ack_inflight_batch(&commit.session_id, &commit.packet_ids)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn insert_all(&self, messages: Vec<OfflineMessage>) -> anyhow::Result<()> {
+        self.inbox.enqueue_batch(messages).await
+    }
+
+    pub async fn subscribe_all(&self, subscriptions: Vec<Subscription>) -> anyhow::Result<()> {
+        for subscription in subscriptions {
+            self.inbox.subscribe(subscription).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn unsubscribe_all(&self, requests: &[InboxUnsubscribeSpec]) -> anyhow::Result<usize> {
+        let mut removed = 0usize;
+        for request in requests {
+            if self
+                .inbox
+                .unsubscribe_shared(
+                    &request.session_id,
+                    &request.topic_filter,
+                    request.shared_group.as_deref(),
+                )
+                .await?
+            {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxTenantStats {
+    pub tenant_id: String,
+    pub subscriptions: usize,
+    pub offline_messages: usize,
+    pub inflight_messages: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InboxBalanceAction {
+    SplitTenantRange { tenant_id: String },
+    ScaleTenantReplicas {
+        tenant_id: String,
+        voters: usize,
+        learners: usize,
+    },
+    RunTenantMaintenance { tenant_id: String },
+}
+
+pub trait InboxBalancePolicy: Send + Sync {
+    fn propose(&self, tenants: &[InboxTenantStats]) -> Vec<InboxBalanceAction>;
+}
+
+#[derive(Debug, Clone)]
+pub struct ThresholdInboxBalancePolicy {
+    pub max_subscriptions: usize,
+    pub max_offline_messages: usize,
+    pub max_inflight_messages: usize,
+    pub desired_voters: usize,
+    pub desired_learners: usize,
+}
+
+impl InboxBalancePolicy for ThresholdInboxBalancePolicy {
+    fn propose(&self, tenants: &[InboxTenantStats]) -> Vec<InboxBalanceAction> {
+        let mut actions = Vec::new();
+        for tenant in tenants {
+            let overloaded = tenant.subscriptions > self.max_subscriptions
+                || tenant.offline_messages > self.max_offline_messages
+                || tenant.inflight_messages > self.max_inflight_messages;
+            if overloaded {
+                actions.push(InboxBalanceAction::RunTenantMaintenance {
+                    tenant_id: tenant.tenant_id.clone(),
+                });
+                actions.push(InboxBalanceAction::SplitTenantRange {
+                    tenant_id: tenant.tenant_id.clone(),
+                });
+                actions.push(InboxBalanceAction::ScaleTenantReplicas {
+                    tenant_id: tenant.tenant_id.clone(),
+                    voters: self.desired_voters,
+                    learners: self.desired_learners,
+                });
+            }
+        }
+        actions
+    }
+}
+
+#[derive(Clone)]
+pub struct InboxMaintenanceWorker {
+    gc_runner: TenantInboxGcRunner,
+    delay_runner: InboxDelayTaskRunner,
+}
+
+impl InboxMaintenanceWorker {
+    pub fn new(gc_runner: TenantInboxGcRunner, delay_runner: InboxDelayTaskRunner) -> Self {
+        Self {
+            gc_runner,
+            delay_runner,
+        }
+    }
+
+    pub async fn run_tenant_gc(
+        &self,
+        tenant_id: &str,
+        now_ms: u64,
+    ) -> anyhow::Result<InboxExpiryStats> {
+        self.gc_runner.run_tenant(tenant_id, now_ms).await
+    }
+
+    pub fn schedule_tenant_gc(
+        &self,
+        tenant_id: String,
+        interval: Duration,
+        now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
+    ) -> JoinHandle<anyhow::Result<()>> {
+        self.gc_runner.spawn_tenant(tenant_id, interval, now_ms)
+    }
+
+    pub fn schedule_delayed_task(
+        &self,
+        task: InboxDelayedTask,
+        delay: Duration,
+    ) -> JoinHandle<anyhow::Result<()>> {
+        self.delay_runner.schedule(task, delay)
+    }
+}
+
+fn publish_properties_expired_at(properties: &PublishProperties, now_ms: u64) -> bool {
+    let Some(expiry_secs) = properties.message_expiry_interval_secs else {
+        return false;
+    };
+    let Some(stored_at_ms) = properties.stored_at_ms else {
+        return false;
+    };
+    now_ms.saturating_sub(stored_at_ms) >= u64::from(expiry_secs) * 1000
 }
 
 #[derive(Clone)]
@@ -346,6 +760,57 @@ impl ReplicatedInboxHandle {
             executor,
             next_seq: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    async fn remove_offline_messages(
+        &self,
+        messages: &[OfflineMessage],
+    ) -> anyhow::Result<usize> {
+        let mut removed = 0usize;
+        for message in messages {
+            let range_id = self.inbox_range_id_for_tenant(&message.tenant_id).await?;
+            let entries = self.executor.scan(&range_id, None, usize::MAX).await?;
+            let mut removals = Vec::new();
+            for (key, value) in entries {
+                if !key.starts_with(OFFLINE_KEY_PREFIX) {
+                    continue;
+                }
+                let candidate = decode_offline(&value)?;
+                if candidate.session_id == message.session_id
+                    && candidate.topic == message.topic
+                    && candidate.from_session_id == message.from_session_id
+                    && candidate.payload == message.payload
+                    && candidate.properties == message.properties
+                {
+                    removals.push(KvMutation { key, value: None });
+                }
+            }
+            if !removals.is_empty() {
+                removed += removals.len();
+                self.executor.apply(&range_id, removals).await?;
+            }
+        }
+        Ok(removed)
+    }
+
+    async fn remove_inflight_messages(
+        &self,
+        messages: &[InflightMessage],
+    ) -> anyhow::Result<usize> {
+        let mut removed = 0usize;
+        let mut grouped: BTreeMap<String, Vec<KvMutation>> = BTreeMap::new();
+        for message in messages {
+            let range_id = self.inflight_range_id_for_tenant(&message.tenant_id).await?;
+            grouped.entry(range_id).or_default().push(KvMutation {
+                key: inflight_key(&message.session_id, message.packet_id),
+                value: None,
+            });
+            removed += 1;
+        }
+        for (range_id, removals) in grouped {
+            self.executor.apply(&range_id, removals).await?;
+        }
+        Ok(removed)
     }
 
     async fn inbox_range_id_for_tenant(&self, tenant_id: &str) -> anyhow::Result<String> {
@@ -379,6 +844,42 @@ impl ReplicatedInboxHandle {
             entries.extend(self.executor.scan(&descriptor.id, None, usize::MAX).await?);
         }
         Ok(entries)
+    }
+
+    async fn scan_kind_prefix(
+        &self,
+        kind: ServiceShardKind,
+        prefix: &[u8],
+    ) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
+        let mut entries = Vec::new();
+        let boundary = prefix_boundary(prefix);
+        for descriptor in self.router.list().await? {
+            if descriptor.shard.kind != kind {
+                continue;
+            }
+            entries.extend(
+                self.executor
+                    .scan(&descriptor.id, Some(boundary.clone()), usize::MAX)
+                    .await?,
+            );
+        }
+        Ok(entries)
+    }
+
+    async fn get_from_kind_ranges(
+        &self,
+        kind: ServiceShardKind,
+        key: &[u8],
+    ) -> anyhow::Result<Option<Bytes>> {
+        for descriptor in self.router.list().await? {
+            if descriptor.shard.kind != kind {
+                continue;
+            }
+            if let Some(value) = self.executor.get(&descriptor.id, key).await? {
+                return Ok(Some(value));
+            }
+        }
+        Ok(None)
     }
 
     async fn next_offline_seq(&self) -> anyhow::Result<u64> {
@@ -450,6 +951,46 @@ fn inflight_key(session_id: &SessionId, packet_id: u16) -> Bytes {
     key.push(0);
     key.extend_from_slice(&packet_id.to_be_bytes());
     Bytes::from(key)
+}
+
+fn subscription_session_prefix(session_id: &SessionId) -> Bytes {
+    let mut key = Vec::with_capacity(SUBSCRIPTION_KEY_PREFIX.len() + session_id.len() + 1);
+    key.extend_from_slice(SUBSCRIPTION_KEY_PREFIX);
+    key.extend_from_slice(session_id.as_bytes());
+    key.push(0);
+    Bytes::from(key)
+}
+
+fn offline_session_prefix(session_id: &SessionId) -> Bytes {
+    let mut key = Vec::with_capacity(OFFLINE_KEY_PREFIX.len() + session_id.len() + 1);
+    key.extend_from_slice(OFFLINE_KEY_PREFIX);
+    key.extend_from_slice(session_id.as_bytes());
+    key.push(0);
+    Bytes::from(key)
+}
+
+fn inflight_session_prefix(session_id: &SessionId) -> Bytes {
+    let mut key = Vec::with_capacity(INFLIGHT_KEY_PREFIX.len() + session_id.len() + 1);
+    key.extend_from_slice(INFLIGHT_KEY_PREFIX);
+    key.extend_from_slice(session_id.as_bytes());
+    key.push(0);
+    Bytes::from(key)
+}
+
+fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    for index in (0..end.len()).rev() {
+        if end[index] != u8::MAX {
+            end[index] = end[index].saturating_add(1);
+            end.truncate(index + 1);
+            return Some(end);
+        }
+    }
+    None
+}
+
+fn prefix_boundary(prefix: &[u8]) -> RangeBoundary {
+    RangeBoundary::new(Some(prefix.to_vec()), prefix_upper_bound(prefix))
 }
 
 fn encode_subscription(subscription: &Subscription) -> anyhow::Result<Bytes> {
@@ -631,6 +1172,20 @@ impl InboxService for ReplicatedInboxHandle {
         Ok(true)
     }
 
+    async fn lookup_subscription(
+        &self,
+        session_id: &SessionId,
+        topic_filter: &str,
+        shared_group: Option<&str>,
+    ) -> anyhow::Result<Option<Subscription>> {
+        let key = subscription_key(session_id, topic_filter, shared_group);
+        Ok(self
+            .get_from_kind_ranges(ServiceShardKind::Inbox, &key)
+            .await?
+            .map(|value| decode_subscription(&value))
+            .transpose()?)
+    }
+
     async fn enqueue(&self, message: OfflineMessage) -> anyhow::Result<()> {
         let range_id = self.inbox_range_id_for_tenant(&message.tenant_id).await?;
         let seq = self.next_offline_seq().await?;
@@ -650,7 +1205,10 @@ impl InboxService for ReplicatedInboxHandle {
         session_id: &SessionId,
     ) -> anyhow::Result<Vec<Subscription>> {
         let mut subscriptions = Vec::new();
-        for (_, value) in self.scan_inbox_kind(ServiceShardKind::Inbox).await? {
+        for (_, value) in self
+            .scan_kind_prefix(ServiceShardKind::Inbox, &subscription_session_prefix(session_id))
+            .await?
+        {
             if let Ok(subscription) = decode_subscription(&value) {
                 if subscription.session_id == *session_id {
                     subscriptions.push(subscription);
@@ -683,7 +1241,10 @@ impl InboxService for ReplicatedInboxHandle {
 
     async fn peek(&self, session_id: &SessionId) -> anyhow::Result<Vec<OfflineMessage>> {
         let mut messages = Vec::new();
-        for (_, value) in self.scan_inbox_kind(ServiceShardKind::Inbox).await? {
+        for (_, value) in self
+            .scan_kind_prefix(ServiceShardKind::Inbox, &offline_session_prefix(session_id))
+            .await?
+        {
             if let Ok(message) = decode_offline(&value) {
                 if message.session_id == *session_id {
                     messages.push(message);
@@ -710,7 +1271,14 @@ impl InboxService for ReplicatedInboxHandle {
         }
         for message in &messages {
             let range_id = self.inbox_range_id_for_tenant(&message.tenant_id).await?;
-            let entries = self.executor.scan(&range_id, None, usize::MAX).await?;
+            let entries = self
+                .executor
+                .scan(
+                    &range_id,
+                    Some(prefix_boundary(&offline_session_prefix(session_id))),
+                    usize::MAX,
+                )
+                .await?;
             let mut removals = Vec::new();
             for (key, value) in entries {
                 if !key.starts_with(OFFLINE_KEY_PREFIX) {
@@ -771,7 +1339,10 @@ impl InboxService for ReplicatedInboxHandle {
 
     async fn fetch_inflight(&self, session_id: &SessionId) -> anyhow::Result<Vec<InflightMessage>> {
         let mut messages = Vec::new();
-        for (_, value) in self.scan_inbox_kind(ServiceShardKind::Inflight).await? {
+        for (_, value) in self
+            .scan_kind_prefix(ServiceShardKind::Inflight, &inflight_session_prefix(session_id))
+            .await?
+        {
             if let Ok(message) = decode_inflight(&value) {
                 if message.session_id == *session_id {
                     messages.push(message);
@@ -808,6 +1379,48 @@ impl InboxService for ReplicatedInboxHandle {
 
     async fn inflight_count(&self) -> anyhow::Result<usize> {
         Ok(self.list_all_inflight().await?.len())
+    }
+
+    async fn expire_messages(&self, now_ms: u64) -> anyhow::Result<InboxExpiryStats> {
+        let expired_offline = self
+            .list_all_offline()
+            .await?
+            .into_iter()
+            .filter(|message| publish_properties_expired_at(&message.properties, now_ms))
+            .collect::<Vec<_>>();
+        let expired_inflight = self
+            .list_all_inflight()
+            .await?
+            .into_iter()
+            .filter(|message| publish_properties_expired_at(&message.properties, now_ms))
+            .collect::<Vec<_>>();
+        Ok(InboxExpiryStats {
+            offline_messages: self.remove_offline_messages(&expired_offline).await?,
+            inflight_messages: self.remove_inflight_messages(&expired_inflight).await?,
+        })
+    }
+
+    async fn expire_tenant_messages(
+        &self,
+        tenant_id: &str,
+        now_ms: u64,
+    ) -> anyhow::Result<InboxExpiryStats> {
+        let expired_offline = self
+            .list_tenant_offline(tenant_id)
+            .await?
+            .into_iter()
+            .filter(|message| publish_properties_expired_at(&message.properties, now_ms))
+            .collect::<Vec<_>>();
+        let expired_inflight = self
+            .list_tenant_inflight(tenant_id)
+            .await?
+            .into_iter()
+            .filter(|message| publish_properties_expired_at(&message.properties, now_ms))
+            .collect::<Vec<_>>();
+        Ok(InboxExpiryStats {
+            offline_messages: self.remove_offline_messages(&expired_offline).await?,
+            inflight_messages: self.remove_inflight_messages(&expired_inflight).await?,
+        })
     }
 }
 

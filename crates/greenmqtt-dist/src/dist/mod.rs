@@ -13,17 +13,90 @@ pub(crate) use handle::{
     tenant_filter_shared_identity, TenantRoutes,
 };
 pub use persistent::PersistentDistHandle;
+use greenmqtt_core::RangeBoundary;
+use std::collections::HashMap;
+use std::sync::RwLock;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::task::JoinHandle;
 
 #[derive(Clone)]
 pub struct ReplicatedDistHandle {
     router: Arc<dyn KvRangeRouter>,
     executor: Arc<dyn KvRangeExecutor>,
+    tenant_wildcard_cache: Arc<RwLock<HashMap<String, TenantRoutes>>>,
 }
 
 impl ReplicatedDistHandle {
     pub fn new(router: Arc<dyn KvRangeRouter>, executor: Arc<dyn KvRangeExecutor>) -> Self {
-        Self { router, executor }
+        Self {
+            router,
+            executor,
+            tenant_wildcard_cache: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    async fn tenant_ranges(
+        &self,
+        tenant_id: &str,
+    ) -> anyhow::Result<Vec<greenmqtt_kv_client::RangeRoute>> {
+        self.router.route_shard(&dist_tenant_shard(tenant_id)).await
+    }
+
+    async fn scan_tenant_prefix(
+        &self,
+        tenant_id: &str,
+        prefix: &[u8],
+    ) -> anyhow::Result<Vec<RouteRecord>> {
+        let boundary = prefix_boundary(prefix);
+        let mut routes = Vec::new();
+        for descriptor in self.tenant_ranges(tenant_id).await? {
+            for (_, value) in self
+                .executor
+                .scan(&descriptor.descriptor.id, Some(boundary.clone()), usize::MAX)
+                .await?
+            {
+                routes.push(decode_route_record(&value)?);
+            }
+        }
+        Ok(routes)
+    }
+
+    fn invalidate_tenant_cache(&self, tenant_id: &str) {
+        self.tenant_wildcard_cache
+            .write()
+            .expect("dist cache poisoned")
+            .remove(tenant_id);
+    }
+
+    pub async fn warm_tenant_cache(&self, tenant_id: &str) -> anyhow::Result<usize> {
+        self.invalidate_tenant_cache(tenant_id);
+        let cache = self.cached_wildcard_routes(tenant_id).await?;
+        Ok(cache.wildcards.len())
+    }
+
+    async fn cached_wildcard_routes(&self, tenant_id: &str) -> anyhow::Result<TenantRoutes> {
+        if let Some(routes) = self
+            .tenant_wildcard_cache
+            .read()
+            .expect("dist cache poisoned")
+            .get(tenant_id)
+            .cloned()
+        {
+            return Ok(routes);
+        }
+        let wildcard = self
+            .list_routes(Some(tenant_id))
+            .await?
+            .into_iter()
+            .filter(|route| route.topic_filter.contains('#') || route.topic_filter.contains('+'))
+            .collect::<Vec<_>>();
+        let routes = tenant_routes_from_vec(wildcard);
+        self.tenant_wildcard_cache
+            .write()
+            .expect("dist cache poisoned")
+            .insert(tenant_id.to_string(), routes.clone());
+        Ok(routes)
     }
 }
 
@@ -48,6 +121,61 @@ fn encode_route_record(route: &RouteRecord) -> anyhow::Result<Bytes> {
 
 fn decode_route_record(value: &[u8]) -> anyhow::Result<RouteRecord> {
     Ok(bincode::deserialize(value)?)
+}
+
+const EXACT_INDEX_TAG: &[u8] = b"\0\xffexact\0";
+
+fn exact_index_key(route: &RouteRecord) -> Bytes {
+    let mut key = Vec::with_capacity(
+        route.topic_filter.len()
+            + EXACT_INDEX_TAG.len()
+            + route.session_id.len()
+            + route.shared_group.as_deref().unwrap_or_default().len()
+            + 2,
+    );
+    key.extend_from_slice(route.topic_filter.as_bytes());
+    key.extend_from_slice(EXACT_INDEX_TAG);
+    key.extend_from_slice(route.session_id.as_bytes());
+    key.push(0);
+    key.extend_from_slice(route.shared_group.as_deref().unwrap_or_default().as_bytes());
+    Bytes::from(key)
+}
+
+fn exact_index_prefix(topic: &str) -> Bytes {
+    let mut key = Vec::with_capacity(topic.len() + EXACT_INDEX_TAG.len());
+    key.extend_from_slice(topic.as_bytes());
+    key.extend_from_slice(EXACT_INDEX_TAG);
+    Bytes::from(key)
+}
+
+fn route_mutations(route: &RouteRecord, value: Option<Bytes>) -> anyhow::Result<Vec<greenmqtt_kv_engine::KvMutation>> {
+    let mut mutations = vec![greenmqtt_kv_engine::KvMutation {
+        key: route_record_key(route),
+        value: value.clone(),
+    }];
+    if !route.topic_filter.contains('#') && !route.topic_filter.contains('+') {
+        mutations.push(greenmqtt_kv_engine::KvMutation {
+            key: exact_index_key(route),
+            value,
+        });
+    }
+    Ok(mutations)
+}
+
+fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    for index in (0..end.len()).rev() {
+        if end[index] != u8::MAX {
+            end[index] = end[index].saturating_add(1);
+            end.truncate(index + 1);
+            return Some(end);
+        }
+    }
+    None
+}
+
+fn prefix_boundary(prefix: &[u8]) -> RangeBoundary {
+    RangeBoundary::new(Some(prefix.to_vec()), prefix_upper_bound(prefix))
 }
 
 #[async_trait]
@@ -292,6 +420,133 @@ pub trait DistRouter: Send + Sync {
 }
 
 #[async_trait]
+pub trait DistDeliverySink: Send + Sync {
+    async fn deliver(
+        &self,
+        tenant_id: &str,
+        topic: &TopicName,
+        routes: &[RouteRecord],
+    ) -> anyhow::Result<()>;
+}
+
+#[derive(Clone)]
+pub struct DistFanoutWorker {
+    router: Arc<dyn DistRouter>,
+    sink: Arc<dyn DistDeliverySink>,
+}
+
+impl DistFanoutWorker {
+    pub fn new(router: Arc<dyn DistRouter>, sink: Arc<dyn DistDeliverySink>) -> Self {
+        Self { router, sink }
+    }
+
+    pub async fn fanout(&self, tenant_id: &str, topic: &TopicName) -> anyhow::Result<usize> {
+        let routes = self.router.match_topic(tenant_id, topic).await?;
+        self.sink.deliver(tenant_id, topic, &routes).await?;
+        Ok(routes.len())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DistTenantStats {
+    pub tenant_id: String,
+    pub total_routes: usize,
+    pub wildcard_routes: usize,
+    pub shared_routes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DistBalanceAction {
+    SplitTenantRange { tenant_id: String },
+    ScaleTenantReplicas {
+        tenant_id: String,
+        voters: usize,
+        learners: usize,
+    },
+    RunTenantCleanup { tenant_id: String },
+}
+
+pub trait DistBalancePolicy: Send + Sync {
+    fn propose(&self, tenants: &[DistTenantStats]) -> Vec<DistBalanceAction>;
+}
+
+#[derive(Debug, Clone)]
+pub struct ThresholdDistBalancePolicy {
+    pub max_total_routes: usize,
+    pub max_wildcard_routes: usize,
+    pub max_shared_routes: usize,
+    pub desired_voters: usize,
+    pub desired_learners: usize,
+}
+
+impl DistBalancePolicy for ThresholdDistBalancePolicy {
+    fn propose(&self, tenants: &[DistTenantStats]) -> Vec<DistBalanceAction> {
+        let mut actions = Vec::new();
+        for tenant in tenants {
+            let overloaded = tenant.total_routes > self.max_total_routes
+                || tenant.wildcard_routes > self.max_wildcard_routes
+                || tenant.shared_routes > self.max_shared_routes;
+            if overloaded {
+                actions.push(DistBalanceAction::RunTenantCleanup {
+                    tenant_id: tenant.tenant_id.clone(),
+                });
+                actions.push(DistBalanceAction::SplitTenantRange {
+                    tenant_id: tenant.tenant_id.clone(),
+                });
+                actions.push(DistBalanceAction::ScaleTenantReplicas {
+                    tenant_id: tenant.tenant_id.clone(),
+                    voters: self.desired_voters,
+                    learners: self.desired_learners,
+                });
+            }
+        }
+        actions
+    }
+}
+
+#[async_trait]
+pub trait DistMaintenance: Send + Sync {
+    async fn refresh_tenant(&self, tenant_id: &str) -> anyhow::Result<usize>;
+}
+
+#[async_trait]
+impl DistMaintenance for ReplicatedDistHandle {
+    async fn refresh_tenant(&self, tenant_id: &str) -> anyhow::Result<usize> {
+        self.warm_tenant_cache(tenant_id).await
+    }
+}
+
+#[derive(Clone)]
+pub struct DistMaintenanceWorker {
+    maintenance: Arc<dyn DistMaintenance>,
+}
+
+impl DistMaintenanceWorker {
+    pub fn new(maintenance: Arc<dyn DistMaintenance>) -> Self {
+        Self { maintenance }
+    }
+
+    pub async fn refresh_tenant(&self, tenant_id: &str) -> anyhow::Result<usize> {
+        self.maintenance.refresh_tenant(tenant_id).await
+    }
+
+    pub fn spawn_tenant_refresh(
+        &self,
+        tenant_id: String,
+        interval: Duration,
+    ) -> JoinHandle<anyhow::Result<()>> {
+        let worker = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                let _ = worker.refresh_tenant(&tenant_id).await?;
+            }
+        })
+    }
+}
+
+#[async_trait]
 impl DistRouter for ReplicatedDistHandle {
     async fn add_route(&self, route: RouteRecord) -> anyhow::Result<()> {
         let shard = dist_tenant_shard(&route.tenant_id);
@@ -302,13 +557,11 @@ impl DistRouter for ReplicatedDistHandle {
             .ok_or_else(|| {
                 anyhow::anyhow!("no dist range available for tenant {}", route.tenant_id)
             })?;
+        self.invalidate_tenant_cache(&route.tenant_id);
         self.executor
             .apply(
                 &range.descriptor.id,
-                vec![greenmqtt_kv_engine::KvMutation {
-                    key: route_record_key(&route),
-                    value: Some(encode_route_record(&route)?),
-                }],
+                route_mutations(&route, Some(encode_route_record(&route)?))?,
             )
             .await
     }
@@ -322,14 +575,9 @@ impl DistRouter for ReplicatedDistHandle {
             .ok_or_else(|| {
                 anyhow::anyhow!("no dist range available for tenant {}", route.tenant_id)
             })?;
+        self.invalidate_tenant_cache(&route.tenant_id);
         self.executor
-            .apply(
-                &range.descriptor.id,
-                vec![greenmqtt_kv_engine::KvMutation {
-                    key: route_record_key(route),
-                    value: None,
-                }],
-            )
+            .apply(&range.descriptor.id, route_mutations(route, None)?)
             .await
     }
 
@@ -355,9 +603,12 @@ impl DistRouter for ReplicatedDistHandle {
         tenant_id: &str,
         topic: &TopicName,
     ) -> anyhow::Result<Vec<RouteRecord>> {
-        let routes = self.list_routes(Some(tenant_id)).await?;
-        let cache = tenant_routes_from_vec(routes);
-        Ok(crate::trie::select_routes(&cache, topic))
+        let mut routes = self
+            .scan_tenant_prefix(tenant_id, &exact_index_prefix(topic))
+            .await?;
+        let wildcard = self.cached_wildcard_routes(tenant_id).await?;
+        routes.extend(crate::trie::select_routes(&wildcard, topic));
+        Ok(routes)
     }
 
     async fn list_routes(&self, tenant_id: Option<&str>) -> anyhow::Result<Vec<RouteRecord>> {
@@ -385,6 +636,9 @@ impl DistRouter for ReplicatedDistHandle {
                 .scan(&descriptor.descriptor.id, None, usize::MAX)
                 .await?
             {
+                if value.is_empty() {
+                    continue;
+                }
                 let route = decode_route_record(&value)?;
                 if tenant_id
                     .map(|tenant_id| route.tenant_id == tenant_id)
@@ -400,6 +654,12 @@ impl DistRouter for ReplicatedDistHandle {
                 .then(left.topic_filter.cmp(&right.topic_filter))
                 .then(left.session_id.cmp(&right.session_id))
                 .then(left.shared_group.cmp(&right.shared_group))
+        });
+        routes.dedup_by(|left, right| {
+            left.tenant_id == right.tenant_id
+                && left.topic_filter == right.topic_filter
+                && left.session_id == right.session_id
+                && left.shared_group == right.shared_group
         });
         Ok(routes)
     }

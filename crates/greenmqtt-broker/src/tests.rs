@@ -4473,6 +4473,18 @@ async fn connection_shaping_and_slowdown_choose_larger_delay() {
 }
 
 #[tokio::test]
+async fn connection_rate_limit_rejects_after_threshold_within_same_window() {
+    let mut broker = test_broker();
+    broker.set_connection_rate_limit(1);
+
+    assert!(broker.allow_connection_attempt());
+    assert!(!broker.allow_connection_attempt());
+
+    broker.reset_connection_rate_window();
+    assert!(broker.allow_connection_attempt());
+}
+
+#[tokio::test]
 async fn connect_debounce_rejects_repeated_identity_within_window() {
     let mut broker = test_broker();
     broker.set_connect_debounce_window(Duration::from_secs(1));

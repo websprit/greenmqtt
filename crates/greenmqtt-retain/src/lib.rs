@@ -6,6 +6,8 @@ use greenmqtt_kv_engine::KvMutation;
 use greenmqtt_storage::RetainStore;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
+use tokio::task::JoinHandle;
 
 #[async_trait]
 pub trait RetainService: Send + Sync {
@@ -45,6 +47,8 @@ pub struct PersistentRetainHandle {
 pub struct ReplicatedRetainHandle {
     router: Arc<dyn KvRangeRouter>,
     executor: Arc<dyn KvRangeExecutor>,
+    tenant_cache: Arc<RwLock<HashMap<String, Vec<RetainedMessage>>>>,
+    filter_cache: Arc<RwLock<HashMap<(String, String), Vec<RetainedMessage>>>>,
 }
 
 pub fn retain_tenant_shard(tenant_id: &str) -> ServiceShardKey {
@@ -152,7 +156,35 @@ impl PersistentRetainHandle {
 
 impl ReplicatedRetainHandle {
     pub fn new(router: Arc<dyn KvRangeRouter>, executor: Arc<dyn KvRangeExecutor>) -> Self {
-        Self { router, executor }
+        Self {
+            router,
+            executor,
+            tenant_cache: Arc::new(RwLock::new(HashMap::new())),
+            filter_cache: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    fn invalidate_tenant_cache(&self, tenant_id: &str) {
+        self.tenant_cache
+            .write()
+            .expect("retain cache poisoned")
+            .remove(tenant_id);
+        self.filter_cache
+            .write()
+            .expect("retain cache poisoned")
+            .retain(|(cached_tenant_id, _), _| cached_tenant_id != tenant_id);
+    }
+
+    pub fn cache_tenant_count(&self) -> usize {
+        self.tenant_cache
+            .read()
+            .expect("retain cache poisoned")
+            .len()
+    }
+
+    pub async fn warm_tenant_cache(&self, tenant_id: &str) -> anyhow::Result<usize> {
+        self.invalidate_tenant_cache(tenant_id);
+        Ok(self.list_tenant_retained(tenant_id).await?.len())
     }
 }
 
@@ -416,6 +448,7 @@ impl RetainService for ReplicatedRetainHandle {
             .ok_or_else(|| {
                 anyhow::anyhow!("no retain range available for tenant {}", message.tenant_id)
             })?;
+        self.invalidate_tenant_cache(&message.tenant_id);
         self.executor
             .apply(
                 &route.descriptor.id,
@@ -433,6 +466,15 @@ impl RetainService for ReplicatedRetainHandle {
     }
 
     async fn list_tenant_retained(&self, tenant_id: &str) -> anyhow::Result<Vec<RetainedMessage>> {
+        if let Some(cached) = self
+            .tenant_cache
+            .read()
+            .expect("retain cache poisoned")
+            .get(tenant_id)
+            .cloned()
+        {
+            return Ok(cached);
+        }
         let shard = retain_tenant_shard(tenant_id);
         let routes = self.router.route_shard(&shard).await?;
         let mut retained = Vec::new();
@@ -446,6 +488,10 @@ impl RetainService for ReplicatedRetainHandle {
             }
         }
         retained.sort_by(|left, right| left.topic.cmp(&right.topic));
+        self.tenant_cache
+            .write()
+            .expect("retain cache poisoned")
+            .insert(tenant_id.to_string(), retained.clone());
         Ok(retained)
     }
 
@@ -477,13 +523,27 @@ impl RetainService for ReplicatedRetainHandle {
                 .into_iter()
                 .collect());
         }
+        if let Some(cached) = self
+            .filter_cache
+            .read()
+            .expect("retain cache poisoned")
+            .get(&(tenant_id.to_string(), topic_filter.to_string()))
+            .cloned()
+        {
+            return Ok(cached);
+        }
         let compiled = CompiledTopicFilter::new(topic_filter);
-        Ok(self
+        let matched = self
             .list_tenant_retained(tenant_id)
             .await?
             .into_iter()
             .filter(|message| compiled.matches(&message.topic))
-            .collect())
+            .collect::<Vec<_>>();
+        self.filter_cache
+            .write()
+            .expect("retain cache poisoned")
+            .insert((tenant_id.to_string(), topic_filter.to_string()), matched.clone());
+        Ok(matched)
     }
 
     async fn retained_count(&self) -> anyhow::Result<usize> {
@@ -498,6 +558,98 @@ impl RetainService for ReplicatedRetainHandle {
             }
         }
         Ok(total)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainTenantStats {
+    pub tenant_id: String,
+    pub retained_messages: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetainBalanceAction {
+    SplitTenantRange { tenant_id: String },
+    ScaleTenantReplicas {
+        tenant_id: String,
+        voters: usize,
+        learners: usize,
+    },
+    RunTenantCleanup { tenant_id: String },
+}
+
+pub trait RetainBalancePolicy: Send + Sync {
+    fn propose(&self, tenants: &[RetainTenantStats]) -> Vec<RetainBalanceAction>;
+}
+
+#[derive(Debug, Clone)]
+pub struct ThresholdRetainBalancePolicy {
+    pub max_retained_messages: usize,
+    pub desired_voters: usize,
+    pub desired_learners: usize,
+}
+
+impl RetainBalancePolicy for ThresholdRetainBalancePolicy {
+    fn propose(&self, tenants: &[RetainTenantStats]) -> Vec<RetainBalanceAction> {
+        let mut actions = Vec::new();
+        for tenant in tenants {
+            if tenant.retained_messages > self.max_retained_messages {
+                actions.push(RetainBalanceAction::RunTenantCleanup {
+                    tenant_id: tenant.tenant_id.clone(),
+                });
+                actions.push(RetainBalanceAction::SplitTenantRange {
+                    tenant_id: tenant.tenant_id.clone(),
+                });
+                actions.push(RetainBalanceAction::ScaleTenantReplicas {
+                    tenant_id: tenant.tenant_id.clone(),
+                    voters: self.desired_voters,
+                    learners: self.desired_learners,
+                });
+            }
+        }
+        actions
+    }
+}
+
+#[async_trait::async_trait]
+pub trait RetainMaintenance: Send + Sync {
+    async fn refresh_tenant(&self, tenant_id: &str) -> anyhow::Result<usize>;
+}
+
+#[async_trait::async_trait]
+impl RetainMaintenance for ReplicatedRetainHandle {
+    async fn refresh_tenant(&self, tenant_id: &str) -> anyhow::Result<usize> {
+        self.warm_tenant_cache(tenant_id).await
+    }
+}
+
+#[derive(Clone)]
+pub struct RetainMaintenanceWorker {
+    maintenance: Arc<dyn RetainMaintenance>,
+}
+
+impl RetainMaintenanceWorker {
+    pub fn new(maintenance: Arc<dyn RetainMaintenance>) -> Self {
+        Self { maintenance }
+    }
+
+    pub async fn refresh_tenant(&self, tenant_id: &str) -> anyhow::Result<usize> {
+        self.maintenance.refresh_tenant(tenant_id).await
+    }
+
+    pub fn spawn_tenant_refresh(
+        &self,
+        tenant_id: String,
+        interval: Duration,
+    ) -> JoinHandle<anyhow::Result<()>> {
+        let worker = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                let _ = worker.refresh_tenant(&tenant_id).await?;
+            }
+        })
     }
 }
 
@@ -527,7 +679,8 @@ impl Lifecycle for PersistentRetainHandle {
 mod tests {
     use super::{
         retain_tenant_shard, retained_message_shard, PersistentRetainHandle,
-        ReplicatedRetainHandle, RetainHandle, RetainService,
+        ReplicatedRetainHandle, RetainBalanceAction, RetainBalancePolicy, RetainHandle,
+        RetainMaintenanceWorker, RetainService, RetainTenantStats, ThresholdRetainBalancePolicy,
     };
     use async_trait::async_trait;
     use bytes::Bytes;
@@ -542,6 +695,7 @@ mod tests {
     use greenmqtt_storage::{MemoryRetainStore, RetainStore};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::time::Duration;
 
     #[derive(Clone)]
     struct LocalKvRangeExecutor {
@@ -1537,5 +1691,164 @@ mod tests {
                 .payload,
             b"restored".as_slice()
         );
+    }
+
+    #[tokio::test]
+    async fn replicated_retain_caches_tenant_and_filter_matches() {
+        let engine = MemoryKvEngine::default();
+        engine
+            .bootstrap(KvRangeBootstrap {
+                range_id: "retain-range-cache".into(),
+                boundary: RangeBoundary::full(),
+            })
+            .await
+            .unwrap();
+        let router = Arc::new(MemoryKvRangeRouter::default());
+        router
+            .upsert(ReplicatedRangeDescriptor::new(
+                "retain-range-cache",
+                retain_tenant_shard("t1"),
+                RangeBoundary::full(),
+                1,
+                1,
+                Some(1),
+                vec![RangeReplica::new(
+                    1,
+                    ReplicaRole::Voter,
+                    ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ))
+            .await
+            .unwrap();
+        let retain = ReplicatedRetainHandle::new(
+            router,
+            Arc::new(LocalKvRangeExecutor {
+                engine: engine.clone(),
+            }),
+        );
+        for topic in ["alerts/a", "alerts/b"] {
+            retain
+                .retain(RetainedMessage {
+                    tenant_id: "t1".into(),
+                    topic: topic.into(),
+                    payload: b"up".to_vec().into(),
+                    qos: 1,
+                })
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(retain.match_topic("t1", "alerts/#").await.unwrap().len(), 2);
+        assert_eq!(retain.cache_tenant_count(), 1);
+        assert_eq!(retain.match_topic("t1", "alerts/#").await.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn threshold_retain_balance_policy_proposes_actions_for_hot_tenant() {
+        let policy = ThresholdRetainBalancePolicy {
+            max_retained_messages: 8,
+            desired_voters: 3,
+            desired_learners: 1,
+        };
+        let actions = policy.propose(&[
+            RetainTenantStats {
+                tenant_id: "cool".into(),
+                retained_messages: 2,
+            },
+            RetainTenantStats {
+                tenant_id: "hot".into(),
+                retained_messages: 12,
+            },
+        ]);
+        assert_eq!(
+            actions,
+            vec![
+                RetainBalanceAction::RunTenantCleanup {
+                    tenant_id: "hot".into(),
+                },
+                RetainBalanceAction::SplitTenantRange {
+                    tenant_id: "hot".into(),
+                },
+                RetainBalanceAction::ScaleTenantReplicas {
+                    tenant_id: "hot".into(),
+                    voters: 3,
+                    learners: 1,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn retain_maintenance_worker_refreshes_tenant_cache() {
+        let engine = MemoryKvEngine::default();
+        engine
+            .bootstrap(KvRangeBootstrap {
+                range_id: "retain-range-maint".into(),
+                boundary: RangeBoundary::full(),
+            })
+            .await
+            .unwrap();
+        let router = Arc::new(MemoryKvRangeRouter::default());
+        router
+            .upsert(ReplicatedRangeDescriptor::new(
+                "retain-range-maint",
+                retain_tenant_shard("t1"),
+                RangeBoundary::full(),
+                1,
+                1,
+                Some(1),
+                vec![RangeReplica::new(
+                    1,
+                    ReplicaRole::Voter,
+                    ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ))
+            .await
+            .unwrap();
+        let retain = Arc::new(ReplicatedRetainHandle::new(
+            router,
+            Arc::new(LocalKvRangeExecutor {
+                engine: engine.clone(),
+            }),
+        ));
+        retain
+            .retain(RetainedMessage {
+                tenant_id: "t1".into(),
+                topic: "alerts/a".into(),
+                payload: b"up".to_vec().into(),
+                qos: 1,
+            })
+            .await
+            .unwrap();
+
+        let worker = RetainMaintenanceWorker::new(retain.clone());
+        assert_eq!(worker.refresh_tenant("t1").await.unwrap(), 1);
+        let task = worker.spawn_tenant_refresh("t1".into(), Duration::from_millis(1));
+        tokio::time::sleep(Duration::from_millis(3)).await;
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn retain_large_wildcard_fanout_remains_correct() {
+        let retain = RetainHandle::default();
+        for index in 0..256u32 {
+            retain
+                .retain(RetainedMessage {
+                    tenant_id: "t-load".into(),
+                    topic: format!("devices/{index}/state"),
+                    payload: format!("p-{index}").into_bytes().into(),
+                    qos: 1,
+                })
+                .await
+                .unwrap();
+        }
+        let matched = retain.match_topic("t-load", "devices/+/state").await.unwrap();
+        assert_eq!(matched.len(), 256);
     }
 }

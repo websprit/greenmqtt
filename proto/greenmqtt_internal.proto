@@ -600,6 +600,68 @@ message RangeDebugReply {
   string text = 1;
 }
 
+message RangeBootstrapRequest {
+  ReplicatedRangeRecord descriptor = 1;
+}
+
+message RangeBootstrapReply {
+  string range_id = 1;
+}
+
+message RangeChangeReplicasRequest {
+  string range_id = 1;
+  repeated uint64 voters = 2;
+  repeated uint64 learners = 3;
+}
+
+message RangeTransferLeadershipRequest {
+  string range_id = 1;
+  uint64 target_node_id = 2;
+}
+
+message RangeRecoverRequest {
+  string range_id = 1;
+  uint64 new_leader_node_id = 2;
+}
+
+message RangeSplitRequest {
+  string range_id = 1;
+  bytes split_key = 2;
+}
+
+message RangeSplitReply {
+  string left_range_id = 1;
+  string right_range_id = 2;
+}
+
+message RangeMergeRequest {
+  string left_range_id = 1;
+  string right_range_id = 2;
+}
+
+message RangeMergeReply {
+  string range_id = 1;
+}
+
+message RangeDrainRequest {
+  string range_id = 1;
+}
+
+message RangeRetireRequest {
+  string range_id = 1;
+}
+
+message ZombieRangeRecord {
+  string range_id = 1;
+  string lifecycle = 2;
+  uint64 leader_node_id = 3;
+  bool has_leader_node_id = 4;
+}
+
+message ZombieRangeListReply {
+  repeated ZombieRangeRecord entries = 1;
+}
+
 service SessionDictService {
   rpc RegisterSession(RegisterSessionRequest) returns (RegisterSessionReply);
   rpc UnregisterSession(UnregisterSessionRequest) returns (RegisterSessionReply);
@@ -687,4 +749,16 @@ service RangeAdminService {
   rpc ListRangeHealth(.google.protobuf.Empty) returns (RangeHealthListReply);
   rpc GetRangeHealth(RangeHealthRequest) returns (RangeHealthReply);
   rpc DebugDump(.google.protobuf.Empty) returns (RangeDebugReply);
+}
+
+service RangeControlService {
+  rpc BootstrapRange(RangeBootstrapRequest) returns (RangeBootstrapReply);
+  rpc ChangeReplicas(RangeChangeReplicasRequest) returns (.google.protobuf.Empty);
+  rpc TransferLeadership(RangeTransferLeadershipRequest) returns (.google.protobuf.Empty);
+  rpc RecoverRange(RangeRecoverRequest) returns (.google.protobuf.Empty);
+  rpc SplitRange(RangeSplitRequest) returns (RangeSplitReply);
+  rpc MergeRanges(RangeMergeRequest) returns (RangeMergeReply);
+  rpc DrainRange(RangeDrainRequest) returns (.google.protobuf.Empty);
+  rpc RetireRange(RangeRetireRequest) returns (.google.protobuf.Empty);
+  rpc ListZombieRanges(.google.protobuf.Empty) returns (ZombieRangeListReply);
 }

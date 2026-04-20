@@ -1,9 +1,10 @@
 use crate::state::{
-    offline_message_matches, remove_cached_tenant_inflight, remove_cached_tenant_offline,
-    remove_session_topic_subscription, remove_tenant_subscription, subscription_index_key,
+    offline_message_matches, remove_cached_inflight_message, remove_cached_offline_message,
+    remove_cached_tenant_inflight, remove_cached_tenant_offline, remove_session_topic_subscription,
+    remove_tenant_subscription, subscription_index_key,
     tenant_topic_shared_subscription_key, InboxState,
 };
-use crate::InboxService;
+use crate::{publish_properties_expired_at, InboxExpiryStats, InboxService};
 use async_trait::async_trait;
 use greenmqtt_core::{InflightMessage, Lifecycle, OfflineMessage, SessionId, Subscription};
 use greenmqtt_storage::{InboxStore, InflightStore, SubscriptionStore};
@@ -33,6 +34,55 @@ impl PersistentInboxHandle {
             inflight_store,
             inner: Arc::new(RwLock::new(InboxState::default())),
         }
+    }
+
+    async fn expire_session_messages_inner(
+        &self,
+        session_id: &SessionId,
+        now_ms: u64,
+    ) -> anyhow::Result<InboxExpiryStats> {
+        let mut stats = InboxExpiryStats::default();
+        let offline = self.inbox_store.peek_messages(session_id).await?;
+        let expired_offline = offline
+            .iter()
+            .filter(|message| publish_properties_expired_at(&message.properties, now_ms))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !expired_offline.is_empty() {
+            self.inbox_store.purge_messages(session_id).await?;
+            let retained = offline
+                .into_iter()
+                .filter(|message| !publish_properties_expired_at(&message.properties, now_ms))
+                .collect::<Vec<_>>();
+            if !retained.is_empty() {
+                self.inbox_store.append_messages(&retained).await?;
+            }
+            stats.offline_messages += expired_offline.len();
+            let mut guard = self.inner.write().expect("inbox poisoned");
+            for message in &expired_offline {
+                let _ = remove_cached_offline_message(&mut guard, message);
+            }
+        }
+
+        let inflight = self.inflight_store.load_inflight(session_id).await?;
+        let expired_packets = inflight
+            .iter()
+            .filter(|message| publish_properties_expired_at(&message.properties, now_ms))
+            .map(|message| message.packet_id)
+            .collect::<Vec<_>>();
+        if !expired_packets.is_empty() {
+            self.inflight_store
+                .delete_inflight_batch(session_id, &expired_packets)
+                .await?;
+            stats.inflight_messages += expired_packets.len();
+            let mut guard = self.inner.write().expect("inbox poisoned");
+            for message in inflight.iter().filter(|message| {
+                publish_properties_expired_at(&message.properties, now_ms)
+            }) {
+                let _ = remove_cached_inflight_message(&mut guard, message);
+            }
+        }
+        Ok(stats)
     }
 }
 #[async_trait]
@@ -1093,6 +1143,70 @@ impl InboxService for InboxHandle {
             .expect("inbox poisoned")
             .total_inflight_messages)
     }
+
+    async fn expire_messages(&self, now_ms: u64) -> anyhow::Result<InboxExpiryStats> {
+        let mut guard = self.inner.write().expect("inbox poisoned");
+        let expired_offline = guard
+            .offline_messages
+            .values()
+            .flat_map(|messages| messages.iter().cloned())
+            .filter(|message| publish_properties_expired_at(&message.properties, now_ms))
+            .collect::<Vec<_>>();
+        let expired_inflight = guard
+            .inflight_messages
+            .values()
+            .flat_map(|messages| messages.values().cloned())
+            .filter(|message| publish_properties_expired_at(&message.properties, now_ms))
+            .collect::<Vec<_>>();
+        let offline_messages = expired_offline
+            .iter()
+            .filter(|message| remove_cached_offline_message(&mut guard, message))
+            .count();
+        let inflight_messages = expired_inflight
+            .iter()
+            .filter(|message| remove_cached_inflight_message(&mut guard, message))
+            .count();
+        Ok(InboxExpiryStats {
+            offline_messages,
+            inflight_messages,
+        })
+    }
+
+    async fn expire_tenant_messages(
+        &self,
+        tenant_id: &str,
+        now_ms: u64,
+    ) -> anyhow::Result<InboxExpiryStats> {
+        let mut guard = self.inner.write().expect("inbox poisoned");
+        let expired_offline = guard
+            .offline_messages_by_tenant
+            .get(tenant_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|message| publish_properties_expired_at(&message.properties, now_ms))
+            .collect::<Vec<_>>();
+        let expired_inflight = guard
+            .inflight_messages_by_tenant
+            .get(tenant_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|message| publish_properties_expired_at(&message.properties, now_ms))
+            .collect::<Vec<_>>();
+        let offline_messages = expired_offline
+            .iter()
+            .filter(|message| remove_cached_offline_message(&mut guard, message))
+            .count();
+        let inflight_messages = expired_inflight
+            .iter()
+            .filter(|message| remove_cached_inflight_message(&mut guard, message))
+            .count();
+        Ok(InboxExpiryStats {
+            offline_messages,
+            inflight_messages,
+        })
+    }
 }
 
 #[async_trait]
@@ -1918,6 +2032,59 @@ impl InboxService for PersistentInboxHandle {
 
     async fn inflight_count(&self) -> anyhow::Result<usize> {
         self.inflight_store.count_inflight().await
+    }
+
+    async fn expire_messages(&self, now_ms: u64) -> anyhow::Result<InboxExpiryStats> {
+        let session_ids = {
+            let mut session_ids = std::collections::BTreeSet::new();
+            for message in self.inbox_store.list_all_messages().await? {
+                if publish_properties_expired_at(&message.properties, now_ms) {
+                    session_ids.insert(message.session_id);
+                }
+            }
+            for message in self.inflight_store.list_all_inflight().await? {
+                if publish_properties_expired_at(&message.properties, now_ms) {
+                    session_ids.insert(message.session_id);
+                }
+            }
+            session_ids
+        };
+
+        let mut stats = InboxExpiryStats::default();
+        for session_id in session_ids {
+            let session_stats = self.expire_session_messages_inner(&session_id, now_ms).await?;
+            stats.offline_messages += session_stats.offline_messages;
+            stats.inflight_messages += session_stats.inflight_messages;
+        }
+        Ok(stats)
+    }
+
+    async fn expire_tenant_messages(
+        &self,
+        tenant_id: &str,
+        now_ms: u64,
+    ) -> anyhow::Result<InboxExpiryStats> {
+        let session_ids = {
+            let mut session_ids = std::collections::BTreeSet::new();
+            for message in self.inbox_store.list_tenant_messages(tenant_id).await? {
+                if publish_properties_expired_at(&message.properties, now_ms) {
+                    session_ids.insert(message.session_id);
+                }
+            }
+            for message in self.inflight_store.list_tenant_inflight(tenant_id).await? {
+                if publish_properties_expired_at(&message.properties, now_ms) {
+                    session_ids.insert(message.session_id);
+                }
+            }
+            session_ids
+        };
+        let mut stats = InboxExpiryStats::default();
+        for session_id in session_ids {
+            let session_stats = self.expire_session_messages_inner(&session_id, now_ms).await?;
+            stats.offline_messages += session_stats.offline_messages;
+            stats.inflight_messages += session_stats.inflight_messages;
+        }
+        Ok(stats)
     }
 }
 

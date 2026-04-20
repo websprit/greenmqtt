@@ -1,12 +1,13 @@
 use async_trait::async_trait;
 use greenmqtt_cluster::ClusterWorkflowController;
 use greenmqtt_core::{
-    BalancerState, ClusterNodeLifecycle, ControlPlaneRegistry, NodeId, RangeBoundary, RangeReplica,
-    ReplicaRole, ReplicaSyncState, ReplicatedRangeDescriptor, ServiceEndpoint, ServiceKind,
-    ServiceShardAssignment, ServiceShardKey, ServiceShardLifecycle, ServiceShardTransition,
-    ServiceShardTransitionKind,
+    BalancerState, BalancerStateRegistry, ClusterNodeLifecycle, ControlPlaneRegistry, NodeId,
+    RangeBoundary, RangeReplica, ReplicaRole, ReplicaSyncState, ReplicatedRangeDescriptor,
+    ServiceEndpoint, ServiceKind, ServiceShardAssignment, ServiceShardKey,
+    ServiceShardLifecycle, ServiceShardTransition, ServiceShardTransitionKind,
 };
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BalanceCommand {
@@ -80,6 +81,8 @@ pub async fn execute_balance_commands(
 pub struct BalanceCoordinator {
     controller: Arc<dyn BalanceController>,
     executor: Arc<dyn BalanceCommandExecutor>,
+    feedback_registry: Option<Arc<dyn BalancerStateRegistry>>,
+    feedback_name: Option<String>,
 }
 
 impl BalanceCoordinator {
@@ -90,7 +93,51 @@ impl BalanceCoordinator {
         Self {
             controller,
             executor,
+            feedback_registry: None,
+            feedback_name: None,
         }
+    }
+
+    pub fn with_feedback(
+        controller: Arc<dyn BalanceController>,
+        executor: Arc<dyn BalanceCommandExecutor>,
+        registry: Arc<dyn BalancerStateRegistry>,
+        balancer_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            controller,
+            executor,
+            feedback_registry: Some(registry),
+            feedback_name: Some(balancer_name.into()),
+        }
+    }
+
+    async fn record_feedback(
+        &self,
+        operation: &str,
+        applied: usize,
+    ) -> anyhow::Result<()> {
+        let (Some(registry), Some(name)) = (&self.feedback_registry, &self.feedback_name) else {
+            return Ok(());
+        };
+        let mut state = registry
+            .resolve_balancer_state(name)
+            .await?
+            .unwrap_or_default();
+        state.load_rules.insert("last_operation".into(), operation.into());
+        state
+            .load_rules
+            .insert("last_applied".into(), applied.to_string());
+        state.load_rules.insert(
+            "last_updated_ms".into(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock went backwards")
+                .as_millis()
+                .to_string(),
+        );
+        registry.upsert_balancer_state(name, state).await?;
+        Ok(())
     }
 
     pub async fn bootstrap_missing_ranges(
@@ -101,7 +148,9 @@ impl BalanceCoordinator {
             .controller
             .bootstrap_missing_ranges(desired_ranges)
             .await?;
-        execute_balance_commands(self.executor.as_ref(), &commands).await
+        let applied = execute_balance_commands(self.executor.as_ref(), &commands).await?;
+        self.record_feedback("bootstrap_missing_ranges", applied).await?;
+        Ok(applied)
     }
 
     pub async fn reconcile_replica_counts(
@@ -113,22 +162,30 @@ impl BalanceCoordinator {
             .controller
             .reconcile_replica_counts(voters_per_range, learners_per_range)
             .await?;
-        execute_balance_commands(self.executor.as_ref(), &commands).await
+        let applied = execute_balance_commands(self.executor.as_ref(), &commands).await?;
+        self.record_feedback("reconcile_replica_counts", applied).await?;
+        Ok(applied)
     }
 
     pub async fn rebalance_range_leaders(&self) -> anyhow::Result<usize> {
         let commands = self.controller.rebalance_range_leaders().await?;
-        execute_balance_commands(self.executor.as_ref(), &commands).await
+        let applied = execute_balance_commands(self.executor.as_ref(), &commands).await?;
+        self.record_feedback("rebalance_range_leaders", applied).await?;
+        Ok(applied)
     }
 
     pub async fn cleanup_unreachable_replicas(&self) -> anyhow::Result<usize> {
         let commands = self.controller.cleanup_unreachable_replicas().await?;
-        execute_balance_commands(self.executor.as_ref(), &commands).await
+        let applied = execute_balance_commands(self.executor.as_ref(), &commands).await?;
+        self.record_feedback("cleanup_unreachable_replicas", applied).await?;
+        Ok(applied)
     }
 
     pub async fn recover_ranges(&self) -> anyhow::Result<usize> {
         let commands = self.controller.recover_ranges().await?;
-        execute_balance_commands(self.executor.as_ref(), &commands).await
+        let applied = execute_balance_commands(self.executor.as_ref(), &commands).await?;
+        self.record_feedback("recover_ranges", applied).await?;
+        Ok(applied)
     }
 }
 
@@ -1442,6 +1499,64 @@ mod tests {
         assert_eq!(
             executor.commands.lock().expect("executor poisoned").len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn balance_coordinator_records_feedback_state_after_execution() {
+        let registry = Arc::new(StaticServiceEndpointRegistry::default());
+        registry
+            .upsert_member(ClusterNodeMembership::new(
+                7,
+                1,
+                ClusterNodeLifecycle::Serving,
+                vec![ServiceEndpoint::new(
+                    ServiceKind::Retain,
+                    7,
+                    "http://127.0.0.1:50070",
+                )],
+            ))
+            .await
+            .unwrap();
+        let controller: Arc<dyn BalanceController> =
+            Arc::new(MetadataBalanceController::new(registry.clone()));
+        let executor = Arc::new(RecordingExecutor::default());
+        let coordinator = BalanceCoordinator::with_feedback(
+            controller,
+            executor,
+            registry.clone(),
+            "dist-balancer",
+        );
+
+        let applied = coordinator
+            .bootstrap_missing_ranges(vec![ReplicatedRangeDescriptor::new(
+                "retain-range-feedback",
+                ServiceShardKey::retain("t1"),
+                RangeBoundary::full(),
+                1,
+                1,
+                None,
+                Vec::new(),
+                0,
+                0,
+                ServiceShardLifecycle::Bootstrapping,
+            )])
+            .await
+            .unwrap();
+        assert_eq!(applied, 1);
+
+        let state = registry
+            .resolve_balancer_state("dist-balancer")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state.load_rules.get("last_operation").map(String::as_str),
+            Some("bootstrap_missing_ranges")
+        );
+        assert_eq!(
+            state.load_rules.get("last_applied").map(String::as_str),
+            Some("1")
         );
     }
 }

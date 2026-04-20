@@ -4,6 +4,7 @@ use greenmqtt_core::{ClientIdentity, Lifecycle, ServiceShardKey, ServiceShardKin
 use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter};
 use greenmqtt_kv_engine::KvMutation;
 use greenmqtt_storage::SessionStore;
+use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
@@ -16,6 +17,12 @@ pub trait SessionDirectory: Send + Sync {
         identity: &ClientIdentity,
     ) -> anyhow::Result<Option<SessionRecord>>;
     async fn lookup_session(&self, session_id: &str) -> anyhow::Result<Option<SessionRecord>>;
+    async fn session_exists(&self, session_id: &str) -> anyhow::Result<bool> {
+        Ok(self.lookup_session(session_id).await?.is_some())
+    }
+    async fn identity_exists(&self, identity: &ClientIdentity) -> anyhow::Result<bool> {
+        Ok(self.lookup_identity(identity).await?.is_some())
+    }
     async fn list_sessions(&self, tenant_id: Option<&str>) -> anyhow::Result<Vec<SessionRecord>>;
     async fn session_count(&self) -> anyhow::Result<usize>;
 }
@@ -133,6 +140,65 @@ pub struct PersistentSessionDictHandle {
 pub struct ReplicatedSessionDictHandle {
     router: Arc<dyn KvRangeRouter>,
     executor: Arc<dyn KvRangeExecutor>,
+    identity_cache: Arc<RwLock<HashMap<(String, String, String), SessionRecord>>>,
+    session_cache: Arc<RwLock<HashMap<String, SessionRecord>>>,
+    session_range_cache: Arc<RwLock<HashMap<String, String>>>,
+}
+
+#[derive(Clone)]
+pub struct SessionOnlineCheckScheduler {
+    directory: Arc<dyn SessionDirectory>,
+}
+
+impl SessionOnlineCheckScheduler {
+    pub fn new(directory: Arc<dyn SessionDirectory>) -> Self {
+        Self { directory }
+    }
+
+    pub async fn check_sessions(
+        &self,
+        session_ids: &[String],
+    ) -> anyhow::Result<BTreeMap<String, bool>> {
+        let known = self
+            .directory
+            .list_sessions(None)
+            .await?
+            .into_iter()
+            .map(|record| record.session_id)
+            .collect::<HashSet<_>>();
+        Ok(session_ids
+            .iter()
+            .map(|session_id| (session_id.clone(), known.contains(session_id)))
+            .collect())
+    }
+
+    pub async fn check_identities(
+        &self,
+        identities: &[ClientIdentity],
+    ) -> anyhow::Result<BTreeMap<(String, String, String), bool>> {
+        let mut grouped: BTreeMap<String, Vec<&ClientIdentity>> = BTreeMap::new();
+        for identity in identities {
+            grouped
+                .entry(identity.tenant_id.clone())
+                .or_default()
+                .push(identity);
+        }
+        let mut results = BTreeMap::new();
+        for (tenant_id, identities) in grouped {
+            let known = self
+                .directory
+                .list_sessions(Some(&tenant_id))
+                .await?
+                .into_iter()
+                .map(|record| SessionDictHandle::identity_key(&record.identity))
+                .collect::<HashSet<_>>();
+            for identity in identities {
+                let key = SessionDictHandle::identity_key(identity);
+                results.insert(key.clone(), known.contains(&key));
+            }
+        }
+        Ok(results)
+    }
 }
 
 pub fn session_record_shard(record: &SessionRecord) -> ServiceShardKey {
@@ -195,7 +261,13 @@ impl PersistentSessionDictHandle {
 
 impl ReplicatedSessionDictHandle {
     pub fn new(router: Arc<dyn KvRangeRouter>, executor: Arc<dyn KvRangeExecutor>) -> Self {
-        Self { router, executor }
+        Self {
+            router,
+            executor,
+            identity_cache: Arc::new(RwLock::new(HashMap::new())),
+            session_cache: Arc::new(RwLock::new(HashMap::new())),
+            session_range_cache: Arc::new(RwLock::new(HashMap::new())),
+        }
     }
 
     async fn tenant_routes(
@@ -231,6 +303,39 @@ impl ReplicatedSessionDictHandle {
             self.executor.apply(&range_id, mutations).await?;
         }
         Ok(())
+    }
+
+    fn cache_record(&self, record: SessionRecord, range_id: Option<String>) {
+        let identity_key = SessionDictHandle::identity_key(&record.identity);
+        self.identity_cache
+            .write()
+            .expect("sessiondict cache poisoned")
+            .insert(identity_key, record.clone());
+        self.session_cache
+            .write()
+            .expect("sessiondict cache poisoned")
+            .insert(record.session_id.clone(), record.clone());
+        if let Some(range_id) = range_id {
+            self.session_range_cache
+                .write()
+                .expect("sessiondict cache poisoned")
+                .insert(record.session_id.clone(), range_id);
+        }
+    }
+
+    fn evict_record(&self, record: &SessionRecord) {
+        self.identity_cache
+            .write()
+            .expect("sessiondict cache poisoned")
+            .remove(&SessionDictHandle::identity_key(&record.identity));
+        self.session_cache
+            .write()
+            .expect("sessiondict cache poisoned")
+            .remove(&record.session_id);
+        self.session_range_cache
+            .write()
+            .expect("sessiondict cache poisoned")
+            .remove(&record.session_id);
     }
 
     async fn scan_session_records_for_tenant(
@@ -585,6 +690,15 @@ impl SessionDirectory for ReplicatedSessionDictHandle {
         });
         self.apply_grouped(&record.identity.tenant_id, mutations)
             .await?;
+        if let Some(previous) = replaced.as_ref() {
+            self.evict_record(previous);
+        }
+        let range_id = self
+            .router
+            .route_key(&session_scan_shard(&record.identity.tenant_id), &encoded_session_key(&record.session_id))
+            .await?
+            .map(|route| route.descriptor.id);
+        self.cache_record(record.clone(), range_id);
         Ok(replaced)
     }
 
@@ -606,6 +720,7 @@ impl SessionDirectory for ReplicatedSessionDictHandle {
             ],
         )
         .await?;
+        self.evict_record(&record);
         Ok(Some(record))
     }
 
@@ -613,6 +728,15 @@ impl SessionDirectory for ReplicatedSessionDictHandle {
         &self,
         identity: &ClientIdentity,
     ) -> anyhow::Result<Option<SessionRecord>> {
+        if let Some(cached) = self
+            .identity_cache
+            .read()
+            .expect("sessiondict cache poisoned")
+            .get(&SessionDictHandle::identity_key(identity))
+            .cloned()
+        {
+            return Ok(Some(cached));
+        }
         let shard = session_scan_shard(&identity.tenant_id);
         let Some(route) = self
             .router
@@ -621,23 +745,54 @@ impl SessionDirectory for ReplicatedSessionDictHandle {
         else {
             return Ok(None);
         };
-        self.executor
+        let record = self
+            .executor
             .get(&route.descriptor.id, &encoded_identity_key(identity))
             .await?
             .map(|value| decode_session_record(&value))
-            .transpose()
+            .transpose()?;
+        if let Some(record) = &record {
+            self.cache_record(record.clone(), Some(route.descriptor.id.clone()));
+        }
+        Ok(record)
     }
 
     async fn lookup_session(&self, session_id: &str) -> anyhow::Result<Option<SessionRecord>> {
+        if let Some(cached) = self
+            .session_cache
+            .read()
+            .expect("sessiondict cache poisoned")
+            .get(session_id)
+            .cloned()
+        {
+            return Ok(Some(cached));
+        }
         let target_key = encoded_session_key(session_id);
+        let cached_range_id = self
+            .session_range_cache
+            .read()
+            .expect("sessiondict cache poisoned")
+            .get(session_id)
+            .cloned();
+        if let Some(range_id) = cached_range_id {
+            if let Some(value) = self.executor.get(&range_id, &target_key).await? {
+                let record = decode_session_record(&value)?;
+                self.cache_record(record.clone(), Some(range_id));
+                return Ok(Some(record));
+            }
+            self.session_range_cache
+                .write()
+                .expect("sessiondict cache poisoned")
+                .remove(session_id);
+        }
         for descriptor in self.router.list().await? {
             if descriptor.shard.kind != ServiceShardKind::SessionDict {
                 continue;
             }
-            for (key, value) in self.executor.scan(&descriptor.id, None, usize::MAX).await? {
-                if key == target_key {
-                    return Ok(Some(decode_session_record(&value)?));
-                }
+            if let Some(value) = self.executor.get(&descriptor.id, &target_key).await? {
+                let record = decode_session_record(&value)?;
+                self.cache_record(record.clone(), Some(descriptor.id.clone()));
+                return Ok(Some(record));
             }
         }
         Ok(None)
@@ -682,7 +837,7 @@ mod tests {
     use super::{
         session_identity_shard, session_record_shard, session_scan_shard,
         PersistentSessionDictHandle, ReplicatedSessionDictHandle, SessionDictHandle,
-        SessionDirectory, SessionDirectoryState,
+        SessionDirectory, SessionDirectoryState, SessionOnlineCheckScheduler,
     };
     use async_trait::async_trait;
     use bytes::Bytes;
@@ -697,7 +852,7 @@ mod tests {
     };
     use greenmqtt_storage::{MemorySessionStore, SessionStore};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex, RwLock};
 
     #[derive(Clone)]
     struct LocalKvRangeExecutor {
@@ -717,6 +872,60 @@ mod tests {
             boundary: Option<RangeBoundary>,
             limit: usize,
         ) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
+            let range = self.engine.open_range(range_id).await?;
+            range
+                .reader()
+                .scan(&boundary.unwrap_or_else(RangeBoundary::full), limit)
+                .await
+        }
+
+        async fn apply(&self, range_id: &str, mutations: Vec<KvMutation>) -> anyhow::Result<()> {
+            let range = self.engine.open_range(range_id).await?;
+            range.writer().apply(mutations).await
+        }
+
+        async fn checkpoint(
+            &self,
+            range_id: &str,
+            checkpoint_id: &str,
+        ) -> anyhow::Result<KvRangeCheckpoint> {
+            let range = self.engine.open_range(range_id).await?;
+            range.checkpoint(checkpoint_id).await
+        }
+
+        async fn snapshot(&self, range_id: &str) -> anyhow::Result<KvRangeSnapshot> {
+            let range = self.engine.open_range(range_id).await?;
+            range.snapshot().await
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingKvRangeExecutor {
+        engine: MemoryKvEngine,
+        get_calls: Arc<AtomicUsize>,
+        scan_calls: Arc<AtomicUsize>,
+        scanned_boundaries: Arc<Mutex<Vec<Option<RangeBoundary>>>>,
+    }
+
+    #[async_trait]
+    impl KvRangeExecutor for RecordingKvRangeExecutor {
+        async fn get(&self, range_id: &str, key: &[u8]) -> anyhow::Result<Option<Bytes>> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
+            let range = self.engine.open_range(range_id).await?;
+            range.reader().get(key).await
+        }
+
+        async fn scan(
+            &self,
+            range_id: &str,
+            boundary: Option<RangeBoundary>,
+            limit: usize,
+        ) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
+            self.scan_calls.fetch_add(1, Ordering::SeqCst);
+            self.scanned_boundaries
+                .lock()
+                .expect("executor poisoned")
+                .push(boundary.clone());
             let range = self.engine.open_range(range_id).await?;
             range
                 .reader()
@@ -1183,6 +1392,304 @@ mod tests {
         let removed = service.unregister("s2").await.unwrap().unwrap();
         assert_eq!(removed.session_id, "s2");
         assert!(service.list_sessions(Some("t1")).await.unwrap().is_empty());
+    }
+
+    #[derive(Default)]
+    struct CountingDirectory {
+        records: Arc<RwLock<Vec<SessionRecord>>>,
+        list_all_calls: AtomicUsize,
+        list_tenant_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl SessionDirectory for CountingDirectory {
+        async fn register(&self, record: SessionRecord) -> anyhow::Result<Option<SessionRecord>> {
+            self.records.write().expect("directory poisoned").push(record);
+            Ok(None)
+        }
+
+        async fn unregister(&self, session_id: &str) -> anyhow::Result<Option<SessionRecord>> {
+            let mut guard = self.records.write().expect("directory poisoned");
+            let index = guard.iter().position(|record| record.session_id == session_id);
+            Ok(index.map(|index| guard.remove(index)))
+        }
+
+        async fn lookup_identity(
+            &self,
+            identity: &ClientIdentity,
+        ) -> anyhow::Result<Option<SessionRecord>> {
+            Ok(self
+                .records
+                .read()
+                .expect("directory poisoned")
+                .iter()
+                .find(|record| &record.identity == identity)
+                .cloned())
+        }
+
+        async fn lookup_session(&self, session_id: &str) -> anyhow::Result<Option<SessionRecord>> {
+            Ok(self
+                .records
+                .read()
+                .expect("directory poisoned")
+                .iter()
+                .find(|record| record.session_id == session_id)
+                .cloned())
+        }
+
+        async fn list_sessions(&self, tenant_id: Option<&str>) -> anyhow::Result<Vec<SessionRecord>> {
+            match tenant_id {
+                Some(tenant_id) => {
+                    self.list_tenant_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(self
+                        .records
+                        .read()
+                        .expect("directory poisoned")
+                        .iter()
+                        .filter(|record| record.identity.tenant_id == tenant_id)
+                        .cloned()
+                        .collect())
+                }
+                None => {
+                    self.list_all_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(self.records.read().expect("directory poisoned").clone())
+                }
+            }
+        }
+
+        async fn session_count(&self) -> anyhow::Result<usize> {
+            Ok(self.records.read().expect("directory poisoned").len())
+        }
+    }
+
+    #[tokio::test]
+    async fn session_online_check_scheduler_batches_session_checks_via_single_global_list() {
+        let directory = Arc::new(CountingDirectory::default());
+        for (tenant_id, session_id) in [("t1", "s1"), ("t2", "s2")] {
+            directory
+                .register(SessionRecord {
+                    session_id: session_id.into(),
+                    node_id: 1,
+                    kind: SessionKind::Persistent,
+                    identity: ClientIdentity {
+                        tenant_id: tenant_id.into(),
+                        user_id: format!("u-{session_id}"),
+                        client_id: format!("c-{session_id}"),
+                    },
+                    session_expiry_interval_secs: None,
+                    expires_at_ms: None,
+                })
+                .await
+                .unwrap();
+        }
+        let scheduler = SessionOnlineCheckScheduler::new(directory.clone());
+        let checks = scheduler
+            .check_sessions(&["s1".into(), "missing".into(), "s2".into()])
+            .await
+            .unwrap();
+        assert_eq!(checks["s1"], true);
+        assert_eq!(checks["s2"], true);
+        assert_eq!(checks["missing"], false);
+        assert_eq!(directory.list_all_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(directory.list_tenant_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn session_online_check_scheduler_batches_identity_checks_per_tenant() {
+        let directory = Arc::new(CountingDirectory::default());
+        for (tenant_id, user_id, client_id, session_id) in [
+            ("t1", "u1", "c1", "s1"),
+            ("t1", "u2", "c2", "s2"),
+            ("t2", "u3", "c3", "s3"),
+        ] {
+            directory
+                .register(SessionRecord {
+                    session_id: session_id.into(),
+                    node_id: 1,
+                    kind: SessionKind::Persistent,
+                    identity: ClientIdentity {
+                        tenant_id: tenant_id.into(),
+                        user_id: user_id.into(),
+                        client_id: client_id.into(),
+                    },
+                    session_expiry_interval_secs: None,
+                    expires_at_ms: None,
+                })
+                .await
+                .unwrap();
+        }
+        let scheduler = SessionOnlineCheckScheduler::new(directory.clone());
+        let checks = scheduler
+            .check_identities(&[
+                ClientIdentity {
+                    tenant_id: "t1".into(),
+                    user_id: "u1".into(),
+                    client_id: "c1".into(),
+                },
+                ClientIdentity {
+                    tenant_id: "t1".into(),
+                    user_id: "missing".into(),
+                    client_id: "c9".into(),
+                },
+                ClientIdentity {
+                    tenant_id: "t2".into(),
+                    user_id: "u3".into(),
+                    client_id: "c3".into(),
+                },
+            ])
+            .await
+            .unwrap();
+        assert_eq!(checks[&("t1".into(), "u1".into(), "c1".into())], true);
+        assert_eq!(checks[&("t1".into(), "missing".into(), "c9".into())], false);
+        assert_eq!(checks[&("t2".into(), "u3".into(), "c3".into())], true);
+        assert_eq!(directory.list_all_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(directory.list_tenant_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn persistent_sessiondict_recovers_large_tenant_population() {
+        let store = Arc::new(MemorySessionStore::default());
+        let service = PersistentSessionDictHandle::open(store.clone())
+            .await
+            .unwrap();
+        for index in 0..256u32 {
+            service
+                .register(SessionRecord {
+                    session_id: format!("s-{index}"),
+                    node_id: u64::from(index % 3),
+                    kind: SessionKind::Persistent,
+                    identity: ClientIdentity {
+                        tenant_id: "t-large".into(),
+                        user_id: format!("u-{index}"),
+                        client_id: format!("c-{index}"),
+                    },
+                    session_expiry_interval_secs: Some(60),
+                    expires_at_ms: Some(1_000 + u64::from(index)),
+                })
+                .await
+                .unwrap();
+        }
+
+        let reopened = PersistentSessionDictHandle::open(store).await.unwrap();
+        let records = reopened.list_sessions(Some("t-large")).await.unwrap();
+        assert_eq!(records.len(), 256);
+        assert_eq!(reopened.session_count().await.unwrap(), 256);
+        assert!(reopened.lookup_session("s-42").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn replicated_sessiondict_lookup_session_uses_exact_get_not_full_scan() {
+        let engine = MemoryKvEngine::default();
+        engine
+            .bootstrap(KvRangeBootstrap {
+                range_id: "session-range-get".into(),
+                boundary: RangeBoundary::full(),
+            })
+            .await
+            .unwrap();
+        let router = Arc::new(MemoryKvRangeRouter::default());
+        router
+            .upsert(ReplicatedRangeDescriptor::new(
+                "session-range-get",
+                session_scan_shard("t1"),
+                RangeBoundary::full(),
+                1,
+                1,
+                Some(1),
+                vec![RangeReplica::new(
+                    1,
+                    ReplicaRole::Voter,
+                    ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ))
+            .await
+            .unwrap();
+        let executor = Arc::new(RecordingKvRangeExecutor {
+            engine: engine.clone(),
+            ..RecordingKvRangeExecutor::default()
+        });
+        let service = ReplicatedSessionDictHandle::new(router.clone(), executor.clone());
+        let record = SessionRecord {
+            session_id: "s1".into(),
+            node_id: 1,
+            kind: SessionKind::Persistent,
+            identity: ClientIdentity {
+                tenant_id: "t1".into(),
+                user_id: "u1".into(),
+                client_id: "c1".into(),
+            },
+            session_expiry_interval_secs: None,
+            expires_at_ms: None,
+        };
+        service.register(record).await.unwrap();
+        executor.get_calls.store(0, Ordering::SeqCst);
+        executor.scan_calls.store(0, Ordering::SeqCst);
+        let cold = ReplicatedSessionDictHandle::new(router, executor.clone());
+
+        let loaded = cold.lookup_session("s1").await.unwrap().unwrap();
+        assert_eq!(loaded.session_id, "s1");
+        assert_eq!(executor.scan_calls.load(Ordering::SeqCst), 0);
+        assert!(executor.get_calls.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn replicated_sessiondict_lookup_session_reuses_cached_range_after_first_hit() {
+        let engine = MemoryKvEngine::default();
+        engine
+            .bootstrap(KvRangeBootstrap {
+                range_id: "session-range-cache".into(),
+                boundary: RangeBoundary::full(),
+            })
+            .await
+            .unwrap();
+        let router = Arc::new(MemoryKvRangeRouter::default());
+        router
+            .upsert(ReplicatedRangeDescriptor::new(
+                "session-range-cache",
+                session_scan_shard("t1"),
+                RangeBoundary::full(),
+                1,
+                1,
+                Some(1),
+                vec![RangeReplica::new(
+                    1,
+                    ReplicaRole::Voter,
+                    ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ))
+            .await
+            .unwrap();
+        let executor = Arc::new(RecordingKvRangeExecutor {
+            engine: engine.clone(),
+            ..RecordingKvRangeExecutor::default()
+        });
+        let service = ReplicatedSessionDictHandle::new(router, executor.clone());
+        service
+            .register(SessionRecord {
+                session_id: "s1".into(),
+                node_id: 1,
+                kind: SessionKind::Persistent,
+                identity: ClientIdentity {
+                    tenant_id: "t1".into(),
+                    user_id: "u1".into(),
+                    client_id: "c1".into(),
+                },
+                session_expiry_interval_secs: None,
+                expires_at_ms: None,
+            })
+            .await
+            .unwrap();
+
+        let _ = service.lookup_session("s1").await.unwrap().unwrap();
+        executor.get_calls.store(0, Ordering::SeqCst);
+        let _ = service.lookup_session("s1").await.unwrap().unwrap();
+        assert_eq!(executor.get_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

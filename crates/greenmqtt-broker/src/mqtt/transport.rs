@@ -7,16 +7,19 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Once;
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
+use tokio::time::{timeout, Duration};
 use tokio_tungstenite::accept_async;
 
 use super::session::{drive_session, TcpTransport, WsTransport};
 use super::BrokerRuntime;
 
 static RUSTLS_PROVIDER: Once = Once::new();
+const PROXY_V1_MAX_HEADER_BYTES: usize = 108;
+const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct QuicBiStream {
     send: SendStream,
@@ -55,6 +58,71 @@ impl AsyncWrite for QuicBiStream {
     }
 }
 
+fn proxy_protocol_enabled() -> bool {
+    std::env::var("GREENMQTT_PROXY_PROTOCOL")
+        .ok()
+        .map(|value| matches!(value.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+fn handshake_timeout() -> Duration {
+    std::env::var("GREENMQTT_HANDSHAKE_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_HANDSHAKE_TIMEOUT)
+}
+
+fn ingress_bandwidth_limits() -> (Option<(u64, u64)>, Option<(u64, u64)>) {
+    fn parse_limit(rate_var: &str, burst_var: &str) -> Option<(u64, u64)> {
+        let rate = std::env::var(rate_var).ok()?.parse::<u64>().ok()?;
+        let burst = std::env::var(burst_var)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(rate.max(1));
+        Some((rate.max(1), burst.max(1)))
+    }
+    (
+        parse_limit(
+            "GREENMQTT_INGRESS_READ_RATE_PER_SEC",
+            "GREENMQTT_INGRESS_READ_BURST",
+        ),
+        parse_limit(
+            "GREENMQTT_INGRESS_WRITE_RATE_PER_SEC",
+            "GREENMQTT_INGRESS_WRITE_BURST",
+        ),
+    )
+}
+
+fn parse_proxy_protocol_v1_header(buffer: &[u8]) -> anyhow::Result<Option<usize>> {
+    if !buffer.starts_with(b"PROXY ") {
+        return Ok(None);
+    }
+    let Some(end) = buffer.windows(2).position(|window| window == b"\r\n") else {
+        anyhow::bail!("incomplete proxy protocol header");
+    };
+    let end = end + 2;
+    anyhow::ensure!(
+        end <= PROXY_V1_MAX_HEADER_BYTES,
+        "proxy protocol header exceeds maximum size"
+    );
+    let line = std::str::from_utf8(&buffer[..end.saturating_sub(2)])?;
+    let parts = line.split_whitespace().collect::<Vec<_>>();
+    anyhow::ensure!(parts.len() >= 2, "invalid proxy protocol header");
+    anyhow::ensure!(parts[0] == "PROXY", "invalid proxy protocol prefix");
+    Ok(Some(end))
+}
+
+async fn maybe_strip_proxy_protocol(stream: &mut tokio::net::TcpStream) -> anyhow::Result<()> {
+    let mut peek = vec![0u8; PROXY_V1_MAX_HEADER_BYTES];
+    let read = stream.peek(&mut peek).await?;
+    if let Some(header_len) = parse_proxy_protocol_v1_header(&peek[..read])? {
+        let mut discard = vec![0u8; header_len];
+        stream.read_exact(&mut discard).await?;
+    }
+    Ok(())
+}
+
 pub async fn serve_tcp<A, C, H>(
     broker: Arc<BrokerRuntime<A, C, H>>,
     bind: SocketAddr,
@@ -78,8 +146,20 @@ where
     H: EventHook + 'static,
 {
     let listener = TcpListener::bind(bind).await?;
+    let proxy_protocol = proxy_protocol_enabled();
+    let ingress_limits = ingress_bandwidth_limits();
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (mut stream, _) = listener.accept().await?;
+        if proxy_protocol {
+            if let Err(error) = maybe_strip_proxy_protocol(&mut stream).await {
+                eprintln!("greenmqtt tcp proxy protocol error: {error:#}");
+                continue;
+            }
+        }
+        if !broker.allow_connection_attempt() {
+            drop(stream);
+            continue;
+        }
         let broker = broker.clone();
         let listener_profile = listener_profile.clone();
         let bandwidth = broker.bandwidth_limits();
@@ -95,7 +175,7 @@ where
             if let Err(error) = with_listener_profile(
                 listener_profile,
                 drive_session(
-                    TcpTransport::with_bandwidth(stream, bandwidth.0, bandwidth.1),
+                    TcpTransport::with_bandwidth(stream, ingress_limits.0.or(bandwidth.0), ingress_limits.1.or(bandwidth.1)),
                     broker,
                 ),
             )
@@ -136,8 +216,21 @@ where
 {
     let listener = TcpListener::bind(bind).await?;
     let acceptor = load_tls_acceptor(cert_path.as_ref(), key_path.as_ref())?;
+    let proxy_protocol = proxy_protocol_enabled();
+    let timeout_window = handshake_timeout();
+    let ingress_limits = ingress_bandwidth_limits();
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (mut stream, _) = listener.accept().await?;
+        if proxy_protocol {
+            if let Err(error) = maybe_strip_proxy_protocol(&mut stream).await {
+                eprintln!("greenmqtt tls proxy protocol error: {error:#}");
+                continue;
+            }
+        }
+        if !broker.allow_connection_attempt() {
+            drop(stream);
+            continue;
+        }
         let broker = broker.clone();
         let listener_profile = listener_profile.clone();
         let bandwidth = broker.bandwidth_limits();
@@ -151,12 +244,12 @@ where
         };
         tokio::spawn(async move {
             let permit_guard = permit;
-            match acceptor.accept(stream).await {
-                Ok(stream) => {
+            match timeout(timeout_window, acceptor.accept(stream)).await {
+                Ok(Ok(stream)) => {
                     if let Err(error) = with_listener_profile(
                         listener_profile,
                         drive_session(
-                            TcpTransport::with_bandwidth(stream, bandwidth.0, bandwidth.1),
+                            TcpTransport::with_bandwidth(stream, ingress_limits.0.or(bandwidth.0), ingress_limits.1.or(bandwidth.1)),
                             broker,
                         ),
                     )
@@ -165,8 +258,11 @@ where
                         eprintln!("greenmqtt tls session error: {error:#}");
                     }
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     eprintln!("greenmqtt tls handshake error: {error:#}");
+                }
+                Err(_) => {
+                    eprintln!("greenmqtt tls handshake timeout");
                 }
             }
             drop(permit_guard);
@@ -197,8 +293,21 @@ where
     H: EventHook + 'static,
 {
     let listener = TcpListener::bind(bind).await?;
+    let proxy_protocol = proxy_protocol_enabled();
+    let timeout_window = handshake_timeout();
+    let ingress_limits = ingress_bandwidth_limits();
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (mut stream, _) = listener.accept().await?;
+        if proxy_protocol {
+            if let Err(error) = maybe_strip_proxy_protocol(&mut stream).await {
+                eprintln!("greenmqtt ws proxy protocol error: {error:#}");
+                continue;
+            }
+        }
+        if !broker.allow_connection_attempt() {
+            drop(stream);
+            continue;
+        }
         let broker = broker.clone();
         let listener_profile = listener_profile.clone();
         let bandwidth = broker.bandwidth_limits();
@@ -211,22 +320,29 @@ where
         };
         tokio::spawn(async move {
             let permit_guard = permit;
-            match accept_async(stream).await {
+            match timeout(timeout_window, accept_async(stream)).await {
                 Ok(stream) => {
-                    if let Err(error) = with_listener_profile(
-                        listener_profile,
-                        drive_session(
-                            WsTransport::with_bandwidth(stream, bandwidth.0, bandwidth.1),
-                            broker,
-                        ),
-                    )
-                    .await
-                    {
-                        eprintln!("greenmqtt ws session error: {error:#}");
+                    match stream {
+                        Ok(stream) => {
+                            if let Err(error) = with_listener_profile(
+                                listener_profile,
+                                drive_session(
+                                    WsTransport::with_bandwidth(stream, ingress_limits.0.or(bandwidth.0), ingress_limits.1.or(bandwidth.1)),
+                                    broker,
+                                ),
+                            )
+                            .await
+                            {
+                                eprintln!("greenmqtt ws session error: {error:#}");
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("greenmqtt ws handshake error: {error:#}");
+                        }
                     }
                 }
-                Err(error) => {
-                    eprintln!("greenmqtt ws handshake error: {error:#}");
+                Err(_) => {
+                    eprintln!("greenmqtt ws handshake timeout");
                 }
             }
             drop(permit_guard);
@@ -262,8 +378,21 @@ where
 {
     let listener = TcpListener::bind(bind).await?;
     let acceptor = load_tls_acceptor(cert_path.as_ref(), key_path.as_ref())?;
+    let proxy_protocol = proxy_protocol_enabled();
+    let timeout_window = handshake_timeout();
+    let ingress_limits = ingress_bandwidth_limits();
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (mut stream, _) = listener.accept().await?;
+        if proxy_protocol {
+            if let Err(error) = maybe_strip_proxy_protocol(&mut stream).await {
+                eprintln!("greenmqtt wss proxy protocol error: {error:#}");
+                continue;
+            }
+        }
+        if !broker.allow_connection_attempt() {
+            drop(stream);
+            continue;
+        }
         let broker = broker.clone();
         let listener_profile = listener_profile.clone();
         let bandwidth = broker.bandwidth_limits();
@@ -277,13 +406,13 @@ where
         };
         tokio::spawn(async move {
             let permit_guard = permit;
-            match acceptor.accept(stream).await {
-                Ok(stream) => match accept_async(stream).await {
-                    Ok(stream) => {
+            match timeout(timeout_window, acceptor.accept(stream)).await {
+                Ok(Ok(stream)) => match timeout(timeout_window, accept_async(stream)).await {
+                    Ok(Ok(stream)) => {
                         if let Err(error) = with_listener_profile(
                             listener_profile,
                             drive_session(
-                                WsTransport::with_bandwidth(stream, bandwidth.0, bandwidth.1),
+                                WsTransport::with_bandwidth(stream, ingress_limits.0.or(bandwidth.0), ingress_limits.1.or(bandwidth.1)),
                                 broker,
                             ),
                         )
@@ -292,12 +421,18 @@ where
                             eprintln!("greenmqtt wss session error: {error:#}");
                         }
                     }
-                    Err(error) => {
+                    Ok(Err(error)) => {
                         eprintln!("greenmqtt wss websocket handshake error: {error:#}");
                     }
+                    Err(_) => {
+                        eprintln!("greenmqtt wss websocket handshake timeout");
+                    }
                 },
-                Err(error) => {
+                Ok(Err(error)) => {
                     eprintln!("greenmqtt wss tls handshake error: {error:#}");
+                }
+                Err(_) => {
+                    eprintln!("greenmqtt wss tls handshake timeout");
                 }
             }
             drop(permit_guard);
@@ -331,6 +466,8 @@ where
     C: AclProvider + 'static,
     H: EventHook + 'static,
 {
+    let timeout_window = handshake_timeout();
+    let ingress_limits = ingress_bandwidth_limits();
     let endpoint = Endpoint::server(
         load_quic_server_config(cert_path.as_ref(), key_path.as_ref())?,
         bind,
@@ -343,49 +480,60 @@ where
         let listener_profile = listener_profile.clone();
         let bandwidth = broker.bandwidth_limits();
         tokio::spawn(async move {
-            match incoming.await {
+            match timeout(timeout_window, incoming).await {
                 Ok(connection) => {
-                    let permit = match broker.try_acquire_connection_slot() {
-                        Ok(permit) => permit,
-                        Err(()) => {
-                            connection.close(0u32.into(), b"connection limit exceeded");
-                            return;
-                        }
-                    };
-                    let permit_guard = permit;
-                    loop {
-                        match connection.accept_bi().await {
-                            Ok((send, recv)) => {
-                                let broker = broker.clone();
-                                let listener_profile = listener_profile.clone();
-                                tokio::spawn(async move {
-                                    if let Err(error) = with_listener_profile(
-                                        listener_profile,
-                                        drive_session(
-                                            TcpTransport::with_bandwidth(
-                                                QuicBiStream { send, recv },
-                                                bandwidth.0,
-                                                bandwidth.1,
-                                            ),
-                                            broker,
-                                        ),
-                                    )
-                                    .await
-                                    {
-                                        eprintln!("greenmqtt quic session error: {error:#}");
+                    match connection {
+                        Ok(connection) => {
+                            if !broker.allow_connection_attempt() {
+                                connection.close(0u32.into(), b"connection rate limit exceeded");
+                                return;
+                            }
+                            let permit = match broker.try_acquire_connection_slot() {
+                                Ok(permit) => permit,
+                                Err(()) => {
+                                    connection.close(0u32.into(), b"connection limit exceeded");
+                                    return;
+                                }
+                            };
+                            let permit_guard = permit;
+                            loop {
+                                match connection.accept_bi().await {
+                                    Ok((send, recv)) => {
+                                        let broker = broker.clone();
+                                        let listener_profile = listener_profile.clone();
+                                        tokio::spawn(async move {
+                                            if let Err(error) = with_listener_profile(
+                                                listener_profile,
+                                                drive_session(
+                                                    TcpTransport::with_bandwidth(
+                                                        QuicBiStream { send, recv },
+                                                        ingress_limits.0.or(bandwidth.0),
+                                                        ingress_limits.1.or(bandwidth.1),
+                                                    ),
+                                                    broker,
+                                                ),
+                                            )
+                                            .await
+                                            {
+                                                eprintln!("greenmqtt quic session error: {error:#}");
+                                            }
+                                        });
                                     }
-                                });
+                                    Err(error) => {
+                                        eprintln!("greenmqtt quic stream accept error: {error:#}");
+                                        break;
+                                    }
+                                }
                             }
-                            Err(error) => {
-                                eprintln!("greenmqtt quic stream accept error: {error:#}");
-                                break;
-                            }
+                            drop(permit_guard);
+                        }
+                        Err(error) => {
+                            eprintln!("greenmqtt quic handshake error: {error:#}");
                         }
                     }
-                    drop(permit_guard);
                 }
-                Err(error) => {
-                    eprintln!("greenmqtt quic handshake error: {error:#}");
+                Err(_) => {
+                    eprintln!("greenmqtt quic handshake timeout");
                 }
             }
         });
@@ -431,4 +579,47 @@ fn load_tls_material(
     let key = rustls_pemfile::private_key(&mut key_reader)?
         .ok_or_else(|| anyhow::anyhow!("no private key found in {}", key_path.display()))?;
     Ok((certs, key))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{handshake_timeout, ingress_bandwidth_limits, parse_proxy_protocol_v1_header};
+    use std::time::Duration;
+
+    #[test]
+    fn parses_proxy_protocol_v1_header_length() {
+        let header = b"PROXY TCP4 203.0.113.1 192.0.2.1 56324 1883\r\nmqtt";
+        let parsed = parse_proxy_protocol_v1_header(header).unwrap();
+        assert_eq!(parsed, Some(45));
+    }
+
+    #[test]
+    fn ignores_non_proxy_prefix() {
+        assert!(parse_proxy_protocol_v1_header(b"\x10\x0emqtt-connect")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn handshake_timeout_reads_env_override() {
+        std::env::set_var("GREENMQTT_HANDSHAKE_TIMEOUT_MS", "1500");
+        assert_eq!(handshake_timeout(), Duration::from_millis(1500));
+        std::env::remove_var("GREENMQTT_HANDSHAKE_TIMEOUT_MS");
+    }
+
+    #[test]
+    fn ingress_bandwidth_limits_read_env_override() {
+        std::env::set_var("GREENMQTT_INGRESS_READ_RATE_PER_SEC", "1024");
+        std::env::set_var("GREENMQTT_INGRESS_READ_BURST", "2048");
+        std::env::set_var("GREENMQTT_INGRESS_WRITE_RATE_PER_SEC", "512");
+        std::env::set_var("GREENMQTT_INGRESS_WRITE_BURST", "1024");
+        assert_eq!(
+            ingress_bandwidth_limits(),
+            (Some((1024, 2048)), Some((512, 1024)))
+        );
+        std::env::remove_var("GREENMQTT_INGRESS_READ_RATE_PER_SEC");
+        std::env::remove_var("GREENMQTT_INGRESS_READ_BURST");
+        std::env::remove_var("GREENMQTT_INGRESS_WRITE_RATE_PER_SEC");
+        std::env::remove_var("GREENMQTT_INGRESS_WRITE_BURST");
+    }
 }

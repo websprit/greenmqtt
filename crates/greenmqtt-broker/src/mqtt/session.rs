@@ -1,4 +1,5 @@
 use crate::broker::metrics::BrokerMetrics;
+use crate::broker::pressure::PressureLevel;
 use crate::broker::send_quota::SendQuotaManager;
 use crate::broker::token_bucket::TokenBucket;
 use crate::mqtt::connect::{
@@ -227,6 +228,7 @@ use greenmqtt_core::{Delivery, InflightPhase};
 use greenmqtt_plugin_api::{AclProvider, AuthProvider, EventHook};
 use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -234,6 +236,77 @@ use tokio::time::sleep;
 pub(crate) const MAX_PENDING_INBOUND_QOS2: usize = 256;
 const WRITE_STALL_TIMEOUT: Duration = Duration::from_millis(100);
 const WRITE_STALL_BACKOFF: Duration = Duration::from_millis(100);
+const PRESSURE_WARNING_BACKOFF: Duration = Duration::from_millis(25);
+const PRESSURE_CRITICAL_BACKOFF: Duration = Duration::from_millis(100);
+const PRESSURE_EMERGENCY_BACKOFF: Duration = Duration::from_millis(250);
+const PRESSURE_EMERGENCY_DISCONNECT_AFTER: Duration = Duration::from_secs(2);
+const INBOUND_PUBLISH_DEDUP_CAPACITY: usize = 1024;
+
+fn ingress_backoff_delay(level: PressureLevel) -> Option<Duration> {
+    match level {
+        PressureLevel::Warning => Some(PRESSURE_WARNING_BACKOFF),
+        PressureLevel::Critical => Some(PRESSURE_CRITICAL_BACKOFF),
+        PressureLevel::Emergency => Some(PRESSURE_EMERGENCY_BACKOFF),
+        PressureLevel::Normal => None,
+    }
+}
+
+fn pressure_disconnect_timeout_reached(level: PressureLevel, elapsed: Duration) -> bool {
+    matches!(level, PressureLevel::Emergency) && elapsed >= PRESSURE_EMERGENCY_DISCONNECT_AFTER
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InboundPublishFingerprint {
+    digest: u64,
+}
+
+fn inbound_publish_fingerprint(publish: &PublishRequest) -> InboundPublishFingerprint {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    publish.topic.hash(&mut hasher);
+    publish.payload.hash(&mut hasher);
+    publish.qos.hash(&mut hasher);
+    publish.retain.hash(&mut hasher);
+    InboundPublishFingerprint {
+        digest: hasher.finish(),
+    }
+}
+
+#[derive(Debug)]
+struct InboundPublishDedupCache {
+    entries: HashMap<u16, InboundPublishFingerprint>,
+    order: VecDeque<u16>,
+    capacity: usize,
+}
+
+impl InboundPublishDedupCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            capacity,
+        }
+    }
+
+    fn is_duplicate(&self, packet_id: u16, fingerprint: InboundPublishFingerprint) -> bool {
+        self.entries.get(&packet_id).copied() == Some(fingerprint)
+    }
+
+    fn remember(&mut self, packet_id: u16, fingerprint: InboundPublishFingerprint) {
+        if !self.entries.contains_key(&packet_id) {
+            self.order.push_back(packet_id);
+        }
+        self.entries.insert(packet_id, fingerprint);
+        while self.order.len() > self.capacity {
+            if let Some(evicted) = self.order.pop_front() {
+                self.entries.remove(&evicted);
+            }
+        }
+    }
+
+    fn forget(&mut self, packet_id: u16) {
+        self.entries.remove(&packet_id);
+    }
+}
 
 pub(crate) struct PreparedReplayPacket {
     packet: Vec<u8>,
@@ -265,12 +338,35 @@ where
     let mut outbound_qos1 = HashMap::<u16, Delivery>::new();
     let mut outbound_qos2_publish = HashMap::<u16, Delivery>::new();
     let mut outbound_qos2_release = HashMap::<u16, Delivery>::new();
+    let mut inbound_qos1_dedup = InboundPublishDedupCache::new(INBOUND_PUBLISH_DEDUP_CAPACITY);
+    let mut inbound_qos2_dedup = InboundPublishDedupCache::new(INBOUND_PUBLISH_DEDUP_CAPACITY);
     let mut next_outbound_packet_id = 1u16;
     let mut protocol_session_state = ProtocolSessionState::default();
     let mut push_paused_until = None;
     let mut write_stall_count = 0usize;
     let mut write_stall_duration = Duration::ZERO;
+    let mut pressure_started_at = None;
     let result = 'session: loop {
+        let pressure_level = broker.current_pressure_level();
+        if let Some(delay) = ingress_backoff_delay(pressure_level) {
+            let started = pressure_started_at.get_or_insert_with(Instant::now);
+            if pressure_disconnect_timeout_reached(pressure_level, started.elapsed()) {
+                if protocol_session_state.active_session_id().is_some() {
+                    let _ = stream
+                        .write_bytes(&build_disconnect_packet_with_server_reference(
+                            protocol_level,
+                            Some(if protocol_level == 5 { 0x89 } else { 0x03 }),
+                            include_problem_information.then_some("server busy"),
+                            broker.config.server_reference.as_deref(),
+                        ))
+                        .await;
+                }
+                break 'session Ok(());
+            }
+            sleep(delay).await;
+        } else {
+            pressure_started_at = None;
+        }
         tokio::select! {
             packet = stream.read_packet(protocol_level, broker.config.max_packet_size) => {
                 let packet = match packet {
@@ -915,6 +1011,44 @@ where
                             retain: publish.retain,
                             properties: publish.properties,
                         };
+                        let fingerprint = inbound_publish_fingerprint(&publish_request);
+                        if publish.qos == 1 {
+                            if let Some(packet_id) = publish.packet_id {
+                                if inbound_qos1_dedup.is_duplicate(packet_id, fingerprint) {
+                                    if let Err(error) = write_puback(
+                                        &mut stream,
+                                        protocol_level,
+                                        packet_id,
+                                        None,
+                                        None,
+                                    )
+                                    .await
+                                    {
+                                        break 'session Err(error);
+                                    }
+                                    continue;
+                                }
+                            }
+                        } else if publish.qos == 2 {
+                            if let Some(packet_id) = publish.packet_id {
+                                if pending_inbound_qos2.contains(&packet_id)
+                                    && inbound_qos2_dedup.is_duplicate(packet_id, fingerprint)
+                                {
+                                    if let Err(error) = write_pubrec(
+                                        &mut stream,
+                                        protocol_level,
+                                        packet_id,
+                                        None,
+                                        None,
+                                    )
+                                    .await
+                                    {
+                                        break 'session Err(error);
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
                         if let Err(error) = validate_utf8_payload_format(
                             &publish_request.properties,
                             &publish_request.payload,
@@ -1009,6 +1143,7 @@ where
                         }
                         if publish.qos == 1 {
                             if let Some(packet_id) = publish.packet_id {
+                                inbound_qos1_dedup.remember(packet_id, fingerprint);
                                     if let Err(error) = write_puback(
                                         &mut stream,
                                         protocol_level,
@@ -1037,6 +1172,7 @@ where
                                     break 'session Err(error);
                                 }
                                 pending_inbound_qos2.insert(packet_id);
+                                inbound_qos2_dedup.remember(packet_id, fingerprint);
                                     if let Err(error) = write_pubrec(
                                         &mut stream,
                                         protocol_level,
@@ -1072,6 +1208,7 @@ where
                             }
                         }
                         send_quota.note_ack();
+                        inbound_qos1_dedup.forget(packet_id);
                         let active_session = match require_packet_session_or_disconnect(
                             &mut stream,
                             &mut protocol_session_state,
@@ -1150,6 +1287,7 @@ where
                             let _ = write_protocol_state_error_disconnect_with_context(&mut stream, protocol_level, include_problem_information, state_error, broker.config.server_reference.as_deref()).await;
                             break 'session Err(anyhow::anyhow!(state_error.reason_string));
                         }
+                        inbound_qos2_dedup.forget(packet_id);
                         if let Err(error) =
                             write_pubcomp(&mut stream, protocol_level, packet_id).await
                         {
@@ -1418,4 +1556,71 @@ where
         );
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        inbound_publish_fingerprint, ingress_backoff_delay, pressure_disconnect_timeout_reached,
+        InboundPublishDedupCache, PRESSURE_CRITICAL_BACKOFF, PRESSURE_EMERGENCY_BACKOFF,
+        PRESSURE_EMERGENCY_DISCONNECT_AFTER, PRESSURE_WARNING_BACKOFF,
+    };
+    use crate::broker::pressure::PressureLevel;
+    use crate::mqtt::PublishRequest;
+    use tokio::time::Duration;
+
+    #[test]
+    fn ingress_backoff_delay_maps_pressure_levels() {
+        assert_eq!(ingress_backoff_delay(PressureLevel::Normal), None);
+        assert_eq!(
+            ingress_backoff_delay(PressureLevel::Warning),
+            Some(PRESSURE_WARNING_BACKOFF)
+        );
+        assert_eq!(
+            ingress_backoff_delay(PressureLevel::Critical),
+            Some(PRESSURE_CRITICAL_BACKOFF)
+        );
+        assert_eq!(
+            ingress_backoff_delay(PressureLevel::Emergency),
+            Some(PRESSURE_EMERGENCY_BACKOFF)
+        );
+    }
+
+    #[test]
+    fn emergency_pressure_disconnect_requires_timeout() {
+        assert!(!pressure_disconnect_timeout_reached(
+            PressureLevel::Critical,
+            PRESSURE_EMERGENCY_DISCONNECT_AFTER
+        ));
+        assert!(!pressure_disconnect_timeout_reached(
+            PressureLevel::Emergency,
+            PRESSURE_EMERGENCY_DISCONNECT_AFTER - Duration::from_millis(1)
+        ));
+        assert!(pressure_disconnect_timeout_reached(
+            PressureLevel::Emergency,
+            PRESSURE_EMERGENCY_DISCONNECT_AFTER
+        ));
+    }
+
+    #[test]
+    fn inbound_publish_dedup_cache_only_hits_same_packet_id_and_fingerprint() {
+        let publish = PublishRequest {
+            topic: "devices/a/state".into(),
+            payload: b"up".to_vec().into(),
+            qos: 1,
+            retain: false,
+            properties: Default::default(),
+        };
+        let fingerprint = inbound_publish_fingerprint(&publish);
+        let mut cache = InboundPublishDedupCache::new(8);
+        assert!(!cache.is_duplicate(7, fingerprint));
+        cache.remember(7, fingerprint);
+        assert!(cache.is_duplicate(7, fingerprint));
+
+        let changed = inbound_publish_fingerprint(&PublishRequest {
+            payload: b"down".to_vec().into(),
+            ..publish
+        });
+        assert!(!cache.is_duplicate(7, changed));
+    }
 }

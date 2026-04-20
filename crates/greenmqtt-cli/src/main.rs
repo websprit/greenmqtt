@@ -30,8 +30,9 @@ use greenmqtt_retain::{
 };
 use greenmqtt_rpc::{
     DistGrpcClient, InboxGrpcClient, KvRangeGrpcClient, KvRangeGrpcExecutorFactory,
-    MetadataGrpcClient, PersistentMetadataRegistry, RetainGrpcClient, RpcRuntime,
-    SessionDictGrpcClient, StaticPeerForwarder, StaticServiceEndpointRegistry,
+    MetadataGrpcClient, PersistentMetadataRegistry, ReplicatedMetadataRegistry,
+    RetainGrpcClient, RpcRuntime, SessionDictGrpcClient, StaticPeerForwarder,
+    StaticServiceEndpointRegistry,
 };
 use greenmqtt_sessiondict::{
     PersistentSessionDictHandle, ReplicatedSessionDictHandle, SessionDictHandle, SessionDirectory,
@@ -717,6 +718,7 @@ async fn main() -> anyhow::Result<()> {
             peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
             assignment_registry: None,
             range_host: None,
+            range_runtime: None,
         }
         .serve(rpc_bind)
         .await?;
@@ -965,6 +967,24 @@ async fn main() -> anyhow::Result<()> {
                 let registry = Arc::new(PersistentMetadataRegistry::open(path).await?);
                 (registry.clone(), registry)
             }
+            "replicated" => {
+                let range_endpoint = std::env::var("GREENMQTT_RANGE_ENDPOINT")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .or_else(|| state_endpoint.clone())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "GREENMQTT_METADATA_BACKEND=replicated requires GREENMQTT_RANGE_ENDPOINT or GREENMQTT_STATE_ENDPOINT"
+                        )
+                    })?;
+                let range_id = std::env::var("GREENMQTT_METADATA_RANGE_ID")
+                    .unwrap_or_else(|_| "__metadata".to_string());
+                let registry = Arc::new(ReplicatedMetadataRegistry::new(
+                    Arc::new(KvRangeGrpcClient::connect(range_endpoint).await?),
+                    range_id,
+                ));
+                (registry.clone(), registry)
+            }
             other => anyhow::bail!("unsupported GREENMQTT_METADATA_BACKEND: {other}"),
         };
         shard_registry
@@ -1004,6 +1024,7 @@ async fn main() -> anyhow::Result<()> {
             peer_sink: broker.clone(),
             assignment_registry: Some(metadata_registry),
             range_host: None,
+            range_runtime: None,
         };
         let mut tasks = JoinSet::new();
         tasks.spawn(async move { http.start().await });

@@ -1,4 +1,8 @@
 use super::{
+    DelayedLwtPublish, InboxBatchScheduler,
+    InboxBalanceAction, InboxBalancePolicy, InboxDelayTaskRunner, InboxDelayedTaskHandler, InboxExpiryStats,
+    InboxInflightCommit, InboxDelayedTask, InboxMaintenanceWorker, InboxTenantStats,
+    InboxUnsubscribeSpec, TenantInboxGcRunner, ThresholdInboxBalancePolicy,
     inbox_session_shard, inbox_tenant_scan_shard, inflight_session_shard,
     inflight_tenant_scan_shard, subscription_shard, InboxHandle, InboxService,
     PersistentInboxHandle, ReplicatedInboxHandle, OFFLINE_KEY_PREFIX,
@@ -6,9 +10,9 @@ use super::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use greenmqtt_core::{
-    InflightMessage, InflightPhase, OfflineMessage, PublishProperties, RangeBoundary, RangeReplica,
-    ReplicaRole, ReplicaSyncState, ReplicatedRangeDescriptor, ServiceShardKey,
-    ServiceShardLifecycle, SessionKind, Subscription,
+    InflightMessage, InflightPhase, OfflineMessage, PublishProperties, PublishRequest, RangeBoundary,
+    RangeReplica, ReplicaRole, ReplicaSyncState, ReplicatedRangeDescriptor, ServiceShardKey,
+    ServiceShardLifecycle, SessionId, SessionKind, Subscription,
 };
 use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter, MemoryKvRangeRouter};
 use greenmqtt_kv_engine::{
@@ -19,7 +23,8 @@ use greenmqtt_storage::{
     SubscriptionStore,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[derive(Clone)]
 struct LocalKvRangeExecutor {
@@ -39,6 +44,61 @@ impl KvRangeExecutor for LocalKvRangeExecutor {
         boundary: Option<RangeBoundary>,
         limit: usize,
     ) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
+        let range = self.engine.open_range(range_id).await?;
+        range
+            .reader()
+            .scan(&boundary.unwrap_or_else(RangeBoundary::full), limit)
+            .await
+    }
+
+    async fn apply(&self, range_id: &str, mutations: Vec<KvMutation>) -> anyhow::Result<()> {
+        let range = self.engine.open_range(range_id).await?;
+        range.writer().apply(mutations).await
+    }
+
+    async fn checkpoint(
+        &self,
+        range_id: &str,
+        checkpoint_id: &str,
+    ) -> anyhow::Result<KvRangeCheckpoint> {
+        let range = self.engine.open_range(range_id).await?;
+        range.checkpoint(checkpoint_id).await
+    }
+
+    async fn snapshot(&self, range_id: &str) -> anyhow::Result<KvRangeSnapshot> {
+        let range = self.engine.open_range(range_id).await?;
+        range.snapshot().await
+    }
+}
+
+#[derive(Clone, Default)]
+struct RecordingKvRangeExecutor {
+    engine: MemoryKvEngine,
+    scan_boundaries: Arc<Mutex<Vec<Option<RangeBoundary>>>>,
+    get_keys: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+#[async_trait]
+impl KvRangeExecutor for RecordingKvRangeExecutor {
+    async fn get(&self, range_id: &str, key: &[u8]) -> anyhow::Result<Option<Bytes>> {
+        self.get_keys
+            .lock()
+            .expect("executor poisoned")
+            .push(key.to_vec());
+        let range = self.engine.open_range(range_id).await?;
+        range.reader().get(key).await
+    }
+
+    async fn scan(
+        &self,
+        range_id: &str,
+        boundary: Option<RangeBoundary>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
+        self.scan_boundaries
+            .lock()
+            .expect("executor poisoned")
+            .push(boundary.clone());
         let range = self.engine.open_range(range_id).await?;
         range
             .reader()
@@ -2268,4 +2328,664 @@ async fn replicated_inbox_replaying_same_offline_mutation_is_idempotent() {
     let messages = inbox.peek(&"s1".into()).await.unwrap();
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].payload.as_ref(), b"first");
+}
+
+#[tokio::test]
+async fn local_inbox_expire_messages_removes_only_expired_entries() {
+    let inbox = InboxHandle::default();
+    inbox
+        .enqueue(OfflineMessage {
+            tenant_id: "t1".into(),
+            session_id: "s1".into(),
+            topic: "devices/a/state".into(),
+            payload: b"expired-offline".to_vec().into(),
+            qos: 1,
+            retain: false,
+            from_session_id: "src".into(),
+            properties: PublishProperties {
+                message_expiry_interval_secs: Some(1),
+                stored_at_ms: Some(1_000),
+                ..PublishProperties::default()
+            },
+        })
+        .await
+        .unwrap();
+    inbox
+        .enqueue(OfflineMessage {
+            tenant_id: "t1".into(),
+            session_id: "s2".into(),
+            topic: "devices/b/state".into(),
+            payload: b"fresh-offline".to_vec().into(),
+            qos: 1,
+            retain: false,
+            from_session_id: "src".into(),
+            properties: PublishProperties {
+                message_expiry_interval_secs: Some(60),
+                stored_at_ms: Some(1_000),
+                ..PublishProperties::default()
+            },
+        })
+        .await
+        .unwrap();
+    inbox
+        .stage_inflight(InflightMessage {
+            tenant_id: "t1".into(),
+            session_id: "s1".into(),
+            packet_id: 7,
+            topic: "devices/a/state".into(),
+            payload: b"expired-inflight".to_vec().into(),
+            qos: 2,
+            retain: false,
+            from_session_id: "src".into(),
+            properties: PublishProperties {
+                message_expiry_interval_secs: Some(1),
+                stored_at_ms: Some(1_000),
+                ..PublishProperties::default()
+            },
+            phase: InflightPhase::Publish,
+        })
+        .await
+        .unwrap();
+
+    let stats = inbox.expire_messages(3_000).await.unwrap();
+    assert_eq!(
+        stats,
+        InboxExpiryStats {
+            offline_messages: 1,
+            inflight_messages: 1,
+        }
+    );
+    assert_eq!(inbox.peek(&"s1".into()).await.unwrap().len(), 0);
+    assert_eq!(inbox.peek(&"s2".into()).await.unwrap().len(), 1);
+    assert!(inbox.fetch_inflight(&"s1".into()).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn persistent_inbox_expire_tenant_messages_preserves_unexpired_records() {
+    let subscriptions = Arc::new(MemorySubscriptionStore::default());
+    let messages = Arc::new(MemoryInboxStore::default());
+    let inflight = Arc::new(MemoryInflightStore::default());
+    let inbox = PersistentInboxHandle::open(subscriptions, messages, inflight);
+
+    inbox
+        .enqueue_batch(vec![
+            OfflineMessage {
+                tenant_id: "t1".into(),
+                session_id: "s1".into(),
+                topic: "devices/a/state".into(),
+                payload: b"expired".to_vec().into(),
+                qos: 1,
+                retain: false,
+                from_session_id: "src".into(),
+                properties: PublishProperties {
+                    message_expiry_interval_secs: Some(1),
+                    stored_at_ms: Some(1_000),
+                    ..PublishProperties::default()
+                },
+            },
+            OfflineMessage {
+                tenant_id: "t1".into(),
+                session_id: "s1".into(),
+                topic: "devices/b/state".into(),
+                payload: b"fresh".to_vec().into(),
+                qos: 1,
+                retain: false,
+                from_session_id: "src".into(),
+                properties: PublishProperties {
+                    message_expiry_interval_secs: Some(60),
+                    stored_at_ms: Some(1_000),
+                    ..PublishProperties::default()
+                },
+            },
+        ])
+        .await
+        .unwrap();
+
+    let stats = inbox.expire_tenant_messages("t1", 3_000).await.unwrap();
+    assert_eq!(stats.offline_messages, 1);
+    let remaining = inbox.peek(&"s1".into()).await.unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].payload.as_ref(), b"fresh");
+}
+
+#[derive(Default)]
+struct RecordingDelayedHandler {
+    attempts: AtomicUsize,
+    expired_tenants: Mutex<Vec<String>>,
+    sent_lwts: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl InboxDelayedTaskHandler for RecordingDelayedHandler {
+    async fn expire_session(
+        &self,
+        session_id: &SessionId,
+        _now_ms: u64,
+    ) -> anyhow::Result<InboxExpiryStats> {
+        self.expired_tenants
+            .lock()
+            .expect("handler poisoned")
+            .push(format!("session:{session_id}"));
+        Ok(InboxExpiryStats::default())
+    }
+
+    async fn expire_tenant(
+        &self,
+        tenant_id: &str,
+        _now_ms: u64,
+    ) -> anyhow::Result<InboxExpiryStats> {
+        let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+        if attempt == 0 {
+            anyhow::bail!("retry once");
+        }
+        self.expired_tenants
+            .lock()
+            .expect("handler poisoned")
+            .push(tenant_id.to_string());
+        Ok(InboxExpiryStats {
+            offline_messages: 1,
+            inflight_messages: 0,
+        })
+    }
+
+    async fn send_lwt(&self, publish: &DelayedLwtPublish) -> anyhow::Result<()> {
+        self.sent_lwts
+            .lock()
+            .expect("handler poisoned")
+            .push(publish.session_id.clone());
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct RecordingLwtSink {
+    sessions: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl super::DelayedLwtSink for RecordingLwtSink {
+    async fn send_lwt(&self, publish: &DelayedLwtPublish) -> anyhow::Result<()> {
+        self.sessions
+            .lock()
+            .expect("sink poisoned")
+            .push(publish.session_id.clone());
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn inbox_delay_task_runner_retries_then_completes() {
+    let handler = Arc::new(RecordingDelayedHandler::default());
+    let runner = InboxDelayTaskRunner::new(handler.clone(), 2, Duration::from_millis(5));
+    runner
+        .run_with_retry(InboxDelayedTask::ExpireTenant {
+            tenant_id: "t1".into(),
+            now_ms: 3_000,
+        })
+        .await
+        .unwrap();
+    assert_eq!(handler.attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        handler.expired_tenants.lock().expect("handler poisoned").as_slice(),
+        ["t1"]
+    );
+}
+
+#[tokio::test]
+async fn tenant_inbox_gc_runner_targets_single_tenant() {
+    let inbox: Arc<dyn InboxService> = Arc::new(InboxHandle::default());
+    inbox
+        .enqueue(OfflineMessage {
+            tenant_id: "t1".into(),
+            session_id: "s1".into(),
+            topic: "devices/a/state".into(),
+            payload: b"expired".to_vec().into(),
+            qos: 1,
+            retain: false,
+            from_session_id: "src".into(),
+            properties: PublishProperties {
+                message_expiry_interval_secs: Some(1),
+                stored_at_ms: Some(1_000),
+                ..PublishProperties::default()
+            },
+        })
+        .await
+        .unwrap();
+    inbox
+        .enqueue(OfflineMessage {
+            tenant_id: "t2".into(),
+            session_id: "s2".into(),
+            topic: "devices/b/state".into(),
+            payload: b"fresh".to_vec().into(),
+            qos: 1,
+            retain: false,
+            from_session_id: "src".into(),
+            properties: PublishProperties {
+                message_expiry_interval_secs: Some(60),
+                stored_at_ms: Some(1_000),
+                ..PublishProperties::default()
+            },
+        })
+        .await
+        .unwrap();
+
+    let runner = TenantInboxGcRunner::new(inbox.clone());
+    let stats = runner.run_tenant("t1", 3_000).await.unwrap();
+    assert_eq!(stats.offline_messages, 1);
+    assert!(inbox.list_tenant_offline("t1").await.unwrap().is_empty());
+    assert_eq!(inbox.list_tenant_offline("t2").await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn inbox_batch_scheduler_covers_attach_fetch_commit_insert_subscribe_and_unsubscribe() {
+    let inbox: Arc<dyn InboxService> = Arc::new(InboxHandle::default());
+    let scheduler = InboxBatchScheduler::new(inbox.clone());
+
+    scheduler
+        .attach_all(&["s1".into(), "s2".into()])
+        .await
+        .unwrap();
+    scheduler
+        .subscribe_all(vec![Subscription {
+            session_id: "s1".into(),
+            tenant_id: "t1".into(),
+            topic_filter: "devices/+/state".into(),
+            qos: 1,
+            subscription_identifier: None,
+            no_local: false,
+            retain_as_published: false,
+            retain_handling: 0,
+            shared_group: Some("workers".into()),
+            kind: SessionKind::Persistent,
+        }])
+        .await
+        .unwrap();
+    scheduler
+        .insert_all(vec![OfflineMessage {
+            tenant_id: "t1".into(),
+            session_id: "s1".into(),
+            topic: "devices/a/state".into(),
+            payload: b"offline".to_vec().into(),
+            qos: 1,
+            retain: false,
+            from_session_id: "src".into(),
+            properties: PublishProperties::default(),
+        }])
+        .await
+        .unwrap();
+    inbox
+        .stage_inflight_batch(vec![InflightMessage {
+            tenant_id: "t1".into(),
+            session_id: "s1".into(),
+            packet_id: 42,
+            topic: "devices/a/state".into(),
+            payload: b"inflight".to_vec().into(),
+            qos: 2,
+            retain: false,
+            from_session_id: "src".into(),
+            properties: PublishProperties::default(),
+            phase: InflightPhase::Publish,
+        }])
+        .await
+        .unwrap();
+
+    let fetched = scheduler.fetch_all(&["s1".into()]).await.unwrap();
+    assert_eq!(fetched["s1"].len(), 1);
+
+    scheduler
+        .commit_all(&[InboxInflightCommit {
+            session_id: "s1".into(),
+            packet_ids: vec![42],
+        }])
+        .await
+        .unwrap();
+    assert!(inbox.fetch_inflight(&"s1".into()).await.unwrap().is_empty());
+
+    let removed = scheduler
+        .unsubscribe_all(&[InboxUnsubscribeSpec {
+            session_id: "s1".into(),
+            topic_filter: "devices/+/state".into(),
+            shared_group: Some("workers".into()),
+        }])
+        .await
+        .unwrap();
+    assert_eq!(removed, 1);
+
+    scheduler.detach_all(&["s1".into(), "s2".into()]).await.unwrap();
+}
+
+#[test]
+fn threshold_inbox_balance_policy_proposes_actions_for_hot_tenant() {
+    let policy = ThresholdInboxBalancePolicy {
+        max_subscriptions: 10,
+        max_offline_messages: 5,
+        max_inflight_messages: 3,
+        desired_voters: 3,
+        desired_learners: 1,
+    };
+    let actions = policy.propose(&[
+        InboxTenantStats {
+            tenant_id: "cool".into(),
+            subscriptions: 1,
+            offline_messages: 1,
+            inflight_messages: 0,
+        },
+        InboxTenantStats {
+            tenant_id: "hot".into(),
+            subscriptions: 12,
+            offline_messages: 9,
+            inflight_messages: 4,
+        },
+    ]);
+    assert_eq!(
+        actions,
+        vec![
+            InboxBalanceAction::RunTenantMaintenance {
+                tenant_id: "hot".into(),
+            },
+            InboxBalanceAction::SplitTenantRange {
+                tenant_id: "hot".into(),
+            },
+            InboxBalanceAction::ScaleTenantReplicas {
+                tenant_id: "hot".into(),
+                voters: 3,
+                learners: 1,
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn inbox_maintenance_worker_runs_gc_and_delayed_lwt() {
+    let inbox: Arc<dyn InboxService> = Arc::new(InboxHandle::default());
+    inbox
+        .enqueue(OfflineMessage {
+            tenant_id: "t1".into(),
+            session_id: "s1".into(),
+            topic: "devices/a/state".into(),
+            payload: b"expired".to_vec().into(),
+            qos: 1,
+            retain: false,
+            from_session_id: "src".into(),
+            properties: PublishProperties {
+                message_expiry_interval_secs: Some(1),
+                stored_at_ms: Some(1_000),
+                ..PublishProperties::default()
+            },
+        })
+        .await
+        .unwrap();
+
+    let lwt_sink = Arc::new(RecordingLwtSink::default());
+    let handler = Arc::new(super::InboxServiceDelayHandler::new(
+        inbox.clone(),
+        lwt_sink.clone(),
+    ));
+    let worker = InboxMaintenanceWorker::new(
+        TenantInboxGcRunner::new(inbox.clone()),
+        InboxDelayTaskRunner::new(handler, 1, Duration::from_millis(5)),
+    );
+
+    let stats = worker.run_tenant_gc("t1", 3_000).await.unwrap();
+    assert_eq!(stats.offline_messages, 1);
+    let task = worker.schedule_delayed_task(
+        InboxDelayedTask::SendLwt(DelayedLwtPublish {
+            tenant_id: "t1".into(),
+            session_id: "s1".into(),
+            publish: PublishRequest {
+                topic: "clients/s1/will".into(),
+                payload: b"gone".to_vec().into(),
+                qos: 1,
+                retain: false,
+                properties: PublishProperties::default(),
+            },
+        }),
+        Duration::from_millis(1),
+    );
+    task.await.unwrap().unwrap();
+    assert_eq!(lwt_sink.sessions.lock().expect("sink poisoned").as_slice(), ["s1"]);
+}
+
+#[tokio::test]
+async fn replicated_inbox_uses_prefix_scans_and_exact_gets_for_session_paths() {
+    let engine = MemoryKvEngine::default();
+    engine
+        .bootstrap(KvRangeBootstrap {
+            range_id: "inbox-range-prefix".into(),
+            boundary: RangeBoundary::full(),
+        })
+        .await
+        .unwrap();
+    engine
+        .bootstrap(KvRangeBootstrap {
+            range_id: "inflight-range-prefix".into(),
+            boundary: RangeBoundary::full(),
+        })
+        .await
+        .unwrap();
+    let router = Arc::new(MemoryKvRangeRouter::default());
+    router
+        .upsert(ReplicatedRangeDescriptor::new(
+            "inbox-range-prefix",
+            inbox_tenant_scan_shard("t1"),
+            RangeBoundary::full(),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ))
+        .await
+        .unwrap();
+    router
+        .upsert(ReplicatedRangeDescriptor::new(
+            "inflight-range-prefix",
+            inflight_tenant_scan_shard("t1"),
+            RangeBoundary::full(),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ))
+        .await
+        .unwrap();
+    let executor = Arc::new(RecordingKvRangeExecutor {
+        engine: engine.clone(),
+        ..RecordingKvRangeExecutor::default()
+    });
+    let inbox = ReplicatedInboxHandle::new(router, executor.clone());
+
+    inbox
+        .subscribe(Subscription {
+            session_id: "s1".into(),
+            tenant_id: "t1".into(),
+            topic_filter: "devices/+/state".into(),
+            qos: 1,
+            subscription_identifier: None,
+            no_local: false,
+            retain_as_published: false,
+            retain_handling: 0,
+            shared_group: Some("workers".into()),
+            kind: SessionKind::Persistent,
+        })
+        .await
+        .unwrap();
+    inbox
+        .enqueue(OfflineMessage {
+            tenant_id: "t1".into(),
+            session_id: "s1".into(),
+            topic: "devices/a/state".into(),
+            payload: b"offline".to_vec().into(),
+            qos: 1,
+            retain: false,
+            from_session_id: "src".into(),
+            properties: PublishProperties::default(),
+        })
+        .await
+        .unwrap();
+    inbox
+        .stage_inflight(InflightMessage {
+            tenant_id: "t1".into(),
+            session_id: "s1".into(),
+            packet_id: 42,
+            topic: "devices/a/state".into(),
+            payload: b"inflight".to_vec().into(),
+            qos: 2,
+            retain: false,
+            from_session_id: "src".into(),
+            properties: PublishProperties::default(),
+            phase: InflightPhase::Publish,
+        })
+        .await
+        .unwrap();
+
+    executor
+        .scan_boundaries
+        .lock()
+        .expect("executor poisoned")
+        .clear();
+    executor.get_keys.lock().expect("executor poisoned").clear();
+
+    let _ = inbox
+        .lookup_subscription(&"s1".into(), "devices/+/state", Some("workers"))
+        .await
+        .unwrap();
+    let _ = inbox.list_subscriptions(&"s1".into()).await.unwrap();
+    let _ = inbox.peek(&"s1".into()).await.unwrap();
+    let _ = inbox.fetch_inflight(&"s1".into()).await.unwrap();
+
+    assert!(!executor.get_keys.lock().expect("executor poisoned").is_empty());
+    let scan_boundaries = executor
+        .scan_boundaries
+        .lock()
+        .expect("executor poisoned")
+        .clone();
+    assert!(!scan_boundaries.is_empty());
+    assert!(scan_boundaries.iter().all(|boundary| boundary.is_some()));
+}
+
+#[tokio::test]
+async fn local_qos2_release_transition_updates_inflight_phase() {
+    let inbox = InboxHandle::default();
+    inbox
+        .stage_inflight(InflightMessage {
+            tenant_id: "t1".into(),
+            session_id: "s1".into(),
+            packet_id: 7,
+            topic: "devices/a/state".into(),
+            payload: b"qos2".to_vec().into(),
+            qos: 2,
+            retain: false,
+            from_session_id: "src".into(),
+            properties: PublishProperties::default(),
+            phase: InflightPhase::Publish,
+        })
+        .await
+        .unwrap();
+
+    assert!(inbox.promote_inflight_release(&"s1".into(), 7).await.unwrap());
+    let inflight = inbox.fetch_inflight(&"s1".into()).await.unwrap();
+    assert_eq!(inflight.len(), 1);
+    assert_eq!(inflight[0].phase, InflightPhase::Release);
+}
+
+#[tokio::test]
+async fn persistent_qos2_release_transition_survives_restart() {
+    let subscriptions = Arc::new(MemorySubscriptionStore::default());
+    let messages = Arc::new(MemoryInboxStore::default());
+    let inflight = Arc::new(MemoryInflightStore::default());
+    let inbox = PersistentInboxHandle::open(subscriptions.clone(), messages.clone(), inflight.clone());
+
+    inbox
+        .stage_inflight(InflightMessage {
+            tenant_id: "t1".into(),
+            session_id: "s1".into(),
+            packet_id: 9,
+            topic: "devices/a/state".into(),
+            payload: b"qos2".to_vec().into(),
+            qos: 2,
+            retain: false,
+            from_session_id: "src".into(),
+            properties: PublishProperties::default(),
+            phase: InflightPhase::Publish,
+        })
+        .await
+        .unwrap();
+    assert!(inbox.promote_inflight_release(&"s1".into(), 9).await.unwrap());
+
+    let cold = PersistentInboxHandle::open(subscriptions, messages, inflight);
+    let inflight = cold.fetch_inflight(&"s1".into()).await.unwrap();
+    assert_eq!(inflight.len(), 1);
+    assert_eq!(inflight[0].phase, InflightPhase::Release);
+}
+
+#[tokio::test]
+async fn replicated_qos2_release_transition_is_idempotent() {
+    let engine = MemoryKvEngine::default();
+    engine
+        .bootstrap(KvRangeBootstrap {
+            range_id: "inflight-range-qos2".into(),
+            boundary: RangeBoundary::full(),
+        })
+        .await
+        .unwrap();
+    let router = Arc::new(MemoryKvRangeRouter::default());
+    router
+        .upsert(ReplicatedRangeDescriptor::new(
+            "inflight-range-qos2",
+            inflight_tenant_scan_shard("t1"),
+            RangeBoundary::full(),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ))
+        .await
+        .unwrap();
+    let executor = Arc::new(LocalKvRangeExecutor {
+        engine: engine.clone(),
+    });
+    let inbox = ReplicatedInboxHandle::new(router, executor);
+
+    inbox
+        .stage_inflight(InflightMessage {
+            tenant_id: "t1".into(),
+            session_id: "s1".into(),
+            packet_id: 11,
+            topic: "devices/a/state".into(),
+            payload: b"qos2".to_vec().into(),
+            qos: 2,
+            retain: false,
+            from_session_id: "src".into(),
+            properties: PublishProperties::default(),
+            phase: InflightPhase::Publish,
+        })
+        .await
+        .unwrap();
+
+    assert!(inbox.promote_inflight_release(&"s1".into(), 11).await.unwrap());
+    assert!(inbox.promote_inflight_release(&"s1".into(), 11).await.unwrap());
+    let inflight = inbox.fetch_inflight(&"s1".into()).await.unwrap();
+    assert_eq!(inflight.len(), 1);
+    assert_eq!(inflight[0].phase, InflightPhase::Release);
 }

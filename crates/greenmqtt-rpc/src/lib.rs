@@ -18,7 +18,9 @@ use greenmqtt_kv_engine::{
     KvEngine, KvMutation, KvRangeBootstrap, KvRangeCheckpoint, KvRangeSnapshot, RocksDbKvEngine,
 };
 use greenmqtt_kv_raft::RaftMessage;
-use greenmqtt_kv_server::{KvRangeHost, RangeHealthSnapshot, ReplicaLagSnapshot, ReplicaTransport};
+use greenmqtt_kv_server::{
+    KvRangeHost, RangeHealthSnapshot, ReplicaLagSnapshot, ReplicaTransport, ZombieRangeSnapshot,
+};
 use greenmqtt_proto::internal::{
     broker_peer_service_client::BrokerPeerServiceClient,
     broker_peer_service_server::{BrokerPeerService, BrokerPeerServiceServer},
@@ -34,6 +36,8 @@ use greenmqtt_proto::internal::{
     raft_transport_service_server::{RaftTransportService, RaftTransportServiceServer},
     range_admin_service_client::RangeAdminServiceClient,
     range_admin_service_server::{RangeAdminService, RangeAdminServiceServer},
+    range_control_service_client::RangeControlServiceClient,
+    range_control_service_server::{RangeControlService, RangeControlServiceServer},
     retain_service_client::RetainServiceClient,
     retain_service_server::{RetainService, RetainServiceServer},
     session_dict_service_client::SessionDictServiceClient,
@@ -52,13 +56,15 @@ use greenmqtt_proto::internal::{
     ListSessionsRequest, LookupSessionByIdRequest, LookupSessionReply, LookupSessionRequest,
     MatchTopicReply, MatchTopicRequest, MemberListReply, MemberLookupRequest, MemberRecordReply,
     NamedBalancerStateRecord, PushDeliveriesReply, PushDeliveriesRequest, PushDeliveryReply,
-    PushDeliveryRequest, RaftTransportRequest, RangeDebugReply, RangeHealthListReply,
-    RangeHealthRecord, RangeHealthReply, RangeHealthRequest, RangeListReply, RangeListRequest,
-    RangeLookupRequest, RangeRecordReply, RangeUpsertRequest, RegisterSessionReply,
-    RegisterSessionRequest, RemoveRouteRequest, RemoveSessionRoutesReply,
-    RemoveSessionRoutesRequest, ReplicaLagRecord, RetainMatchReply, RetainMatchRequest,
-    RetainWriteRequest, RouteRangeRequest, ShardSnapshotChunk, ShardSnapshotRequest,
-    UnregisterSessionRequest,
+    PushDeliveryRequest, RaftTransportRequest, RangeBootstrapReply, RangeBootstrapRequest,
+    RangeChangeReplicasRequest, RangeDebugReply, RangeHealthListReply, RangeHealthRecord,
+    RangeHealthReply, RangeHealthRequest, RangeListReply, RangeListRequest, RangeLookupRequest,
+    RangeDrainRequest, RangeMergeReply, RangeMergeRequest, RangeRecordReply, RangeRecoverRequest,
+    RangeRetireRequest, RangeSplitReply, RangeSplitRequest, RangeTransferLeadershipRequest,
+    RangeUpsertRequest, RegisterSessionReply, RegisterSessionRequest, RemoveRouteRequest,
+    RemoveSessionRoutesReply, RemoveSessionRoutesRequest, ReplicaLagRecord, RetainMatchReply,
+    RetainMatchRequest, RetainWriteRequest, RouteRangeRequest, ShardSnapshotChunk,
+    ShardSnapshotRequest, UnregisterSessionRequest, ZombieRangeListReply, ZombieRangeRecord,
 };
 use greenmqtt_proto::{
     from_proto_balancer_state, from_proto_client_identity, from_proto_cluster_node_membership,
@@ -97,6 +103,7 @@ pub struct RpcRuntime {
     pub peer_sink: Arc<dyn DeliverySink>,
     pub assignment_registry: Option<Arc<dyn MetadataRegistry>>,
     pub range_host: Option<Arc<dyn KvRangeHost>>,
+    pub range_runtime: Option<Arc<greenmqtt_kv_server::ReplicaRuntime>>,
 }
 
 #[derive(Clone)]
@@ -139,6 +146,11 @@ pub struct RangeAdminGrpcClient {
     inner: Arc<Mutex<RangeAdminServiceClient<Channel>>>,
 }
 
+#[derive(Clone)]
+pub struct RangeControlGrpcClient {
+    inner: Arc<Mutex<RangeControlServiceClient<Channel>>>,
+}
+
 #[derive(Clone, Default)]
 pub struct KvRangeGrpcExecutorFactory;
 
@@ -177,6 +189,12 @@ pub struct DynamicServiceEndpointRegistry {
 #[derive(Clone)]
 pub struct PersistentMetadataRegistry {
     engine: Arc<RocksDbKvEngine>,
+    range_id: String,
+}
+
+#[derive(Clone)]
+pub struct ReplicatedMetadataRegistry {
+    executor: Arc<dyn KvRangeExecutor>,
     range_id: String,
 }
 
@@ -254,6 +272,11 @@ struct RangeAdminRpc {
     inner: Option<Arc<dyn KvRangeHost>>,
 }
 
+#[derive(Clone)]
+struct RangeControlRpc {
+    inner: Option<Arc<greenmqtt_kv_server::ReplicaRuntime>>,
+}
+
 async fn apply_committed_entries_for_range(
     hosted: &greenmqtt_kv_server::HostedRange,
 ) -> anyhow::Result<usize> {
@@ -308,6 +331,22 @@ fn to_proto_range_health(health: &RangeHealthSnapshot) -> RangeHealthRecord {
             .iter()
             .map(to_proto_replica_lag)
             .collect(),
+    }
+}
+
+fn to_proto_zombie_range(snapshot: &ZombieRangeSnapshot) -> ZombieRangeRecord {
+    ZombieRangeRecord {
+        range_id: snapshot.range_id.clone(),
+        lifecycle: match snapshot.lifecycle {
+            ServiceShardLifecycle::Bootstrapping => "bootstrapping",
+            ServiceShardLifecycle::Serving => "serving",
+            ServiceShardLifecycle::Draining => "draining",
+            ServiceShardLifecycle::Recovering => "recovering",
+            ServiceShardLifecycle::Offline => "offline",
+        }
+        .to_string(),
+        leader_node_id: snapshot.leader_node_id.unwrap_or_default(),
+        has_leader_node_id: snapshot.leader_node_id.is_some(),
     }
 }
 
@@ -1109,6 +1148,74 @@ impl PersistentMetadataRegistry {
     }
 }
 
+impl ReplicatedMetadataRegistry {
+    pub fn new(executor: Arc<dyn KvRangeExecutor>, range_id: impl Into<String>) -> Self {
+        Self {
+            executor,
+            range_id: range_id.into(),
+        }
+    }
+
+    async fn read_value<T: DeserializeOwned>(&self, key: Bytes) -> anyhow::Result<Option<T>> {
+        self.executor
+            .get(&self.range_id, &key)
+            .await?
+            .map(|value| decode_metadata_value(&value))
+            .transpose()
+    }
+
+    async fn write_value<T: Serialize>(&self, key: Bytes, value: &T) -> anyhow::Result<()> {
+        self.executor
+            .apply(
+                &self.range_id,
+                vec![KvMutation {
+                    key,
+                    value: Some(encode_metadata_value(value)?),
+                }],
+            )
+            .await
+    }
+
+    async fn delete_value<T: DeserializeOwned>(&self, key: Bytes) -> anyhow::Result<Option<T>> {
+        let previous = self.read_value::<T>(key.clone()).await?;
+        if previous.is_some() {
+            self.executor
+                .apply(&self.range_id, vec![KvMutation { key, value: None }])
+                .await?;
+        }
+        Ok(previous)
+    }
+
+    async fn scan_prefix<T: DeserializeOwned>(&self, prefix: &[u8]) -> anyhow::Result<Vec<T>> {
+        Ok(self
+            .executor
+            .scan(
+                &self.range_id,
+                Some(greenmqtt_core::RangeBoundary::full()),
+                usize::MAX,
+            )
+            .await?
+            .into_iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .map(|(_, value)| decode_metadata_value(&value))
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    async fn scan_entries(&self, prefix: &[u8]) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
+        Ok(self
+            .executor
+            .scan(
+                &self.range_id,
+                Some(greenmqtt_core::RangeBoundary::full()),
+                usize::MAX,
+            )
+            .await?
+            .into_iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .collect())
+    }
+}
+
 #[async_trait]
 impl ServiceEndpointRegistry for DynamicServiceEndpointRegistry {
     async fn upsert_assignment(
@@ -1168,6 +1275,49 @@ impl ServiceEndpointRegistry for DynamicServiceEndpointRegistry {
 
 #[async_trait]
 impl ServiceEndpointRegistry for PersistentMetadataRegistry {
+    async fn upsert_assignment(
+        &self,
+        assignment: ServiceShardAssignment,
+    ) -> anyhow::Result<Option<ServiceShardAssignment>> {
+        let key = assignment_key(&assignment.shard)?;
+        let previous = self
+            .read_value::<ServiceShardAssignment>(key.clone())
+            .await?;
+        self.write_value(key, &assignment).await?;
+        Ok(previous)
+    }
+
+    async fn resolve_assignment(
+        &self,
+        shard: &ServiceShardKey,
+    ) -> anyhow::Result<Option<ServiceShardAssignment>> {
+        self.read_value(assignment_key(shard)?).await
+    }
+
+    async fn remove_assignment(
+        &self,
+        shard: &ServiceShardKey,
+    ) -> anyhow::Result<Option<ServiceShardAssignment>> {
+        self.delete_value(assignment_key(shard)?).await
+    }
+
+    async fn list_assignments(
+        &self,
+        kind: Option<ServiceShardKind>,
+    ) -> anyhow::Result<Vec<ServiceShardAssignment>> {
+        let mut assignments = self
+            .scan_prefix::<ServiceShardAssignment>(ASSIGNMENT_PREFIX)
+            .await?;
+        if let Some(kind) = kind {
+            assignments.retain(|assignment| assignment.shard.kind == kind);
+        }
+        assignments.sort_by(|left, right| left.shard.cmp(&right.shard));
+        Ok(assignments)
+    }
+}
+
+#[async_trait]
+impl ServiceEndpointRegistry for ReplicatedMetadataRegistry {
     async fn upsert_assignment(
         &self,
         assignment: ServiceShardAssignment,
@@ -1311,6 +1461,49 @@ impl ReplicatedRangeRegistry for PersistentMetadataRegistry {
 }
 
 #[async_trait]
+impl ReplicatedRangeRegistry for ReplicatedMetadataRegistry {
+    async fn upsert_range(
+        &self,
+        descriptor: ReplicatedRangeDescriptor,
+    ) -> anyhow::Result<Option<ReplicatedRangeDescriptor>> {
+        let key = range_key(&descriptor.id);
+        let previous = self
+            .read_value::<ReplicatedRangeDescriptor>(key.clone())
+            .await?;
+        self.write_value(key, &descriptor).await?;
+        Ok(previous)
+    }
+
+    async fn resolve_range(
+        &self,
+        range_id: &str,
+    ) -> anyhow::Result<Option<ReplicatedRangeDescriptor>> {
+        self.read_value(range_key(range_id)).await
+    }
+
+    async fn remove_range(
+        &self,
+        range_id: &str,
+    ) -> anyhow::Result<Option<ReplicatedRangeDescriptor>> {
+        self.delete_value(range_key(range_id)).await
+    }
+
+    async fn list_ranges(
+        &self,
+        shard_kind: Option<ServiceShardKind>,
+    ) -> anyhow::Result<Vec<ReplicatedRangeDescriptor>> {
+        let mut ranges = self
+            .scan_prefix::<ReplicatedRangeDescriptor>(RANGE_PREFIX)
+            .await?;
+        if let Some(kind) = shard_kind {
+            ranges.retain(|descriptor| descriptor.shard.kind == kind);
+        }
+        ranges.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(ranges)
+    }
+}
+
+#[async_trait]
 impl BalancerStateRegistry for DynamicServiceEndpointRegistry {
     async fn upsert_balancer_state(
         &self,
@@ -1394,6 +1587,43 @@ impl BalancerStateRegistry for PersistentMetadataRegistry {
             if !key.starts_with(BALANCER_PREFIX) {
                 continue;
             }
+            let name = std::str::from_utf8(&key[BALANCER_PREFIX.len()..])?.to_string();
+            states.insert(name, decode_metadata_value(&value)?);
+        }
+        Ok(states)
+    }
+}
+
+#[async_trait]
+impl BalancerStateRegistry for ReplicatedMetadataRegistry {
+    async fn upsert_balancer_state(
+        &self,
+        balancer_name: &str,
+        state: BalancerState,
+    ) -> anyhow::Result<Option<BalancerState>> {
+        let key = balancer_key(balancer_name);
+        let previous = self.read_value::<BalancerState>(key.clone()).await?;
+        self.write_value(key, &state).await?;
+        Ok(previous)
+    }
+
+    async fn resolve_balancer_state(
+        &self,
+        balancer_name: &str,
+    ) -> anyhow::Result<Option<BalancerState>> {
+        self.read_value(balancer_key(balancer_name)).await
+    }
+
+    async fn remove_balancer_state(
+        &self,
+        balancer_name: &str,
+    ) -> anyhow::Result<Option<BalancerState>> {
+        self.delete_value(balancer_key(balancer_name)).await
+    }
+
+    async fn list_balancer_states(&self) -> anyhow::Result<BTreeMap<String, BalancerState>> {
+        let mut states = BTreeMap::new();
+        for (key, value) in self.scan_entries(BALANCER_PREFIX).await? {
             let name = std::str::from_utf8(&key[BALANCER_PREFIX.len()..])?.to_string();
             states.insert(name, decode_metadata_value(&value)?);
         }
@@ -1488,6 +1718,41 @@ impl ClusterMembershipRegistry for PersistentMetadataRegistry {
 }
 
 #[async_trait]
+impl ClusterMembershipRegistry for ReplicatedMetadataRegistry {
+    async fn upsert_member(
+        &self,
+        member: ClusterNodeMembership,
+    ) -> anyhow::Result<Option<ClusterNodeMembership>> {
+        let key = member_key(member.node_id);
+        let previous = self.read_value::<ClusterNodeMembership>(key.clone()).await?;
+        self.write_value(key, &member).await?;
+        Ok(previous)
+    }
+
+    async fn resolve_member(
+        &self,
+        node_id: NodeId,
+    ) -> anyhow::Result<Option<ClusterNodeMembership>> {
+        self.read_value(member_key(node_id)).await
+    }
+
+    async fn remove_member(
+        &self,
+        node_id: NodeId,
+    ) -> anyhow::Result<Option<ClusterNodeMembership>> {
+        self.delete_value(member_key(node_id)).await
+    }
+
+    async fn list_members(&self) -> anyhow::Result<Vec<ClusterNodeMembership>> {
+        let mut members = self
+            .scan_prefix::<ClusterNodeMembership>(MEMBER_PREFIX)
+            .await?;
+        members.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        Ok(members)
+    }
+}
+
+#[async_trait]
 impl ServiceShardRecoveryControl for DynamicServiceEndpointRegistry {
     async fn apply_transition(
         &self,
@@ -1520,6 +1785,16 @@ impl ServiceShardRecoveryControl for PersistentMetadataRegistry {
                 );
             }
         }
+        self.upsert_assignment(transition.target_assignment).await
+    }
+}
+
+#[async_trait]
+impl ServiceShardRecoveryControl for ReplicatedMetadataRegistry {
+    async fn apply_transition(
+        &self,
+        transition: ServiceShardTransition,
+    ) -> anyhow::Result<Option<ServiceShardAssignment>> {
         self.upsert_assignment(transition.target_assignment).await
     }
 }
@@ -2681,6 +2956,151 @@ impl RangeAdminGrpcClient {
     }
 }
 
+impl RangeControlGrpcClient {
+    pub async fn connect(endpoint: impl Into<String>) -> anyhow::Result<Self> {
+        Ok(Self {
+            inner: Arc::new(Mutex::new(
+                RangeControlServiceClient::connect(endpoint.into()).await?,
+            )),
+        })
+    }
+
+    pub async fn bootstrap_range(
+        &self,
+        descriptor: ReplicatedRangeDescriptor,
+    ) -> anyhow::Result<String> {
+        let mut client = self.inner.lock().await;
+        Ok(client
+            .bootstrap_range(RangeBootstrapRequest {
+                descriptor: Some(to_proto_replicated_range(&descriptor)),
+            })
+            .await?
+            .into_inner()
+            .range_id)
+    }
+
+    pub async fn change_replicas(
+        &self,
+        range_id: &str,
+        voters: Vec<NodeId>,
+        learners: Vec<NodeId>,
+    ) -> anyhow::Result<()> {
+        let mut client = self.inner.lock().await;
+        client
+            .change_replicas(RangeChangeReplicasRequest {
+                range_id: range_id.to_string(),
+                voters,
+                learners,
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn transfer_leadership(
+        &self,
+        range_id: &str,
+        target_node_id: NodeId,
+    ) -> anyhow::Result<()> {
+        let mut client = self.inner.lock().await;
+        client
+            .transfer_leadership(RangeTransferLeadershipRequest {
+                range_id: range_id.to_string(),
+                target_node_id,
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn recover_range(
+        &self,
+        range_id: &str,
+        new_leader_node_id: NodeId,
+    ) -> anyhow::Result<()> {
+        let mut client = self.inner.lock().await;
+        client
+            .recover_range(RangeRecoverRequest {
+                range_id: range_id.to_string(),
+                new_leader_node_id,
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn split_range(
+        &self,
+        range_id: &str,
+        split_key: Vec<u8>,
+    ) -> anyhow::Result<(String, String)> {
+        let mut client = self.inner.lock().await;
+        let reply = client
+            .split_range(RangeSplitRequest {
+                range_id: range_id.to_string(),
+                split_key,
+            })
+            .await?
+            .into_inner();
+        Ok((reply.left_range_id, reply.right_range_id))
+    }
+
+    pub async fn merge_ranges(
+        &self,
+        left_range_id: &str,
+        right_range_id: &str,
+    ) -> anyhow::Result<String> {
+        let mut client = self.inner.lock().await;
+        Ok(client
+            .merge_ranges(RangeMergeRequest {
+                left_range_id: left_range_id.to_string(),
+                right_range_id: right_range_id.to_string(),
+            })
+            .await?
+            .into_inner()
+            .range_id)
+    }
+
+    pub async fn drain_range(&self, range_id: &str) -> anyhow::Result<()> {
+        let mut client = self.inner.lock().await;
+        client
+            .drain_range(RangeDrainRequest {
+                range_id: range_id.to_string(),
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn retire_range(&self, range_id: &str) -> anyhow::Result<()> {
+        let mut client = self.inner.lock().await;
+        client
+            .retire_range(RangeRetireRequest {
+                range_id: range_id.to_string(),
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_zombie_ranges(&self) -> anyhow::Result<Vec<ZombieRangeSnapshot>> {
+        let mut client = self.inner.lock().await;
+        Ok(client
+            .list_zombie_ranges(())
+            .await?
+            .into_inner()
+            .entries
+            .into_iter()
+            .map(|entry| ZombieRangeSnapshot {
+                range_id: entry.range_id,
+                lifecycle: match entry.lifecycle.as_str() {
+                    "bootstrapping" => ServiceShardLifecycle::Bootstrapping,
+                    "draining" => ServiceShardLifecycle::Draining,
+                    "recovering" => ServiceShardLifecycle::Recovering,
+                    "offline" => ServiceShardLifecycle::Offline,
+                    _ => ServiceShardLifecycle::Serving,
+                },
+                leader_node_id: entry.has_leader_node_id.then_some(entry.leader_node_id),
+            })
+            .collect())
+    }
+}
+
 #[async_trait]
 impl ReplicaTransport for RaftTransportGrpcClient {
     async fn send(
@@ -2949,6 +3369,9 @@ impl RpcRuntime {
             }))
             .add_service(RangeAdminServiceServer::new(RangeAdminRpc {
                 inner: self.range_host.clone(),
+            }))
+            .add_service(RangeControlServiceServer::new(RangeControlRpc {
+                inner: self.range_runtime.clone(),
             }))
             .serve(bind)
             .await?;
@@ -4671,6 +5094,159 @@ impl RangeAdminService for RangeAdminRpc {
         );
         let text = runtime.debug_dump().await.map_err(internal_status)?;
         Ok(Response::new(RangeDebugReply { text }))
+    }
+}
+
+#[tonic::async_trait]
+impl RangeControlService for RangeControlRpc {
+    async fn bootstrap_range(
+        &self,
+        request: Request<RangeBootstrapRequest>,
+    ) -> Result<Response<RangeBootstrapReply>, Status> {
+        let runtime = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("range runtime unavailable"))?;
+        let descriptor = request
+            .into_inner()
+            .descriptor
+            .ok_or_else(|| Status::invalid_argument("missing descriptor"))
+            .map(from_proto_replicated_range)?;
+        let range_id = runtime
+            .bootstrap_range(descriptor)
+            .await
+            .map_err(internal_status)?;
+        Ok(Response::new(RangeBootstrapReply { range_id }))
+    }
+
+    async fn change_replicas(
+        &self,
+        request: Request<RangeChangeReplicasRequest>,
+    ) -> Result<Response<()>, Status> {
+        let runtime = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("range runtime unavailable"))?;
+        let request = request.into_inner();
+        runtime
+            .change_replicas(&request.range_id, request.voters, request.learners)
+            .await
+            .map_err(internal_status)?;
+        Ok(Response::new(()))
+    }
+
+    async fn transfer_leadership(
+        &self,
+        request: Request<RangeTransferLeadershipRequest>,
+    ) -> Result<Response<()>, Status> {
+        let runtime = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("range runtime unavailable"))?;
+        let request = request.into_inner();
+        runtime
+            .transfer_leadership(&request.range_id, request.target_node_id)
+            .await
+            .map_err(internal_status)?;
+        Ok(Response::new(()))
+    }
+
+    async fn recover_range(
+        &self,
+        request: Request<RangeRecoverRequest>,
+    ) -> Result<Response<()>, Status> {
+        let runtime = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("range runtime unavailable"))?;
+        let request = request.into_inner();
+        runtime
+            .recover_range(&request.range_id, request.new_leader_node_id)
+            .await
+            .map_err(internal_status)?;
+        Ok(Response::new(()))
+    }
+
+    async fn split_range(
+        &self,
+        request: Request<RangeSplitRequest>,
+    ) -> Result<Response<RangeSplitReply>, Status> {
+        let runtime = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("range runtime unavailable"))?;
+        let request = request.into_inner();
+        let (left_range_id, right_range_id) = runtime
+            .split_range(&request.range_id, request.split_key)
+            .await
+            .map_err(internal_status)?;
+        Ok(Response::new(RangeSplitReply {
+            left_range_id,
+            right_range_id,
+        }))
+    }
+
+    async fn merge_ranges(
+        &self,
+        request: Request<RangeMergeRequest>,
+    ) -> Result<Response<RangeMergeReply>, Status> {
+        let runtime = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("range runtime unavailable"))?;
+        let request = request.into_inner();
+        let range_id = runtime
+            .merge_ranges(&request.left_range_id, &request.right_range_id)
+            .await
+            .map_err(internal_status)?;
+        Ok(Response::new(RangeMergeReply { range_id }))
+    }
+
+    async fn drain_range(
+        &self,
+        request: Request<RangeDrainRequest>,
+    ) -> Result<Response<()>, Status> {
+        let runtime = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("range runtime unavailable"))?;
+        runtime
+            .drain_range(&request.into_inner().range_id)
+            .await
+            .map_err(internal_status)?;
+        Ok(Response::new(()))
+    }
+
+    async fn retire_range(
+        &self,
+        request: Request<RangeRetireRequest>,
+    ) -> Result<Response<()>, Status> {
+        let runtime = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("range runtime unavailable"))?;
+        runtime
+            .retire_range(&request.into_inner().range_id)
+            .await
+            .map_err(internal_status)?;
+        Ok(Response::new(()))
+    }
+
+    async fn list_zombie_ranges(
+        &self,
+        _request: Request<()>,
+    ) -> Result<Response<ZombieRangeListReply>, Status> {
+        let runtime = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("range runtime unavailable"))?;
+        let entries = runtime
+            .list_zombie_ranges()
+            .await
+            .map_err(internal_status)?;
+        Ok(Response::new(ZombieRangeListReply {
+            entries: entries.iter().map(to_proto_zombie_range).collect(),
+        }))
     }
 }
 

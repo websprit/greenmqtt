@@ -53,6 +53,13 @@ pub struct RangeHealthSnapshot {
     pub replica_lag: Vec<ReplicaLagSnapshot>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ZombieRangeSnapshot {
+    pub range_id: String,
+    pub lifecycle: ServiceShardLifecycle,
+    pub leader_node_id: Option<NodeId>,
+}
+
 #[async_trait]
 pub trait KvRangeHost: Send + Sync {
     async fn add_range(&self, range: HostedRange) -> anyhow::Result<()>;
@@ -97,6 +104,7 @@ pub struct ReplicaRuntime {
     transport: Arc<dyn ReplicaTransport>,
     lifecycle: Option<Arc<dyn RangeLifecycleManager>>,
     pending: Arc<Mutex<VecDeque<PendingOutbound>>>,
+    pending_reconfig: Arc<Mutex<BTreeMap<String, PendingReconfiguration>>>,
     send_timeout: Duration,
     max_pending: usize,
     snapshot_threshold: u64,
@@ -116,6 +124,12 @@ struct PendingOutbound {
     message: RaftMessage,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingReconfiguration {
+    voters: Vec<NodeId>,
+    learners: Vec<NodeId>,
+}
+
 impl ReplicaRuntime {
     pub fn new(host: Arc<dyn KvRangeHost>, transport: Arc<dyn ReplicaTransport>) -> Self {
         Self {
@@ -123,6 +137,7 @@ impl ReplicaRuntime {
             transport,
             lifecycle: None,
             pending: Arc::new(Mutex::new(VecDeque::new())),
+            pending_reconfig: Arc::new(Mutex::new(BTreeMap::new())),
             send_timeout: Duration::from_secs(1),
             max_pending: 1024,
             snapshot_threshold: 64,
@@ -144,6 +159,7 @@ impl ReplicaRuntime {
             transport,
             lifecycle,
             pending: Arc::new(Mutex::new(VecDeque::new())),
+            pending_reconfig: Arc::new(Mutex::new(BTreeMap::new())),
             send_timeout,
             max_pending,
             snapshot_threshold,
@@ -555,6 +571,48 @@ impl ReplicaRuntime {
         Ok(merged_id)
     }
 
+    pub async fn bootstrap_range(
+        &self,
+        mut descriptor: ReplicatedRangeDescriptor,
+    ) -> anyhow::Result<String> {
+        let lifecycle = self
+            .lifecycle
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("range lifecycle manager unavailable"))?;
+        anyhow::ensure!(
+            self.host.open_range(&descriptor.id).await?.is_none(),
+            "range `{}` already exists",
+            descriptor.id
+        );
+        descriptor.lifecycle = ServiceShardLifecycle::Serving;
+        let range = lifecycle.create_range(descriptor.clone()).await?;
+        self.replace_range(range).await?;
+        Ok(descriptor.id)
+    }
+
+    pub async fn drain_range(&self, range_id: &str) -> anyhow::Result<()> {
+        let _ = self
+            .rewrite_descriptor(range_id, |descriptor| {
+                descriptor.lifecycle = ServiceShardLifecycle::Draining;
+                descriptor.epoch += 1;
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn retire_range(&self, range_id: &str) -> anyhow::Result<bool> {
+        let lifecycle = self
+            .lifecycle
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("range lifecycle manager unavailable"))?;
+        let removed = self.host.remove_range(range_id).await?;
+        if removed.is_none() {
+            return Ok(false);
+        }
+        lifecycle.retire_range(range_id).await?;
+        Ok(true)
+    }
+
     pub async fn change_replicas(
         &self,
         range_id: &str,
@@ -576,6 +634,22 @@ impl ReplicaRuntime {
         let mut desired_learners = learners;
         desired_learners.sort_unstable();
         desired_learners.dedup();
+        let desired_target = PendingReconfiguration {
+            voters: desired_voters.clone(),
+            learners: desired_learners.clone(),
+        };
+        let pending_target = self
+            .pending_reconfig
+            .lock()
+            .expect("replica runtime poisoned")
+            .get(range_id)
+            .cloned();
+        if let Some(pending) = pending_target.as_ref() {
+            anyhow::ensure!(
+                pending == &desired_target,
+                "config change already in progress for range `{range_id}`"
+            );
+        }
 
         let mut staged_learners = current_learners.clone();
         for node_id in desired_voters.iter().chain(desired_learners.iter()) {
@@ -584,6 +658,10 @@ impl ReplicaRuntime {
             }
         }
         if staged_learners != current_learners {
+            self.pending_reconfig
+                .lock()
+                .expect("replica runtime poisoned")
+                .insert(range_id.to_string(), desired_target);
             return range
                 .raft
                 .change_cluster_config(RaftConfigChange::ReplaceCluster {
@@ -610,7 +688,12 @@ impl ReplicaRuntime {
                 voters: desired_voters,
                 learners: desired_learners,
             })
-            .await
+            .await?;
+        self.pending_reconfig
+            .lock()
+            .expect("replica runtime poisoned")
+            .remove(range_id);
+        Ok(())
     }
 
     pub async fn transfer_leadership(
@@ -777,6 +860,22 @@ impl ReplicaRuntime {
             }
         }
         Ok(lines.join("\n"))
+    }
+
+    pub async fn list_zombie_ranges(&self) -> anyhow::Result<Vec<ZombieRangeSnapshot>> {
+        let statuses = self.host.list_ranges().await?;
+        Ok(statuses
+            .into_iter()
+            .filter(|status| {
+                status.descriptor.lifecycle != ServiceShardLifecycle::Serving
+                    || status.raft.leader_node_id.is_none()
+            })
+            .map(|status| ZombieRangeSnapshot {
+                range_id: status.descriptor.id,
+                lifecycle: status.descriptor.lifecycle,
+                leader_node_id: status.raft.leader_node_id,
+            })
+            .collect())
     }
 
     pub fn spawn(self: Arc<Self>, interval: Duration) -> ReplicaRuntimeHandle {
@@ -1551,6 +1650,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replica_runtime_blocks_switching_reconfig_target_while_stage_is_pending() {
+        let engine = MemoryKvEngine::default();
+        engine
+            .bootstrap(greenmqtt_kv_engine::KvRangeBootstrap {
+                range_id: "range-stage-guard".into(),
+                boundary: RangeBoundary::full(),
+            })
+            .await
+            .unwrap();
+        let space = Arc::<dyn greenmqtt_kv_engine::KvRangeSpace>::from(
+            engine.open_range("range-stage-guard").await.unwrap(),
+        );
+        let raft = Arc::new(MemoryRaftNode::single_node(1, "range-stage-guard"));
+        raft.recover().await.unwrap();
+        let host = Arc::new(MemoryKvRangeHost::default());
+        host.add_range(HostedRange {
+            descriptor: ReplicatedRangeDescriptor::new(
+                "range-stage-guard",
+                ServiceShardKey::retain("tenant-a"),
+                RangeBoundary::full(),
+                1,
+                1,
+                Some(1),
+                vec![RangeReplica::new(
+                    1,
+                    ReplicaRole::Voter,
+                    ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ),
+            raft,
+            space,
+        })
+        .await
+        .unwrap();
+        let runtime = ReplicaRuntime::new(host, Arc::new(RecordingTransport::default()));
+        runtime
+            .change_replicas("range-stage-guard", vec![1, 2], Vec::new())
+            .await
+            .unwrap();
+        let error = runtime
+            .change_replicas("range-stage-guard", vec![1, 3], Vec::new())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("config change already in progress"));
+    }
+
+    #[tokio::test]
+    async fn replica_runtime_allows_new_reconfig_target_after_finalize() {
+        let engine = MemoryKvEngine::default();
+        engine
+            .bootstrap(greenmqtt_kv_engine::KvRangeBootstrap {
+                range_id: "range-stage-finalize".into(),
+                boundary: RangeBoundary::full(),
+            })
+            .await
+            .unwrap();
+        let space = Arc::<dyn greenmqtt_kv_engine::KvRangeSpace>::from(
+            engine.open_range("range-stage-finalize").await.unwrap(),
+        );
+        let raft = Arc::new(MemoryRaftNode::single_node(1, "range-stage-finalize"));
+        raft.recover().await.unwrap();
+        let host = Arc::new(MemoryKvRangeHost::default());
+        host.add_range(HostedRange {
+            descriptor: ReplicatedRangeDescriptor::new(
+                "range-stage-finalize",
+                ServiceShardKey::retain("tenant-a"),
+                RangeBoundary::full(),
+                1,
+                1,
+                Some(1),
+                vec![RangeReplica::new(
+                    1,
+                    ReplicaRole::Voter,
+                    ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ),
+            raft: raft.clone(),
+            space,
+        })
+        .await
+        .unwrap();
+        let runtime = ReplicaRuntime::new(host, Arc::new(RecordingTransport::default()));
+        runtime
+            .change_replicas("range-stage-finalize", vec![1, 2], Vec::new())
+            .await
+            .unwrap();
+        runtime
+            .change_replicas("range-stage-finalize", vec![1, 2], Vec::new())
+            .await
+            .unwrap();
+        runtime
+            .change_replicas("range-stage-finalize", vec![1, 3], Vec::new())
+            .await
+            .unwrap();
+        let status = raft.status().await.unwrap();
+        assert_eq!(status.cluster_config.voters, vec![1, 2]);
+        assert_eq!(status.cluster_config.learners, vec![3]);
+    }
+
+    #[tokio::test]
     async fn replica_runtime_transfer_leadership_updates_raft_state() {
         let engine = MemoryKvEngine::default();
         engine
@@ -1837,7 +2043,10 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(error.contains("refusing to remove current local leader"));
+        assert!(
+            error.contains("refusing to remove current local leader")
+                || error.contains("config change already in progress")
+        );
     }
 
     #[tokio::test]
@@ -2215,5 +2424,45 @@ mod tests {
             lifecycle.retired(),
             vec!["range-left".to_string(), "range-right".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn replica_runtime_bootstrap_range_creates_hosted_range() {
+        let engine = MemoryKvEngine::default();
+        let host = Arc::new(MemoryKvRangeHost::default());
+        let lifecycle = Arc::new(TestRangeLifecycleManager::new(engine.clone()));
+        let runtime = ReplicaRuntime::with_config(
+            host.clone(),
+            Arc::new(RecordingTransport::default()),
+            Some(lifecycle),
+            Duration::from_secs(1),
+            64,
+            64,
+            64,
+        );
+
+        let range_id = runtime
+            .bootstrap_range(ReplicatedRangeDescriptor::new(
+                "range-bootstrap",
+                ServiceShardKey::retain("t1"),
+                RangeBoundary::full(),
+                1,
+                1,
+                Some(1),
+                vec![RangeReplica::new(
+                    1,
+                    ReplicaRole::Voter,
+                    ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Bootstrapping,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(range_id, "range-bootstrap");
+        let hosted = host.open_range("range-bootstrap").await.unwrap().unwrap();
+        assert_eq!(hosted.descriptor.id, "range-bootstrap");
     }
 }

@@ -1,21 +1,25 @@
 use crate::dist::{
-    dist_route_shard, dist_tenant_shard, insert_tenant_route, DistHandle, DistRouter,
-    PersistentDistHandle, ReplicatedDistHandle, TenantRoutes,
+    dist_route_shard, dist_tenant_shard, insert_tenant_route, DistBalanceAction,
+    DistBalancePolicy, DistDeliverySink, DistFanoutWorker, DistHandle, DistMaintenanceWorker,
+    DistRouter, DistTenantStats, PersistentDistHandle, ReplicatedDistHandle,
+    TenantRoutes, ThresholdDistBalancePolicy,
 };
 use crate::trie::select_routes;
 use async_trait::async_trait;
 use bytes::Bytes;
 use greenmqtt_core::{
     RangeBoundary, RangeReplica, ReplicaRole, ReplicaSyncState, ReplicatedRangeDescriptor,
-    RouteRecord, ServiceShardKey, ServiceShardLifecycle, SessionKind,
+    RouteRecord, ServiceShardKey, ServiceShardLifecycle, SessionKind, TopicName,
 };
 use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter, MemoryKvRangeRouter};
 use greenmqtt_kv_engine::{
     KvEngine, KvMutation, KvRangeBootstrap, KvRangeCheckpoint, KvRangeSnapshot, MemoryKvEngine,
 };
 use greenmqtt_storage::{MemoryRouteStore, RouteStore};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Clone)]
 struct LocalKvRangeExecutor {
@@ -59,6 +63,77 @@ impl KvRangeExecutor for LocalKvRangeExecutor {
     async fn snapshot(&self, range_id: &str) -> anyhow::Result<KvRangeSnapshot> {
         let range = self.engine.open_range(range_id).await?;
         range.snapshot().await
+    }
+}
+
+#[derive(Clone, Default)]
+struct RecordingKvRangeExecutor {
+    engine: MemoryKvEngine,
+    scan_boundaries: Arc<Mutex<Vec<Option<RangeBoundary>>>>,
+}
+
+#[async_trait]
+impl KvRangeExecutor for RecordingKvRangeExecutor {
+    async fn get(&self, range_id: &str, key: &[u8]) -> anyhow::Result<Option<Bytes>> {
+        let range = self.engine.open_range(range_id).await?;
+        range.reader().get(key).await
+    }
+
+    async fn scan(
+        &self,
+        range_id: &str,
+        boundary: Option<RangeBoundary>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
+        self.scan_boundaries
+            .lock()
+            .expect("executor poisoned")
+            .push(boundary.clone());
+        let range = self.engine.open_range(range_id).await?;
+        range
+            .reader()
+            .scan(&boundary.unwrap_or_else(RangeBoundary::full), limit)
+            .await
+    }
+
+    async fn apply(&self, range_id: &str, mutations: Vec<KvMutation>) -> anyhow::Result<()> {
+        let range = self.engine.open_range(range_id).await?;
+        range.writer().apply(mutations).await
+    }
+
+    async fn checkpoint(
+        &self,
+        range_id: &str,
+        checkpoint_id: &str,
+    ) -> anyhow::Result<KvRangeCheckpoint> {
+        let range = self.engine.open_range(range_id).await?;
+        range.checkpoint(checkpoint_id).await
+    }
+
+    async fn snapshot(&self, range_id: &str) -> anyhow::Result<KvRangeSnapshot> {
+        let range = self.engine.open_range(range_id).await?;
+        range.snapshot().await
+    }
+}
+
+#[derive(Default)]
+struct RecordingDistSink {
+    deliveries: Arc<Mutex<Vec<(String, String, usize)>>>,
+}
+
+#[async_trait]
+impl DistDeliverySink for RecordingDistSink {
+    async fn deliver(
+        &self,
+        tenant_id: &str,
+        topic: &TopicName,
+        routes: &[RouteRecord],
+    ) -> anyhow::Result<()> {
+        self.deliveries
+            .lock()
+            .expect("sink poisoned")
+            .push((tenant_id.to_string(), topic.clone(), routes.len()));
+        Ok(())
     }
 }
 
@@ -412,9 +487,271 @@ async fn dist_handle_session_topic_shared_lookup_and_remove_use_exact_index() {
         dist.list_session_topic_filter_routes("s1", "devices/+/state")
             .await
             .unwrap()
-            .len(),
+        .len(),
         1
     );
+}
+
+#[tokio::test]
+async fn replicated_dist_match_topic_uses_indexed_scans_and_wildcard_cache() {
+    let engine = MemoryKvEngine::default();
+    engine
+        .bootstrap(KvRangeBootstrap {
+            range_id: "dist-range-prefix".into(),
+            boundary: RangeBoundary::full(),
+        })
+        .await
+        .unwrap();
+    let router = Arc::new(MemoryKvRangeRouter::default());
+    router
+        .upsert(ReplicatedRangeDescriptor::new(
+            "dist-range-prefix",
+            dist_tenant_shard("t1"),
+            RangeBoundary::full(),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ))
+        .await
+        .unwrap();
+    let executor = Arc::new(RecordingKvRangeExecutor {
+        engine: engine.clone(),
+        ..RecordingKvRangeExecutor::default()
+    });
+    let dist = ReplicatedDistHandle::new(router, executor.clone());
+    for topic_filter in ["devices/a/state", "devices/+/state"] {
+        dist.add_route(RouteRecord {
+            tenant_id: "t1".into(),
+            topic_filter: topic_filter.into(),
+            session_id: topic_filter.into(),
+            node_id: 1,
+            subscription_identifier: None,
+            no_local: false,
+            retain_as_published: false,
+            shared_group: None,
+            kind: SessionKind::Persistent,
+        })
+        .await
+        .unwrap();
+    }
+
+    executor
+        .scan_boundaries
+        .lock()
+        .expect("executor poisoned")
+        .clear();
+    let first = dist
+        .match_topic("t1", &"devices/a/state".into())
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 2);
+    let first_scan_count = executor
+        .scan_boundaries
+        .lock()
+        .expect("executor poisoned")
+        .len();
+    assert!(first_scan_count >= 2);
+
+    let second = dist
+        .match_topic("t1", &"devices/a/state".into())
+        .await
+        .unwrap();
+    assert_eq!(second.len(), 2);
+    let second_scan_count = executor
+        .scan_boundaries
+        .lock()
+        .expect("executor poisoned")
+        .len();
+    assert!(second_scan_count < first_scan_count * 2);
+}
+
+#[tokio::test]
+async fn replicated_dist_list_session_routes_deduplicates_index_records() {
+    let engine = MemoryKvEngine::default();
+    engine
+        .bootstrap(KvRangeBootstrap {
+            range_id: "dist-range-session".into(),
+            boundary: RangeBoundary::full(),
+        })
+        .await
+        .unwrap();
+    let router = Arc::new(MemoryKvRangeRouter::default());
+    router
+        .upsert(ReplicatedRangeDescriptor::new(
+            "dist-range-session",
+            dist_tenant_shard("t1"),
+            RangeBoundary::full(),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ))
+        .await
+        .unwrap();
+    let executor = Arc::new(RecordingKvRangeExecutor {
+        engine: engine.clone(),
+        ..RecordingKvRangeExecutor::default()
+    });
+    let dist = ReplicatedDistHandle::new(router, executor.clone());
+    dist.add_route(RouteRecord {
+        tenant_id: "t1".into(),
+        topic_filter: "devices/+/state".into(),
+        session_id: "s1".into(),
+        node_id: 1,
+        subscription_identifier: None,
+        no_local: false,
+        retain_as_published: false,
+        shared_group: Some("workers".into()),
+        kind: SessionKind::Persistent,
+    })
+    .await
+    .unwrap();
+
+    let routes = dist.list_session_routes("s1").await.unwrap();
+    assert_eq!(routes.len(), 1);
+}
+
+#[tokio::test]
+async fn dist_fanout_worker_delivers_matched_routes() {
+    let dist: Arc<dyn DistRouter> = Arc::new(DistHandle::default());
+    dist.add_route(RouteRecord {
+        tenant_id: "t1".into(),
+        topic_filter: "devices/+/state".into(),
+        session_id: "s1".into(),
+        node_id: 1,
+        subscription_identifier: None,
+        no_local: false,
+        retain_as_published: false,
+        shared_group: None,
+        kind: SessionKind::Persistent,
+    })
+    .await
+    .unwrap();
+    let sink = Arc::new(RecordingDistSink::default());
+    let worker = DistFanoutWorker::new(dist.clone(), sink.clone());
+    let delivered = worker
+        .fanout("t1", &"devices/a/state".into())
+        .await
+        .unwrap();
+    assert_eq!(delivered, 1);
+    assert_eq!(
+        sink.deliveries.lock().expect("sink poisoned").as_slice(),
+        [("t1".into(), "devices/a/state".into(), 1)]
+    );
+}
+
+#[test]
+fn threshold_dist_balance_policy_proposes_actions_for_hot_tenant() {
+    let policy = ThresholdDistBalancePolicy {
+        max_total_routes: 10,
+        max_wildcard_routes: 5,
+        max_shared_routes: 3,
+        desired_voters: 3,
+        desired_learners: 1,
+    };
+    let actions = policy.propose(&[
+        DistTenantStats {
+            tenant_id: "cool".into(),
+            total_routes: 1,
+            wildcard_routes: 1,
+            shared_routes: 0,
+        },
+        DistTenantStats {
+            tenant_id: "hot".into(),
+            total_routes: 20,
+            wildcard_routes: 9,
+            shared_routes: 4,
+        },
+    ]);
+    assert_eq!(
+        actions,
+        vec![
+            DistBalanceAction::RunTenantCleanup {
+                tenant_id: "hot".into(),
+            },
+            DistBalanceAction::SplitTenantRange {
+                tenant_id: "hot".into(),
+            },
+            DistBalanceAction::ScaleTenantReplicas {
+                tenant_id: "hot".into(),
+                voters: 3,
+                learners: 1,
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn dist_maintenance_worker_refreshes_tenant_cache() {
+    let engine = MemoryKvEngine::default();
+    engine
+        .bootstrap(KvRangeBootstrap {
+            range_id: "dist-range-maint".into(),
+            boundary: RangeBoundary::full(),
+        })
+        .await
+        .unwrap();
+    let router = Arc::new(MemoryKvRangeRouter::default());
+    router
+        .upsert(ReplicatedRangeDescriptor::new(
+            "dist-range-maint",
+            dist_tenant_shard("t1"),
+            RangeBoundary::full(),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ))
+        .await
+        .unwrap();
+    let dist = Arc::new(ReplicatedDistHandle::new(
+        router,
+        Arc::new(RecordingKvRangeExecutor {
+            engine: engine.clone(),
+            ..RecordingKvRangeExecutor::default()
+        }),
+    ));
+    dist.add_route(RouteRecord {
+        tenant_id: "t1".into(),
+        topic_filter: "devices/#".into(),
+        session_id: "s1".into(),
+        node_id: 1,
+        subscription_identifier: None,
+        no_local: false,
+        retain_as_published: false,
+        shared_group: None,
+        kind: SessionKind::Persistent,
+    })
+    .await
+    .unwrap();
+
+    let worker = DistMaintenanceWorker::new(dist.clone());
+    assert_eq!(worker.refresh_tenant("t1").await.unwrap(), 1);
+    let task = worker.spawn_tenant_refresh("t1".into(), Duration::from_millis(1));
+    tokio::time::sleep(Duration::from_millis(3)).await;
+    task.abort();
 }
 
 #[tokio::test]
