@@ -1,7 +1,7 @@
 use crate::{
     DistGrpcClient, InboxGrpcClient, KvRangeGrpcClient, MetadataGrpcClient, NoopDeliverySink,
-    PeriodicAntiEntropyReconciler, RetainGrpcClient, RpcRuntime, SessionDictGrpcClient,
-    StaticPeerForwarder,
+    PeriodicAntiEntropyReconciler, PersistentMetadataRegistry, RetainGrpcClient, RpcRuntime,
+    SessionDictGrpcClient, StaticPeerForwarder,
     StaticServiceEndpointRegistry,
 };
 use greenmqtt_broker::{BrokerConfig, BrokerRuntime, DefaultBroker, PeerRegistry};
@@ -1163,6 +1163,69 @@ async fn dynamic_registry_tracks_balancer_states() {
         .await
         .unwrap()
         .is_none());
+}
+
+#[tokio::test]
+async fn persistent_metadata_registry_restores_assignments_ranges_and_balancer_state() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let registry = PersistentMetadataRegistry::open(tempdir.path())
+        .await
+        .unwrap();
+    let shard = ServiceShardKey::dist("t1");
+    registry
+        .upsert_assignment(ServiceShardAssignment::new(
+            shard.clone(),
+            ServiceEndpoint::new(ServiceKind::Dist, 7, "http://127.0.0.1:50070"),
+            1,
+            10,
+            ServiceShardLifecycle::Serving,
+        ))
+        .await
+        .unwrap();
+    registry
+        .upsert_range(ReplicatedRangeDescriptor::new(
+            "range-a",
+            shard,
+            RangeBoundary::new(Some(b"a".to_vec()), Some(b"z".to_vec())),
+            1,
+            2,
+            Some(7),
+            vec![RangeReplica::new(
+                7,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ))
+        .await
+        .unwrap();
+    registry
+        .upsert_balancer_state(
+            "leader-balance",
+            BalancerState {
+                disabled: false,
+                load_rules: BTreeMap::from([("max_skew".into(), "1".into())]),
+            },
+        )
+        .await
+        .unwrap();
+
+    let reopened = PersistentMetadataRegistry::open(tempdir.path())
+        .await
+        .unwrap();
+    assert!(reopened.resolve_assignment(&ServiceShardKey::dist("t1")).await.unwrap().is_some());
+    assert!(reopened.resolve_range("range-a").await.unwrap().is_some());
+    assert_eq!(
+        reopened
+            .resolve_balancer_state("leader-balance")
+            .await
+            .unwrap()
+            .unwrap()
+            .load_rules["max_skew"],
+        "1"
+    );
 }
 
 #[tokio::test]

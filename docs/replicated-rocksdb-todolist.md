@@ -63,7 +63,7 @@ Naming rules:
   - [x] query-ready replica selection
   - [x] redirect/retry handling
 - [x] Extend `greenmqtt-rpc` to expose generic range query/mutation/snapshot RPCs.
-- [ ] Promote the current in-memory assignment registry into a real metadata service that
+- [x] Promote the current in-memory assignment registry into a real metadata service that
   tracks:
   - [x] range descriptors
   - [x] replica sets
@@ -130,8 +130,13 @@ Naming rules:
   range status.
 - `greenmqtt-rpc` now keeps in-memory replicated range descriptors and balancer state
   alongside shard assignments and membership.
+- `greenmqtt-rpc` now also has a persistent metadata registry backed by RocksDB kv-engine,
+  and `serve` mode can opt into it with `GREENMQTT_METADATA_BACKEND=rocksdb`.
 - `greenmqtt-rpc` now exposes gRPC metadata APIs plus generic range get/scan/apply/checkpoint/snapshot
   RPCs backed by the in-memory range host.
+- `greenmqtt-kv-balance` now provides a minimal metadata controller that can bootstrap missing
+  ranges, fail over assignments from offline members, and persist balancer state through the
+  control-plane registry.
 - `greenmqtt-retain` now includes a range-backed retain implementation that works over both
   local executors and the gRPC kv-range executor, and CLI/runtime wiring now supports an opt-in
   replicated retain mode while legacy retain remains the default.

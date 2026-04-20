@@ -5,6 +5,7 @@ members = [
     "crates/greenmqtt-kv-engine",
     "crates/greenmqtt-kv-client",
     "crates/greenmqtt-kv-server",
+    "crates/greenmqtt-kv-balance",
     "crates/greenmqtt-broker",
     "crates/greenmqtt-proto",
     "crates/greenmqtt-rpc",

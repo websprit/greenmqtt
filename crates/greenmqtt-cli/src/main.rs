@@ -5,9 +5,9 @@ use greenmqtt_broker::mqtt::{
 };
 use greenmqtt_broker::{BrokerConfig, BrokerRuntime};
 use greenmqtt_core::{
-    ClientIdentity, ClusterMembershipRegistry, ClusterNodeLifecycle, ClusterNodeMembership,
-    ConnectRequest, Lifecycle, PublishProperties, PublishRequest, ServiceEndpoint, ServiceKind,
-    SessionKind,
+    ClientIdentity, ClusterNodeLifecycle, ClusterNodeMembership, ConnectRequest, Lifecycle,
+    MetadataRegistry, PublishProperties, PublishRequest, ServiceEndpoint, ServiceKind,
+    SessionKind, ShardControlRegistry,
 };
 use greenmqtt_dist::{DistHandle, DistRouter, PersistentDistHandle, ReplicatedDistHandle};
 use greenmqtt_http_api::HttpApi;
@@ -23,7 +23,8 @@ use greenmqtt_plugin_api::{
 use greenmqtt_retain::{PersistentRetainHandle, ReplicatedRetainHandle, RetainHandle, RetainService};
 use greenmqtt_rpc::{
     DistGrpcClient, InboxGrpcClient, KvRangeGrpcClient, MetadataGrpcClient, RetainGrpcClient,
-    RpcRuntime, SessionDictGrpcClient, StaticPeerForwarder, StaticServiceEndpointRegistry,
+    PersistentMetadataRegistry, RpcRuntime, SessionDictGrpcClient, StaticPeerForwarder,
+    StaticServiceEndpointRegistry,
 };
 use greenmqtt_sessiondict::{
     PersistentSessionDictHandle, ReplicatedSessionDictHandle, SessionDictHandle, SessionDirectory,
@@ -903,7 +904,33 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         println!("greenmqtt internal grpc listening on {rpc_bind}");
-        let shard_registry = Arc::new(StaticServiceEndpointRegistry::default());
+        let metadata_backend = std::env::var("GREENMQTT_METADATA_BACKEND")
+            .unwrap_or_else(|_| "memory".to_string())
+            .to_lowercase();
+        let metadata_dir = std::env::var("GREENMQTT_METADATA_DATA_DIR")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+            .or_else(|| data_dir.as_ref().map(|dir| PathBuf::from(dir).join("metadata")));
+        let (metadata_registry, shard_registry): (
+            Arc<dyn MetadataRegistry>,
+            Arc<dyn ShardControlRegistry>,
+        ) = match metadata_backend.as_str() {
+            "memory" => {
+                let registry = Arc::new(StaticServiceEndpointRegistry::default());
+                (registry.clone(), registry)
+            }
+            "rocksdb" => {
+                let path = metadata_dir.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "GREENMQTT_METADATA_BACKEND=rocksdb requires GREENMQTT_METADATA_DATA_DIR or GREENMQTT_DATA_DIR"
+                    )
+                })?;
+                let registry = Arc::new(PersistentMetadataRegistry::open(path).await?);
+                (registry.clone(), registry)
+            }
+            other => anyhow::bail!("unsupported GREENMQTT_METADATA_BACKEND: {other}"),
+        };
         shard_registry
             .upsert_member(ClusterNodeMembership::new(
                 node_id,
@@ -939,7 +966,7 @@ async fn main() -> anyhow::Result<()> {
             inbox: broker.inbox.clone(),
             retain: broker.retain.clone(),
             peer_sink: broker.clone(),
-            assignment_registry: Some(shard_registry),
+            assignment_registry: Some(metadata_registry),
             range_host: None,
         };
         let mut tasks = JoinSet::new();

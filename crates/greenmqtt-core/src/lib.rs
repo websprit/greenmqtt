@@ -407,6 +407,10 @@ impl<T> MetadataRegistry for T where
 {
 }
 
+pub trait ControlPlaneRegistry: ShardControlRegistry + MetadataRegistry {}
+
+impl<T> ControlPlaneRegistry for T where T: ShardControlRegistry + MetadataRegistry {}
+
 #[async_trait]
 pub trait ServiceEndpointRegistry: Send + Sync {
     async fn upsert_assignment(

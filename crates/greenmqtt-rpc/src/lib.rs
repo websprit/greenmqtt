@@ -14,7 +14,7 @@ use greenmqtt_inbox::{
     inbox_session_shard, inbox_tenant_scan_shard, inflight_tenant_scan_shard, InboxService,
 };
 use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter, RangeRoute};
-use greenmqtt_kv_engine::{KvMutation, KvRangeCheckpoint, KvRangeSnapshot};
+use greenmqtt_kv_engine::{KvEngine, KvMutation, KvRangeBootstrap, KvRangeCheckpoint, KvRangeSnapshot, RocksDbKvEngine};
 use greenmqtt_kv_server::KvRangeHost;
 use greenmqtt_proto::internal::{
     broker_peer_service_client::BrokerPeerServiceClient,
@@ -64,10 +64,11 @@ use greenmqtt_proto::{
 use greenmqtt_retain::{retain_tenant_shard, RetainService as RetainStoreService};
 use greenmqtt_sessiondict::{session_identity_shard, SessionDirectory};
 use metrics::counter;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex;
@@ -150,12 +151,24 @@ pub struct DynamicServiceEndpointRegistry {
 }
 
 #[derive(Clone)]
+pub struct PersistentMetadataRegistry {
+    engine: Arc<RocksDbKvEngine>,
+    range_id: String,
+}
+
+#[derive(Clone)]
 pub struct PeriodicAntiEntropyReconciler {
     registry: Arc<DynamicServiceEndpointRegistry>,
     interval: std::time::Duration,
 }
 
 pub type StaticServiceEndpointRegistry = DynamicServiceEndpointRegistry;
+
+const METADATA_RANGE_ID: &str = "__metadata";
+const ASSIGNMENT_PREFIX: &[u8] = b"assignment\0";
+const MEMBER_PREFIX: &[u8] = b"member\0";
+const RANGE_PREFIX: &[u8] = b"range\0";
+const BALANCER_PREFIX: &[u8] = b"balancer\0";
 
 #[derive(Clone)]
 struct StaticPeerClient {
@@ -251,6 +264,37 @@ fn snapshot_checksum<T: Serialize>(value: &T) -> anyhow::Result<u64> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     bytes.hash(&mut hasher);
     Ok(hasher.finish())
+}
+
+fn metadata_key(prefix: &[u8], suffix: &[u8]) -> Bytes {
+    let mut key = Vec::with_capacity(prefix.len() + suffix.len());
+    key.extend_from_slice(prefix);
+    key.extend_from_slice(suffix);
+    Bytes::from(key)
+}
+
+fn assignment_key(shard: &ServiceShardKey) -> anyhow::Result<Bytes> {
+    Ok(metadata_key(ASSIGNMENT_PREFIX, &bincode::serialize(shard)?))
+}
+
+fn member_key(node_id: NodeId) -> Bytes {
+    metadata_key(MEMBER_PREFIX, &node_id.to_be_bytes())
+}
+
+fn range_key(range_id: &str) -> Bytes {
+    metadata_key(RANGE_PREFIX, range_id.as_bytes())
+}
+
+fn balancer_key(name: &str) -> Bytes {
+    metadata_key(BALANCER_PREFIX, name.as_bytes())
+}
+
+fn decode_metadata_value<T: DeserializeOwned>(value: &[u8]) -> anyhow::Result<T> {
+    Ok(bincode::deserialize(value)?)
+}
+
+fn encode_metadata_value<T: Serialize>(value: &T) -> anyhow::Result<Bytes> {
+    Ok(Bytes::from(bincode::serialize(value)?))
 }
 
 fn sessiondict_scope(identity: &ClientIdentity) -> String {
@@ -890,6 +934,64 @@ impl DynamicServiceEndpointRegistry {
     }
 }
 
+impl PersistentMetadataRegistry {
+    pub async fn open(path: impl Into<PathBuf>) -> anyhow::Result<Self> {
+        let engine = Arc::new(RocksDbKvEngine::open(path.into())?);
+        engine
+            .bootstrap(KvRangeBootstrap {
+                range_id: METADATA_RANGE_ID.to_string(),
+                boundary: greenmqtt_core::RangeBoundary::full(),
+            })
+            .await?;
+        Ok(Self {
+            engine,
+            range_id: METADATA_RANGE_ID.to_string(),
+        })
+    }
+
+    async fn read_value<T: DeserializeOwned>(&self, key: Bytes) -> anyhow::Result<Option<T>> {
+        let range = self.engine.open_range(&self.range_id).await?;
+        range.reader()
+            .get(&key)
+            .await?
+            .map(|value| decode_metadata_value(&value))
+            .transpose()
+    }
+
+    async fn write_value<T: Serialize>(&self, key: Bytes, value: &T) -> anyhow::Result<()> {
+        let range = self.engine.open_range(&self.range_id).await?;
+        range.writer()
+            .apply(vec![KvMutation {
+                key,
+                value: Some(encode_metadata_value(value)?),
+            }])
+            .await
+    }
+
+    async fn delete_value<T: DeserializeOwned>(&self, key: Bytes) -> anyhow::Result<Option<T>> {
+        let previous = self.read_value::<T>(key.clone()).await?;
+        if previous.is_some() {
+            let range = self.engine.open_range(&self.range_id).await?;
+            range.writer()
+                .apply(vec![KvMutation { key, value: None }])
+                .await?;
+        }
+        Ok(previous)
+    }
+
+    async fn scan_prefix<T: DeserializeOwned>(&self, prefix: &[u8]) -> anyhow::Result<Vec<T>> {
+        let range = self.engine.open_range(&self.range_id).await?;
+        Ok(range
+            .reader()
+            .scan(&greenmqtt_core::RangeBoundary::full(), usize::MAX)
+            .await?
+            .into_iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .map(|(_, value)| decode_metadata_value(&value))
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+}
+
 #[async_trait]
 impl ServiceEndpointRegistry for DynamicServiceEndpointRegistry {
     async fn upsert_assignment(
@@ -942,6 +1044,45 @@ impl ServiceEndpointRegistry for DynamicServiceEndpointRegistry {
             })
             .cloned()
             .collect();
+        assignments.sort_by(|left, right| left.shard.cmp(&right.shard));
+        Ok(assignments)
+    }
+}
+
+#[async_trait]
+impl ServiceEndpointRegistry for PersistentMetadataRegistry {
+    async fn upsert_assignment(
+        &self,
+        assignment: ServiceShardAssignment,
+    ) -> anyhow::Result<Option<ServiceShardAssignment>> {
+        let key = assignment_key(&assignment.shard)?;
+        let previous = self.read_value::<ServiceShardAssignment>(key.clone()).await?;
+        self.write_value(key, &assignment).await?;
+        Ok(previous)
+    }
+
+    async fn resolve_assignment(
+        &self,
+        shard: &ServiceShardKey,
+    ) -> anyhow::Result<Option<ServiceShardAssignment>> {
+        self.read_value(assignment_key(shard)?).await
+    }
+
+    async fn remove_assignment(
+        &self,
+        shard: &ServiceShardKey,
+    ) -> anyhow::Result<Option<ServiceShardAssignment>> {
+        self.delete_value(assignment_key(shard)?).await
+    }
+
+    async fn list_assignments(
+        &self,
+        kind: Option<ServiceShardKind>,
+    ) -> anyhow::Result<Vec<ServiceShardAssignment>> {
+        let mut assignments = self.scan_prefix::<ServiceShardAssignment>(ASSIGNMENT_PREFIX).await?;
+        if let Some(kind) = kind {
+            assignments.retain(|assignment| assignment.shard.kind == kind);
+        }
         assignments.sort_by(|left, right| left.shard.cmp(&right.shard));
         Ok(assignments)
     }
@@ -1006,6 +1147,45 @@ impl ReplicatedRangeRegistry for DynamicServiceEndpointRegistry {
 }
 
 #[async_trait]
+impl ReplicatedRangeRegistry for PersistentMetadataRegistry {
+    async fn upsert_range(
+        &self,
+        descriptor: ReplicatedRangeDescriptor,
+    ) -> anyhow::Result<Option<ReplicatedRangeDescriptor>> {
+        let key = range_key(&descriptor.id);
+        let previous = self.read_value::<ReplicatedRangeDescriptor>(key.clone()).await?;
+        self.write_value(key, &descriptor).await?;
+        Ok(previous)
+    }
+
+    async fn resolve_range(
+        &self,
+        range_id: &str,
+    ) -> anyhow::Result<Option<ReplicatedRangeDescriptor>> {
+        self.read_value(range_key(range_id)).await
+    }
+
+    async fn remove_range(
+        &self,
+        range_id: &str,
+    ) -> anyhow::Result<Option<ReplicatedRangeDescriptor>> {
+        self.delete_value(range_key(range_id)).await
+    }
+
+    async fn list_ranges(
+        &self,
+        shard_kind: Option<ServiceShardKind>,
+    ) -> anyhow::Result<Vec<ReplicatedRangeDescriptor>> {
+        let mut ranges = self.scan_prefix::<ReplicatedRangeDescriptor>(RANGE_PREFIX).await?;
+        if let Some(kind) = shard_kind {
+            ranges.retain(|descriptor| descriptor.shard.kind == kind);
+        }
+        ranges.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(ranges)
+    }
+}
+
+#[async_trait]
 impl BalancerStateRegistry for DynamicServiceEndpointRegistry {
     async fn upsert_balancer_state(
         &self,
@@ -1048,6 +1228,51 @@ impl BalancerStateRegistry for DynamicServiceEndpointRegistry {
             .read()
             .expect("service registry poisoned")
             .clone())
+    }
+}
+
+#[async_trait]
+impl BalancerStateRegistry for PersistentMetadataRegistry {
+    async fn upsert_balancer_state(
+        &self,
+        balancer_name: &str,
+        state: BalancerState,
+    ) -> anyhow::Result<Option<BalancerState>> {
+        let key = balancer_key(balancer_name);
+        let previous = self.read_value::<BalancerState>(key.clone()).await?;
+        self.write_value(key, &state).await?;
+        Ok(previous)
+    }
+
+    async fn resolve_balancer_state(
+        &self,
+        balancer_name: &str,
+    ) -> anyhow::Result<Option<BalancerState>> {
+        self.read_value(balancer_key(balancer_name)).await
+    }
+
+    async fn remove_balancer_state(
+        &self,
+        balancer_name: &str,
+    ) -> anyhow::Result<Option<BalancerState>> {
+        self.delete_value(balancer_key(balancer_name)).await
+    }
+
+    async fn list_balancer_states(&self) -> anyhow::Result<BTreeMap<String, BalancerState>> {
+        let range = self.engine.open_range(&self.range_id).await?;
+        let mut states = BTreeMap::new();
+        for (key, value) in range
+            .reader()
+            .scan(&greenmqtt_core::RangeBoundary::full(), usize::MAX)
+            .await?
+        {
+            if !key.starts_with(BALANCER_PREFIX) {
+                continue;
+            }
+            let name = std::str::from_utf8(&key[BALANCER_PREFIX.len()..])?.to_string();
+            states.insert(name, decode_metadata_value(&value)?);
+        }
+        Ok(states)
     }
 }
 
@@ -1101,6 +1326,36 @@ impl ClusterMembershipRegistry for DynamicServiceEndpointRegistry {
 }
 
 #[async_trait]
+impl ClusterMembershipRegistry for PersistentMetadataRegistry {
+    async fn upsert_member(
+        &self,
+        member: ClusterNodeMembership,
+    ) -> anyhow::Result<Option<ClusterNodeMembership>> {
+        let key = member_key(member.node_id);
+        let previous = self.read_value::<ClusterNodeMembership>(key.clone()).await?;
+        self.write_value(key, &member).await?;
+        Ok(previous)
+    }
+
+    async fn resolve_member(
+        &self,
+        node_id: NodeId,
+    ) -> anyhow::Result<Option<ClusterNodeMembership>> {
+        self.read_value(member_key(node_id)).await
+    }
+
+    async fn remove_member(&self, node_id: NodeId) -> anyhow::Result<Option<ClusterNodeMembership>> {
+        self.delete_value(member_key(node_id)).await
+    }
+
+    async fn list_members(&self) -> anyhow::Result<Vec<ClusterNodeMembership>> {
+        let mut members = self.scan_prefix::<ClusterNodeMembership>(MEMBER_PREFIX).await?;
+        members.sort_by_key(|member| member.node_id);
+        Ok(members)
+    }
+}
+
+#[async_trait]
 impl ServiceShardRecoveryControl for DynamicServiceEndpointRegistry {
     async fn apply_transition(
         &self,
@@ -1116,6 +1371,24 @@ impl ServiceShardRecoveryControl for DynamicServiceEndpointRegistry {
             }
         }
         Ok(assignments.insert(transition.shard.clone(), transition.target_assignment))
+    }
+}
+
+#[async_trait]
+impl ServiceShardRecoveryControl for PersistentMetadataRegistry {
+    async fn apply_transition(
+        &self,
+        transition: ServiceShardTransition,
+    ) -> anyhow::Result<Option<ServiceShardAssignment>> {
+        if let Some(source_node_id) = transition.source_node_id {
+            if let Some(current) = self.resolve_assignment(&transition.shard).await? {
+                anyhow::ensure!(
+                    current.owner_node_id() == source_node_id,
+                    "source owner mismatch for shard transition"
+                );
+            }
+        }
+        self.upsert_assignment(transition.target_assignment).await
     }
 }
 

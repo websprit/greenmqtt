@@ -864,6 +864,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "greenmqtt-kv-balance"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "greenmqtt-core",
+ "greenmqtt-rpc",
+ "tokio",
+]
+
+[[package]]
 name = "greenmqtt-kv-client"
 version = "0.1.0"
 dependencies = [
@@ -963,6 +974,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bincode",
  "bytes",
  "greenmqtt-broker",
  "greenmqtt-core",
