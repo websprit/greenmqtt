@@ -7,12 +7,14 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+bytes.workspace = true
 greenmqtt-broker = { path = "../greenmqtt-broker" }
 greenmqtt-core = { path = "../greenmqtt-core" }
 greenmqtt-dist = { path = "../greenmqtt-dist" }
 greenmqtt-http-api = { path = "../greenmqtt-http-api" }
 greenmqtt-inbox = { path = "../greenmqtt-inbox" }
 greenmqtt-kv-client = { path = "../greenmqtt-kv-client" }
+greenmqtt-kv-engine = { path = "../greenmqtt-kv-engine" }
 greenmqtt-retain = { path = "../greenmqtt-retain" }
 greenmqtt-rpc = { path = "../greenmqtt-rpc" }
 greenmqtt-sessiondict = { path = "../greenmqtt-sessiondict" }
@@ -25,4 +27,6 @@ sysinfo.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+greenmqtt-kv-raft = { path = "../greenmqtt-kv-raft" }
+greenmqtt-kv-server = { path = "../greenmqtt-kv-server" }
 tempfile = "3.27.0"

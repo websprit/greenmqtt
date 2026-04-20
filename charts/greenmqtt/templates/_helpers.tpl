@@ -67,7 +67,21 @@ Headless service name.
 {{- end -}}
 
 {{/*
-Rendered environment variables.
+Store service name.
+*/}}
+{{- define "greenmqtt.storeFullname" -}}
+{{- printf "%s-state" (include "greenmqtt.fullname" .) -}}
+{{- end -}}
+
+{{/*
+Store headless service name.
+*/}}
+{{- define "greenmqtt.storeHeadlessServiceName" -}}
+{{- printf "%s-headless" (include "greenmqtt.storeFullname" .) -}}
+{{- end -}}
+
+{{/*
+Rendered broker environment variables.
 */}}
 {{- define "greenmqtt.env" -}}
 - name: GREENMQTT_MQTT_BIND
@@ -83,6 +97,9 @@ Rendered environment variables.
 {{- if .Values.greenmqtt.stateEndpoint }}
 - name: GREENMQTT_STATE_ENDPOINT
   value: {{ .Values.greenmqtt.stateEndpoint | quote }}
+{{- else if .Values.storeTopology.enabled }}
+- name: GREENMQTT_STATE_ENDPOINT
+  value: {{ printf "http://%s:%v" (include "greenmqtt.storeFullname" .) (.Values.storeTopology.service.rpc.port | int) | quote }}
 {{- end }}
 {{- if .Values.greenmqtt.redisUrl }}
 - name: GREENMQTT_REDIS_URL
@@ -105,6 +122,22 @@ Rendered environment variables.
   value: {{ .Values.greenmqtt.maxPacketSize | quote }}
 {{- end }}
 {{- range $name, $value := .Values.greenmqtt.extraEnv }}
+- name: {{ $name }}
+  value: {{ $value | quote }}
+{{- end }}
+{{- end -}}
+
+{{/*
+Rendered store environment variables.
+*/}}
+{{- define "greenmqtt.storeEnv" -}}
+- name: GREENMQTT_RPC_BIND
+  value: {{ .Values.storeTopology.greenmqtt.rpcBind | quote }}
+- name: GREENMQTT_STORAGE_BACKEND
+  value: {{ .Values.storeTopology.greenmqtt.storageBackend | quote }}
+- name: GREENMQTT_DATA_DIR
+  value: {{ .Values.storeTopology.greenmqtt.dataDir | quote }}
+{{- range $name, $value := .Values.storeTopology.greenmqtt.extraEnv }}
 - name: {{ $name }}
   value: {{ $value | quote }}
 {{- end }}

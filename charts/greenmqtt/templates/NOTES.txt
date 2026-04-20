@@ -9,7 +9,16 @@
   kubectl port-forward svc/{{ include "greenmqtt.fullname" . }} -n {{ .Release.Namespace }} {{ .Values.service.http.port }}:{{ .Values.service.http.port }}
   curl http://127.0.0.1:{{ .Values.service.http.port }}/healthz
 
+{{- if .Values.storeTopology.enabled }}
+3. Store RPC:
+  kubectl port-forward svc/{{ include "greenmqtt.storeFullname" . }} -n {{ .Release.Namespace }} {{ .Values.storeTopology.service.rpc.port }}:{{ .Values.storeTopology.service.rpc.port }}
+
+4. Important note:
+  Broker pods and store pods now have separate topology. Brokers default their
+  `GREENMQTT_STATE_ENDPOINT` to the store service unless you override it explicitly.
+{{- else }}
 3. Important note:
   This chart assigns `GREENMQTT_NODE_ID` from the StatefulSet ordinal. Running multiple replicas
   is possible, but a production cluster still needs explicit peer/state topology planning through
   `GREENMQTT_*` environment variables such as `GREENMQTT_PEERS` or `GREENMQTT_STATE_ENDPOINT`.
+{{- end }}

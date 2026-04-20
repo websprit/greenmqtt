@@ -4,12 +4,18 @@ pub mod internal {
 
 use bytes::Bytes;
 use greenmqtt_core::{
-    BalancerState, ClientIdentity, Delivery, InflightMessage, InflightPhase, OfflineMessage,
-    PublishProperties, RangeBoundary, RangeReplica, ReplicaRole, ReplicaSyncState,
-    ReplicatedRangeDescriptor, RetainedMessage, RouteRecord, ServiceShardKey, ServiceShardKind,
-    ServiceShardLifecycle, SessionKind, SessionRecord, SharedPayload, Subscription, UserProperty,
+    BalancerState, ClientIdentity, ClusterNodeLifecycle, ClusterNodeMembership, Delivery,
+    InflightMessage, InflightPhase, OfflineMessage, PublishProperties, RangeBoundary, RangeReplica,
+    ReplicaRole, ReplicaSyncState, ReplicatedRangeDescriptor, RetainedMessage, RouteRecord,
+    ServiceEndpoint, ServiceKind, ServiceShardKey, ServiceShardKind, ServiceShardLifecycle,
+    SessionKind, SessionRecord, SharedPayload, Subscription, UserProperty,
 };
 use greenmqtt_kv_engine::{KvMutation, KvRangeCheckpoint, KvRangeSnapshot};
+use greenmqtt_kv_raft::{
+    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
+    OutboundRaftMessage, RaftLogEntry, RaftMessage, RaftSnapshot, RequestVoteRequest,
+    RequestVoteResponse,
+};
 use internal as proto;
 
 pub fn to_proto_client_identity(identity: &ClientIdentity) -> proto::ClientIdentity {
@@ -128,6 +134,28 @@ pub fn from_proto_shard_kind(kind: &str) -> ServiceShardKind {
     }
 }
 
+pub fn to_proto_service_kind(kind: &ServiceKind) -> String {
+    match kind {
+        ServiceKind::Broker => "broker".to_string(),
+        ServiceKind::SessionDict => "sessiondict".to_string(),
+        ServiceKind::Dist => "dist".to_string(),
+        ServiceKind::Inbox => "inbox".to_string(),
+        ServiceKind::Retain => "retain".to_string(),
+        ServiceKind::HttpApi => "http-api".to_string(),
+    }
+}
+
+pub fn from_proto_service_kind(kind: &str) -> ServiceKind {
+    match kind {
+        "broker" => ServiceKind::Broker,
+        "sessiondict" => ServiceKind::SessionDict,
+        "inbox" => ServiceKind::Inbox,
+        "retain" => ServiceKind::Retain,
+        "http-api" => ServiceKind::HttpApi,
+        _ => ServiceKind::Dist,
+    }
+}
+
 pub fn to_proto_shard_lifecycle(lifecycle: &ServiceShardLifecycle) -> String {
     match lifecycle {
         ServiceShardLifecycle::Bootstrapping => "bootstrapping".to_string(),
@@ -145,6 +173,72 @@ pub fn from_proto_shard_lifecycle(lifecycle: &str) -> ServiceShardLifecycle {
         "recovering" => ServiceShardLifecycle::Recovering,
         "offline" => ServiceShardLifecycle::Offline,
         _ => ServiceShardLifecycle::Serving,
+    }
+}
+
+pub fn to_proto_cluster_node_lifecycle(lifecycle: &ClusterNodeLifecycle) -> String {
+    match lifecycle {
+        ClusterNodeLifecycle::Joining => "joining".to_string(),
+        ClusterNodeLifecycle::Serving => "serving".to_string(),
+        ClusterNodeLifecycle::Suspect => "suspect".to_string(),
+        ClusterNodeLifecycle::Leaving => "leaving".to_string(),
+        ClusterNodeLifecycle::Offline => "offline".to_string(),
+    }
+}
+
+pub fn from_proto_cluster_node_lifecycle(lifecycle: &str) -> ClusterNodeLifecycle {
+    match lifecycle {
+        "joining" => ClusterNodeLifecycle::Joining,
+        "suspect" => ClusterNodeLifecycle::Suspect,
+        "leaving" => ClusterNodeLifecycle::Leaving,
+        "offline" => ClusterNodeLifecycle::Offline,
+        _ => ClusterNodeLifecycle::Serving,
+    }
+}
+
+pub fn to_proto_service_endpoint(endpoint: &ServiceEndpoint) -> proto::ServiceEndpointRecord {
+    proto::ServiceEndpointRecord {
+        kind: to_proto_service_kind(&endpoint.kind),
+        node_id: endpoint.node_id,
+        endpoint: endpoint.endpoint.clone(),
+    }
+}
+
+pub fn from_proto_service_endpoint(endpoint: proto::ServiceEndpointRecord) -> ServiceEndpoint {
+    ServiceEndpoint {
+        kind: from_proto_service_kind(&endpoint.kind),
+        node_id: endpoint.node_id,
+        endpoint: endpoint.endpoint,
+    }
+}
+
+pub fn to_proto_cluster_node_membership(
+    member: &ClusterNodeMembership,
+) -> proto::ClusterNodeMembershipRecord {
+    proto::ClusterNodeMembershipRecord {
+        node_id: member.node_id,
+        epoch: member.epoch,
+        lifecycle: to_proto_cluster_node_lifecycle(&member.lifecycle),
+        endpoints: member
+            .endpoints
+            .iter()
+            .map(to_proto_service_endpoint)
+            .collect(),
+    }
+}
+
+pub fn from_proto_cluster_node_membership(
+    member: proto::ClusterNodeMembershipRecord,
+) -> ClusterNodeMembership {
+    ClusterNodeMembership {
+        node_id: member.node_id,
+        epoch: member.epoch,
+        lifecycle: from_proto_cluster_node_lifecycle(&member.lifecycle),
+        endpoints: member
+            .endpoints
+            .into_iter()
+            .map(from_proto_service_endpoint)
+            .collect(),
     }
 }
 
@@ -224,7 +318,11 @@ pub fn to_proto_replicated_range(
         epoch: descriptor.epoch,
         config_version: descriptor.config_version,
         leader_node_id: descriptor.leader_node_id.unwrap_or_default(),
-        replicas: descriptor.replicas.iter().map(to_proto_range_replica).collect(),
+        replicas: descriptor
+            .replicas
+            .iter()
+            .map(to_proto_range_replica)
+            .collect(),
         commit_index: descriptor.commit_index,
         applied_index: descriptor.applied_index,
         lifecycle: to_proto_shard_lifecycle(&descriptor.lifecycle),
@@ -327,6 +425,10 @@ pub fn to_proto_kv_range_snapshot(snapshot: &KvRangeSnapshot) -> proto::KvRangeS
     proto::KvRangeSnapshotReply {
         range_id: snapshot.range_id.clone(),
         boundary: Some(to_proto_range_boundary(&snapshot.boundary)),
+        term: snapshot.term,
+        index: snapshot.index,
+        checksum: snapshot.checksum,
+        layout_version: snapshot.layout_version,
         data_path: snapshot.data_path.clone(),
     }
 }
@@ -338,8 +440,184 @@ pub fn from_proto_kv_range_snapshot(snapshot: proto::KvRangeSnapshotReply) -> Kv
             .boundary
             .map(from_proto_range_boundary)
             .unwrap_or_else(RangeBoundary::full),
+        term: snapshot.term,
+        index: snapshot.index,
+        checksum: snapshot.checksum,
+        layout_version: snapshot.layout_version,
         data_path: snapshot.data_path,
     }
+}
+
+pub fn to_proto_raft_log_entry(entry: &RaftLogEntry) -> proto::RaftLogEntryRecord {
+    proto::RaftLogEntryRecord {
+        term: entry.term,
+        index: entry.index,
+        command: entry.command.to_vec(),
+    }
+}
+
+pub fn from_proto_raft_log_entry(entry: proto::RaftLogEntryRecord) -> RaftLogEntry {
+    RaftLogEntry {
+        term: entry.term,
+        index: entry.index,
+        command: Bytes::from(entry.command),
+    }
+}
+
+pub fn to_proto_raft_snapshot(snapshot: &RaftSnapshot) -> proto::RaftSnapshotRecord {
+    proto::RaftSnapshotRecord {
+        range_id: snapshot.range_id.clone(),
+        term: snapshot.term,
+        index: snapshot.index,
+        payload: snapshot.payload.to_vec(),
+    }
+}
+
+pub fn from_proto_raft_snapshot(snapshot: proto::RaftSnapshotRecord) -> RaftSnapshot {
+    RaftSnapshot {
+        range_id: snapshot.range_id,
+        term: snapshot.term,
+        index: snapshot.index,
+        payload: Bytes::from(snapshot.payload),
+    }
+}
+
+pub fn to_proto_raft_transport_request(
+    range_id: &str,
+    from_node_id: u64,
+    message: &RaftMessage,
+) -> proto::RaftTransportRequest {
+    let payload = match message {
+        RaftMessage::AppendEntries(append) => {
+            proto::raft_transport_request::Payload::AppendEntries(
+                proto::RaftAppendEntriesRequestRecord {
+                    term: append.term,
+                    leader_id: append.leader_id,
+                    prev_log_index: append.prev_log_index,
+                    prev_log_term: append.prev_log_term,
+                    entries: append.entries.iter().map(to_proto_raft_log_entry).collect(),
+                    leader_commit: append.leader_commit,
+                },
+            )
+        }
+        RaftMessage::AppendEntriesResponse(response) => {
+            proto::raft_transport_request::Payload::AppendEntriesResponse(
+                proto::RaftAppendEntriesResponseRecord {
+                    term: response.term,
+                    success: response.success,
+                    match_index: response.match_index,
+                },
+            )
+        }
+        RaftMessage::RequestVote(vote) => proto::raft_transport_request::Payload::RequestVote(
+            proto::RaftRequestVoteRequestRecord {
+                term: vote.term,
+                candidate_id: vote.candidate_id,
+                last_log_index: vote.last_log_index,
+                last_log_term: vote.last_log_term,
+            },
+        ),
+        RaftMessage::RequestVoteResponse(response) => {
+            proto::raft_transport_request::Payload::RequestVoteResponse(
+                proto::RaftRequestVoteResponseRecord {
+                    term: response.term,
+                    vote_granted: response.vote_granted,
+                },
+            )
+        }
+        RaftMessage::InstallSnapshot(install) => {
+            proto::raft_transport_request::Payload::InstallSnapshot(
+                proto::RaftInstallSnapshotRequestRecord {
+                    term: install.term,
+                    leader_id: install.leader_id,
+                    snapshot: Some(to_proto_raft_snapshot(&install.snapshot)),
+                },
+            )
+        }
+        RaftMessage::InstallSnapshotResponse(response) => {
+            proto::raft_transport_request::Payload::InstallSnapshotResponse(
+                proto::RaftInstallSnapshotResponseRecord {
+                    term: response.term,
+                    accepted: response.accepted,
+                },
+            )
+        }
+    };
+    proto::RaftTransportRequest {
+        range_id: range_id.to_string(),
+        from_node_id,
+        payload: Some(payload),
+    }
+}
+
+pub fn from_proto_raft_transport_request(
+    request: proto::RaftTransportRequest,
+) -> anyhow::Result<(String, u64, RaftMessage)> {
+    let range_id = request.range_id;
+    let from_node_id = request.from_node_id;
+    let message = match request.payload {
+        Some(proto::raft_transport_request::Payload::AppendEntries(append)) => {
+            RaftMessage::AppendEntries(AppendEntriesRequest {
+                term: append.term,
+                leader_id: append.leader_id,
+                prev_log_index: append.prev_log_index,
+                prev_log_term: append.prev_log_term,
+                entries: append
+                    .entries
+                    .into_iter()
+                    .map(from_proto_raft_log_entry)
+                    .collect(),
+                leader_commit: append.leader_commit,
+            })
+        }
+        Some(proto::raft_transport_request::Payload::AppendEntriesResponse(response)) => {
+            RaftMessage::AppendEntriesResponse(AppendEntriesResponse {
+                term: response.term,
+                success: response.success,
+                match_index: response.match_index,
+            })
+        }
+        Some(proto::raft_transport_request::Payload::RequestVote(vote)) => {
+            RaftMessage::RequestVote(RequestVoteRequest {
+                term: vote.term,
+                candidate_id: vote.candidate_id,
+                last_log_index: vote.last_log_index,
+                last_log_term: vote.last_log_term,
+            })
+        }
+        Some(proto::raft_transport_request::Payload::RequestVoteResponse(response)) => {
+            RaftMessage::RequestVoteResponse(RequestVoteResponse {
+                term: response.term,
+                vote_granted: response.vote_granted,
+            })
+        }
+        Some(proto::raft_transport_request::Payload::InstallSnapshot(install)) => {
+            RaftMessage::InstallSnapshot(InstallSnapshotRequest {
+                term: install.term,
+                leader_id: install.leader_id,
+                snapshot: install
+                    .snapshot
+                    .map(from_proto_raft_snapshot)
+                    .ok_or_else(|| anyhow::anyhow!("missing raft snapshot"))?,
+            })
+        }
+        Some(proto::raft_transport_request::Payload::InstallSnapshotResponse(response)) => {
+            RaftMessage::InstallSnapshotResponse(InstallSnapshotResponse {
+                term: response.term,
+                accepted: response.accepted,
+            })
+        }
+        None => anyhow::bail!("missing raft transport payload"),
+    };
+    Ok((range_id, from_node_id, message))
+}
+
+pub fn to_proto_outbound_raft_message(
+    range_id: &str,
+    from_node_id: u64,
+    outbound: &OutboundRaftMessage,
+) -> proto::RaftTransportRequest {
+    to_proto_raft_transport_request(range_id, from_node_id, &outbound.message)
 }
 
 pub fn to_proto_subscription(subscription: &Subscription) -> proto::SubscriptionRecord {

@@ -344,7 +344,7 @@ impl ReplicatedInboxHandle {
         Self {
             router,
             executor,
-            next_seq: Arc::new(AtomicU64::new(1)),
+            next_seq: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -370,24 +370,34 @@ impl ReplicatedInboxHandle {
             .ok_or_else(|| anyhow::anyhow!("no inflight range available for tenant {tenant_id}"))
     }
 
-    async fn scan_inbox_kind(
-        &self,
-        kind: ServiceShardKind,
-    ) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
+    async fn scan_inbox_kind(&self, kind: ServiceShardKind) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
         let mut entries = Vec::new();
         for descriptor in self.router.list().await? {
             if descriptor.shard.kind != kind {
                 continue;
             }
-            entries.extend(
-                self.executor
-                    .scan(&descriptor.id, None, usize::MAX)
-                    .await?,
-            );
+            entries.extend(self.executor.scan(&descriptor.id, None, usize::MAX).await?);
         }
         Ok(entries)
     }
 
+    async fn next_offline_seq(&self) -> anyhow::Result<u64> {
+        let current = self.next_seq.load(Ordering::Relaxed);
+        if current > 0 {
+            return Ok(self.next_seq.fetch_add(1, Ordering::Relaxed));
+        }
+        let mut max_seq = 0u64;
+        for (key, _) in self.scan_inbox_kind(ServiceShardKind::Inbox).await? {
+            if let Some(seq) = offline_seq_from_key(&key) {
+                max_seq = max_seq.max(seq);
+            }
+        }
+        let next = max_seq.saturating_add(1);
+        let _ = self
+            .next_seq
+            .compare_exchange(0, next, Ordering::SeqCst, Ordering::SeqCst);
+        Ok(self.next_seq.fetch_add(1, Ordering::Relaxed))
+    }
 }
 
 const SUBSCRIPTION_KEY_PREFIX: &[u8] = b"sub\0";
@@ -422,6 +432,15 @@ fn offline_key(session_id: &SessionId, seq: u64) -> Bytes {
     key.push(0);
     key.extend_from_slice(&seq.to_be_bytes());
     Bytes::from(key)
+}
+
+fn offline_seq_from_key(key: &[u8]) -> Option<u64> {
+    if !key.starts_with(OFFLINE_KEY_PREFIX) || key.len() < 8 {
+        return None;
+    }
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(&key[key.len().saturating_sub(8)..]);
+    Some(u64::from_be_bytes(raw))
 }
 
 fn inflight_key(session_id: &SessionId, packet_id: u16) -> Bytes {
@@ -501,7 +520,9 @@ impl InboxService for ReplicatedInboxHandle {
         let inflight = self.fetch_inflight(session_id).await?;
 
         for subscription in subscriptions {
-            let range_id = self.inbox_range_id_for_tenant(&subscription.tenant_id).await?;
+            let range_id = self
+                .inbox_range_id_for_tenant(&subscription.tenant_id)
+                .await?;
             self.executor
                 .apply(
                     &range_id,
@@ -539,7 +560,9 @@ impl InboxService for ReplicatedInboxHandle {
         }
 
         for message in inflight {
-            let range_id = self.inflight_range_id_for_tenant(&message.tenant_id).await?;
+            let range_id = self
+                .inflight_range_id_for_tenant(&message.tenant_id)
+                .await?;
             self.executor
                 .apply(
                     &range_id,
@@ -554,7 +577,9 @@ impl InboxService for ReplicatedInboxHandle {
     }
 
     async fn subscribe(&self, subscription: Subscription) -> anyhow::Result<()> {
-        let range_id = self.inbox_range_id_for_tenant(&subscription.tenant_id).await?;
+        let range_id = self
+            .inbox_range_id_for_tenant(&subscription.tenant_id)
+            .await?;
         self.executor
             .apply(
                 &range_id,
@@ -575,7 +600,8 @@ impl InboxService for ReplicatedInboxHandle {
         session_id: &SessionId,
         topic_filter: &str,
     ) -> anyhow::Result<bool> {
-        self.unsubscribe_shared(session_id, topic_filter, None).await
+        self.unsubscribe_shared(session_id, topic_filter, None)
+            .await
     }
 
     async fn unsubscribe_shared(
@@ -590,7 +616,9 @@ impl InboxService for ReplicatedInboxHandle {
         else {
             return Ok(false);
         };
-        let range_id = self.inbox_range_id_for_tenant(&subscription.tenant_id).await?;
+        let range_id = self
+            .inbox_range_id_for_tenant(&subscription.tenant_id)
+            .await?;
         self.executor
             .apply(
                 &range_id,
@@ -605,7 +633,7 @@ impl InboxService for ReplicatedInboxHandle {
 
     async fn enqueue(&self, message: OfflineMessage) -> anyhow::Result<()> {
         let range_id = self.inbox_range_id_for_tenant(&message.tenant_id).await?;
-        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        let seq = self.next_offline_seq().await?;
         self.executor
             .apply(
                 &range_id,
@@ -704,7 +732,9 @@ impl InboxService for ReplicatedInboxHandle {
     }
 
     async fn stage_inflight(&self, message: InflightMessage) -> anyhow::Result<()> {
-        let range_id = self.inflight_range_id_for_tenant(&message.tenant_id).await?;
+        let range_id = self
+            .inflight_range_id_for_tenant(&message.tenant_id)
+            .await?;
         self.executor
             .apply(
                 &range_id,
@@ -725,7 +755,9 @@ impl InboxService for ReplicatedInboxHandle {
         else {
             return Ok(());
         };
-        let range_id = self.inflight_range_id_for_tenant(&message.tenant_id).await?;
+        let range_id = self
+            .inflight_range_id_for_tenant(&message.tenant_id)
+            .await?;
         self.executor
             .apply(
                 &range_id,
@@ -737,10 +769,7 @@ impl InboxService for ReplicatedInboxHandle {
             .await
     }
 
-    async fn fetch_inflight(
-        &self,
-        session_id: &SessionId,
-    ) -> anyhow::Result<Vec<InflightMessage>> {
+    async fn fetch_inflight(&self, session_id: &SessionId) -> anyhow::Result<Vec<InflightMessage>> {
         let mut messages = Vec::new();
         for (_, value) in self.scan_inbox_kind(ServiceShardKind::Inflight).await? {
             if let Ok(message) = decode_inflight(&value) {

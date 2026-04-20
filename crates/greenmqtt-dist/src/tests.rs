@@ -36,7 +36,8 @@ impl KvRangeExecutor for LocalKvRangeExecutor {
         limit: usize,
     ) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
         let range = self.engine.open_range(range_id).await?;
-        range.reader()
+        range
+            .reader()
             .scan(&boundary.unwrap_or_else(RangeBoundary::full), limit)
             .await
     }
@@ -670,6 +671,61 @@ async fn replicated_dist_routes_and_matches_topics_over_kv_ranges() {
     );
     assert_eq!(dist.remove_session_routes("s1").await.unwrap(), 1);
     assert_eq!(dist.route_count().await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn replicated_dist_reapplying_same_route_keeps_single_record() {
+    let engine = MemoryKvEngine::default();
+    engine
+        .bootstrap(KvRangeBootstrap {
+            range_id: "dist-range-idem".into(),
+            boundary: RangeBoundary::full(),
+        })
+        .await
+        .unwrap();
+    let router = Arc::new(MemoryKvRangeRouter::default());
+    router
+        .upsert(ReplicatedRangeDescriptor::new(
+            "dist-range-idem",
+            dist_tenant_shard("t1"),
+            RangeBoundary::full(),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ))
+        .await
+        .unwrap();
+    let dist = ReplicatedDistHandle::new(
+        router,
+        Arc::new(LocalKvRangeExecutor {
+            engine: engine.clone(),
+        }),
+    );
+    let route = RouteRecord {
+        tenant_id: "t1".into(),
+        topic_filter: "devices/+/state".into(),
+        session_id: "s1".into(),
+        node_id: 1,
+        subscription_identifier: None,
+        no_local: false,
+        retain_as_published: false,
+        shared_group: None,
+        kind: SessionKind::Persistent,
+    };
+
+    dist.add_route(route.clone()).await.unwrap();
+    dist.add_route(route).await.unwrap();
+
+    assert_eq!(dist.route_count().await.unwrap(), 1);
+    assert_eq!(dist.list_routes(Some("t1")).await.unwrap().len(), 1);
 }
 
 #[tokio::test]

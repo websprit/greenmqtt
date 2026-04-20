@@ -5,14 +5,19 @@ use greenmqtt_broker::mqtt::{
 };
 use greenmqtt_broker::{BrokerConfig, BrokerRuntime};
 use greenmqtt_core::{
-    ClientIdentity, ClusterNodeLifecycle, ClusterNodeMembership, ConnectRequest, Lifecycle,
-    MetadataRegistry, PublishProperties, PublishRequest, ServiceEndpoint, ServiceKind,
-    SessionKind, ShardControlRegistry,
+    ClientIdentity, ClusterMembershipRegistry, ClusterNodeLifecycle, ClusterNodeMembership,
+    ConnectRequest, Lifecycle, MetadataRegistry, PublishProperties, PublishRequest, RangeBoundary,
+    RangeReplica, ReplicaRole, ReplicaSyncState, ReplicatedRangeDescriptor, ServiceEndpoint,
+    ServiceKind, ServiceShardKey, ServiceShardKind, ServiceShardLifecycle, SessionKind,
+    ShardControlRegistry,
 };
 use greenmqtt_dist::{DistHandle, DistRouter, PersistentDistHandle, ReplicatedDistHandle};
 use greenmqtt_http_api::HttpApi;
 use greenmqtt_inbox::{InboxHandle, InboxService, PersistentInboxHandle, ReplicatedInboxHandle};
-use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter};
+use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter, LeaderRoutedKvRangeExecutor};
+use greenmqtt_kv_engine::{
+    KvEngine, KvMutation, KvRangeBootstrap, KvRangeCheckpoint, KvRangeSnapshot, RocksDbKvEngine,
+};
 use greenmqtt_plugin_api::{
     current_listener_profile, AclAction, AclDecision, AclProvider, AclRule, AuthProvider,
     BridgeEventHook, BridgeRule, ConfiguredAcl, ConfiguredAuth, ConfiguredEventHook, EventHook,
@@ -20,29 +25,30 @@ use greenmqtt_plugin_api::{
     StaticAclProvider, StaticAuthProvider, StaticEnhancedAuthProvider, TopicRewriteEventHook,
     TopicRewriteRule, WebHookConfig, WebHookEventHook, BRIDGE_CLIENT_ID_PREFIX,
 };
-use greenmqtt_retain::{PersistentRetainHandle, ReplicatedRetainHandle, RetainHandle, RetainService};
+use greenmqtt_retain::{
+    PersistentRetainHandle, ReplicatedRetainHandle, RetainHandle, RetainService,
+};
 use greenmqtt_rpc::{
-    DistGrpcClient, InboxGrpcClient, KvRangeGrpcClient, MetadataGrpcClient, RetainGrpcClient,
-    PersistentMetadataRegistry, RpcRuntime, SessionDictGrpcClient, StaticPeerForwarder,
-    StaticServiceEndpointRegistry,
+    DistGrpcClient, InboxGrpcClient, KvRangeGrpcClient, KvRangeGrpcExecutorFactory,
+    MetadataGrpcClient, PersistentMetadataRegistry, RetainGrpcClient, RpcRuntime,
+    SessionDictGrpcClient, StaticPeerForwarder, StaticServiceEndpointRegistry,
 };
 use greenmqtt_sessiondict::{
     PersistentSessionDictHandle, ReplicatedSessionDictHandle, SessionDictHandle, SessionDirectory,
 };
 use greenmqtt_storage::{
     RedisInboxStore, RedisInflightStore, RedisRetainStore, RedisRouteStore, RedisSessionStore,
-    RedisSubscriptionStore, RocksInboxStore, RocksInflightStore, RocksRetainStore, RocksRouteStore,
-    RocksSessionStore, RocksSubscriptionStore, SledInboxStore, SledInflightStore, SledRetainStore,
-    SledRouteStore, SledSessionStore, SledSubscriptionStore,
+    RedisSubscriptionStore, SledInboxStore, SledInflightStore, SledRetainStore, SledRouteStore,
+    SledSessionStore, SledSubscriptionStore,
 };
 use metrics_exporter_prometheus::PrometheusBuilder;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use std::time::Instant;
 use sysinfo::{get_current_pid, System};
@@ -669,28 +675,54 @@ async fn main() -> anyhow::Result<()> {
 
     let (default_sessiondict, default_dist, default_inbox, default_retain): AppStateServices =
         match state_endpoint.as_deref() {
-        Some(endpoint) => (
-            Arc::new(SessionDictGrpcClient::connect(endpoint).await?),
-            Arc::new(DistGrpcClient::connect(endpoint).await?),
-            Arc::new(InboxGrpcClient::connect(endpoint).await?),
-            Arc::new(RetainGrpcClient::connect(endpoint).await?),
-        ),
-        None => {
-            if storage_backend == "redis" {
-                redis_services(&redis_url).await?
-            } else {
-                match data_dir {
-                    Some(ref dir) => durable_services(PathBuf::from(dir), &storage_backend).await?,
-                    None => (
-                        Arc::new(SessionDictHandle::default()),
-                        Arc::new(DistHandle::default()),
-                        Arc::new(InboxHandle::default()),
-                        Arc::new(RetainHandle::default()),
-                    ),
-                }
+            Some(endpoint) => (
+                Arc::new(SessionDictGrpcClient::connect(endpoint).await?),
+                Arc::new(DistGrpcClient::connect(endpoint).await?),
+                Arc::new(InboxGrpcClient::connect(endpoint).await?),
+                Arc::new(RetainGrpcClient::connect(endpoint).await?),
+            ),
+            None => {
+                if storage_backend == "redis" {
+                    redis_services(&redis_url).await?
+                } else {
+                    match data_dir {
+                        Some(ref dir) => {
+                            durable_services(PathBuf::from(dir), &storage_backend, node_id).await?
+                        }
+                        None => (
+                            Arc::new(SessionDictHandle::default()),
+                            Arc::new(DistHandle::default()),
+                            Arc::new(InboxHandle::default()),
+                            Arc::new(RetainHandle::default()),
+                        ),
+                    }
                 }
             }
         };
+
+    if mode == "state-serve" {
+        anyhow::ensure!(
+            state_endpoint.is_none(),
+            "state-serve does not support GREENMQTT_STATE_ENDPOINT"
+        );
+        let rpc_bind: SocketAddr = std::env::var("GREENMQTT_RPC_BIND")
+            .unwrap_or_else(|_| "127.0.0.1:50051".to_string())
+            .parse()?;
+        println!("greenmqtt state grpc listening on {rpc_bind}");
+        RpcRuntime {
+            sessiondict: default_sessiondict,
+            dist: default_dist,
+            inbox: default_inbox,
+            retain: default_retain,
+            peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
+            assignment_registry: None,
+            range_host: None,
+        }
+        .serve(rpc_bind)
+        .await?;
+        return Ok(());
+    }
+
     let sessiondict =
         configured_sessiondict_service(default_sessiondict, state_endpoint.as_deref()).await?;
     let dist = configured_dist_service(default_dist, state_endpoint.as_deref()).await?;
@@ -911,7 +943,11 @@ async fn main() -> anyhow::Result<()> {
             .ok()
             .filter(|value| !value.trim().is_empty())
             .map(PathBuf::from)
-            .or_else(|| data_dir.as_ref().map(|dir| PathBuf::from(dir).join("metadata")));
+            .or_else(|| {
+                data_dir
+                    .as_ref()
+                    .map(|dir| PathBuf::from(dir).join("metadata"))
+            });
         let (metadata_registry, shard_registry): (
             Arc<dyn MetadataRegistry>,
             Arc<dyn ShardControlRegistry>,
@@ -2596,9 +2632,270 @@ async fn configure_peers(forwarder: &StaticPeerForwarder) -> anyhow::Result<()> 
     Ok(())
 }
 
+#[derive(Clone)]
+struct LocalKvRangeExecutor {
+    engine: Arc<dyn KvEngine>,
+}
+
+#[async_trait]
+impl KvRangeExecutor for LocalKvRangeExecutor {
+    async fn get(&self, range_id: &str, key: &[u8]) -> anyhow::Result<Option<bytes::Bytes>> {
+        let range = self.engine.open_range(range_id).await?;
+        range.reader().get(key).await
+    }
+
+    async fn scan(
+        &self,
+        range_id: &str,
+        boundary: Option<RangeBoundary>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(bytes::Bytes, bytes::Bytes)>> {
+        let range = self.engine.open_range(range_id).await?;
+        range
+            .reader()
+            .scan(&boundary.unwrap_or_else(RangeBoundary::full), limit)
+            .await
+    }
+
+    async fn apply(&self, range_id: &str, mutations: Vec<KvMutation>) -> anyhow::Result<()> {
+        let range = self.engine.open_range(range_id).await?;
+        range.writer().apply(mutations).await
+    }
+
+    async fn checkpoint(
+        &self,
+        range_id: &str,
+        checkpoint_id: &str,
+    ) -> anyhow::Result<KvRangeCheckpoint> {
+        let range = self.engine.open_range(range_id).await?;
+        range.checkpoint(checkpoint_id).await
+    }
+
+    async fn snapshot(&self, range_id: &str) -> anyhow::Result<KvRangeSnapshot> {
+        let range = self.engine.open_range(range_id).await?;
+        range.snapshot().await
+    }
+}
+
+#[derive(Clone, Default)]
+struct SingleNodeServiceRangeRouter {
+    descriptors: Arc<RwLock<BTreeMap<String, ReplicatedRangeDescriptor>>>,
+}
+
+impl SingleNodeServiceRangeRouter {
+    fn new(descriptors: impl IntoIterator<Item = ReplicatedRangeDescriptor>) -> Self {
+        let router = Self::default();
+        {
+            let mut guard = router
+                .descriptors
+                .write()
+                .expect("single-node router poisoned");
+            for descriptor in descriptors {
+                guard.insert(descriptor.id.clone(), descriptor);
+            }
+        }
+        router
+    }
+}
+
+#[async_trait]
+impl KvRangeRouter for SingleNodeServiceRangeRouter {
+    async fn upsert(&self, descriptor: ReplicatedRangeDescriptor) -> anyhow::Result<()> {
+        self.descriptors
+            .write()
+            .expect("single-node router poisoned")
+            .insert(descriptor.id.clone(), descriptor);
+        Ok(())
+    }
+
+    async fn remove(&self, range_id: &str) -> anyhow::Result<Option<ReplicatedRangeDescriptor>> {
+        Ok(self
+            .descriptors
+            .write()
+            .expect("single-node router poisoned")
+            .remove(range_id))
+    }
+
+    async fn list(&self) -> anyhow::Result<Vec<ReplicatedRangeDescriptor>> {
+        Ok(self
+            .descriptors
+            .read()
+            .expect("single-node router poisoned")
+            .values()
+            .cloned()
+            .collect())
+    }
+
+    async fn by_id(
+        &self,
+        range_id: &str,
+    ) -> anyhow::Result<Option<greenmqtt_kv_client::RangeRoute>> {
+        Ok(self
+            .descriptors
+            .read()
+            .expect("single-node router poisoned")
+            .get(range_id)
+            .cloned()
+            .map(greenmqtt_kv_client::RangeRoute::from_descriptor))
+    }
+
+    async fn route_key(
+        &self,
+        shard: &ServiceShardKey,
+        key: &[u8],
+    ) -> anyhow::Result<Option<greenmqtt_kv_client::RangeRoute>> {
+        Ok(self
+            .descriptors
+            .read()
+            .expect("single-node router poisoned")
+            .values()
+            .find(|descriptor| descriptor.shard.kind == shard.kind && descriptor.contains_key(key))
+            .cloned()
+            .map(greenmqtt_kv_client::RangeRoute::from_descriptor))
+    }
+
+    async fn route_shard(
+        &self,
+        shard: &ServiceShardKey,
+    ) -> anyhow::Result<Vec<greenmqtt_kv_client::RangeRoute>> {
+        Ok(self
+            .descriptors
+            .read()
+            .expect("single-node router poisoned")
+            .values()
+            .filter(|descriptor| descriptor.shard.kind == shard.kind)
+            .cloned()
+            .map(greenmqtt_kv_client::RangeRoute::from_descriptor)
+            .collect())
+    }
+}
+
+fn range_engine_root(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("range-engine")
+}
+
+fn legacy_rocksdb_store_dirs(data_dir: &std::path::Path) -> [PathBuf; 6] {
+    [
+        data_dir.join("sessions"),
+        data_dir.join("routes"),
+        data_dir.join("subscriptions"),
+        data_dir.join("inbox"),
+        data_dir.join("inflight"),
+        data_dir.join("retain"),
+    ]
+}
+
+fn single_node_range_descriptors(node_id: u64) -> Vec<ReplicatedRangeDescriptor> {
+    [
+        (
+            "__sessiondict",
+            ServiceShardKey {
+                kind: ServiceShardKind::SessionDict,
+                tenant_id: "*".into(),
+                scope: "*".into(),
+            },
+        ),
+        (
+            "__dist",
+            ServiceShardKey {
+                kind: ServiceShardKind::Dist,
+                tenant_id: "*".into(),
+                scope: "*".into(),
+            },
+        ),
+        (
+            "__retain",
+            ServiceShardKey {
+                kind: ServiceShardKind::Retain,
+                tenant_id: "*".into(),
+                scope: "*".into(),
+            },
+        ),
+        (
+            "__inbox",
+            ServiceShardKey {
+                kind: ServiceShardKind::Inbox,
+                tenant_id: "*".into(),
+                scope: "*".into(),
+            },
+        ),
+        (
+            "__inflight",
+            ServiceShardKey {
+                kind: ServiceShardKind::Inflight,
+                tenant_id: "*".into(),
+                scope: "*".into(),
+            },
+        ),
+    ]
+    .into_iter()
+    .map(|(range_id, shard)| {
+        ReplicatedRangeDescriptor::new(
+            range_id,
+            shard,
+            RangeBoundary::full(),
+            1,
+            1,
+            Some(node_id),
+            vec![RangeReplica::new(
+                node_id,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        )
+    })
+    .collect()
+}
+
+async fn range_scoped_rocksdb_services(
+    data_dir: PathBuf,
+    node_id: u64,
+) -> anyhow::Result<(
+    Arc<dyn SessionDirectory>,
+    Arc<dyn DistRouter>,
+    Arc<dyn InboxService>,
+    Arc<dyn RetainService>,
+)> {
+    let root = range_engine_root(&data_dir);
+    let has_legacy_layout = legacy_rocksdb_store_dirs(&data_dir)
+        .into_iter()
+        .any(|path| path.exists());
+    anyhow::ensure!(
+        root.exists() || !has_legacy_layout,
+        "legacy RocksDB store layout detected in {}; migrate to range-engine layout before using GREENMQTT_STORAGE_BACKEND=rocksdb",
+        data_dir.display()
+    );
+
+    let engine = Arc::new(RocksDbKvEngine::open(&root)?);
+    let descriptors = single_node_range_descriptors(node_id);
+    for descriptor in &descriptors {
+        engine
+            .bootstrap(KvRangeBootstrap {
+                range_id: descriptor.id.clone(),
+                boundary: descriptor.boundary.clone(),
+            })
+            .await?;
+    }
+    let router: Arc<dyn KvRangeRouter> = Arc::new(SingleNodeServiceRangeRouter::new(descriptors));
+    let executor: Arc<dyn KvRangeExecutor> = Arc::new(LocalKvRangeExecutor { engine });
+    Ok((
+        Arc::new(ReplicatedSessionDictHandle::new(
+            router.clone(),
+            executor.clone(),
+        )),
+        Arc::new(ReplicatedDistHandle::new(router.clone(), executor.clone())),
+        Arc::new(ReplicatedInboxHandle::new(router.clone(), executor.clone())),
+        Arc::new(ReplicatedRetainHandle::new(router, executor)),
+    ))
+}
+
 async fn durable_services(
     data_dir: PathBuf,
     backend: &str,
+    node_id: u64,
 ) -> anyhow::Result<(
     Arc<dyn SessionDirectory>,
     Arc<dyn DistRouter>,
@@ -2627,27 +2924,7 @@ async fn durable_services(
                 Arc::new(PersistentRetainHandle::open(retain_store)),
             ))
         }
-        "rocksdb" => {
-            let session_store = Arc::new(RocksSessionStore::open(data_dir.join("sessions"))?);
-            let route_store = Arc::new(RocksRouteStore::open(data_dir.join("routes"))?);
-            let subscription_store = Arc::new(RocksSubscriptionStore::open(
-                data_dir.join("subscriptions"),
-            )?);
-            let inbox_store = Arc::new(RocksInboxStore::open(data_dir.join("inbox"))?);
-            let inflight_store = Arc::new(RocksInflightStore::open(data_dir.join("inflight"))?);
-            let retain_store = Arc::new(RocksRetainStore::open(data_dir.join("retain"))?);
-
-            Ok((
-                Arc::new(PersistentSessionDictHandle::open(session_store).await?),
-                Arc::new(PersistentDistHandle::open(route_store).await?),
-                Arc::new(PersistentInboxHandle::open(
-                    subscription_store,
-                    inbox_store,
-                    inflight_store,
-                )),
-                Arc::new(PersistentRetainHandle::open(retain_store)),
-            ))
-        }
+        "rocksdb" => range_scoped_rocksdb_services(data_dir, node_id).await,
         other => anyhow::bail!("unsupported GREENMQTT_STORAGE_BACKEND: {other}"),
     }
 }
@@ -2679,41 +2956,37 @@ async fn redis_services(
     ))
 }
 
+async fn replicated_range_clients(
+    metadata_endpoint: &str,
+    range_endpoint: &str,
+) -> anyhow::Result<(Arc<dyn KvRangeRouter>, Arc<dyn KvRangeExecutor>)> {
+    let metadata = MetadataGrpcClient::connect(metadata_endpoint.to_string()).await?;
+    let router: Arc<dyn KvRangeRouter> = Arc::new(metadata.clone());
+    let membership: Arc<dyn ClusterMembershipRegistry> = Arc::new(metadata);
+    let fallback: Arc<dyn KvRangeExecutor> =
+        Arc::new(KvRangeGrpcClient::connect(range_endpoint.to_string()).await?);
+    let executor: Arc<dyn KvRangeExecutor> = Arc::new(LeaderRoutedKvRangeExecutor::new(
+        router.clone(),
+        membership,
+        fallback,
+        Arc::new(KvRangeGrpcExecutorFactory),
+    ));
+    Ok((router, executor))
+}
+
 async fn configured_retain_service(
     default_retain: Arc<dyn RetainService>,
     state_endpoint: Option<&str>,
 ) -> anyhow::Result<Arc<dyn RetainService>> {
-    let mode = std::env::var("GREENMQTT_RETAIN_MODE")
-        .unwrap_or_else(|_| "legacy".to_string())
-        .to_lowercase();
-    match mode.as_str() {
-        "legacy" => Ok(default_retain),
-        "replicated" => {
-            let metadata_endpoint = std::env::var("GREENMQTT_METADATA_ENDPOINT")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .or_else(|| state_endpoint.map(ToString::to_string))
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "replicated retain mode requires GREENMQTT_METADATA_ENDPOINT or GREENMQTT_STATE_ENDPOINT"
-                    )
-                })?;
-            let range_endpoint = std::env::var("GREENMQTT_RANGE_ENDPOINT")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .or_else(|| state_endpoint.map(ToString::to_string))
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "replicated retain mode requires GREENMQTT_RANGE_ENDPOINT or GREENMQTT_STATE_ENDPOINT"
-                    )
-                })?;
-            let router: Arc<dyn KvRangeRouter> =
-                Arc::new(MetadataGrpcClient::connect(metadata_endpoint).await?);
-            let executor: Arc<dyn KvRangeExecutor> =
-                Arc::new(KvRangeGrpcClient::connect(range_endpoint).await?);
+    match resolved_state_mode("GREENMQTT_RETAIN_MODE")? {
+        StateMode::Legacy => Ok(default_retain),
+        StateMode::Replicated => {
+            let (metadata_endpoint, range_endpoint) =
+                resolved_replicated_endpoints(state_endpoint, "retain")?;
+            let (router, executor) =
+                replicated_range_clients(&metadata_endpoint, &range_endpoint).await?;
             Ok(Arc::new(ReplicatedRetainHandle::new(router, executor)))
         }
-        other => anyhow::bail!("unsupported GREENMQTT_RETAIN_MODE: {other}"),
     }
 }
 
@@ -2721,37 +2994,15 @@ async fn configured_dist_service(
     default_dist: Arc<dyn DistRouter>,
     state_endpoint: Option<&str>,
 ) -> anyhow::Result<Arc<dyn DistRouter>> {
-    let mode = std::env::var("GREENMQTT_DIST_MODE")
-        .unwrap_or_else(|_| "legacy".to_string())
-        .to_lowercase();
-    match mode.as_str() {
-        "legacy" => Ok(default_dist),
-        "replicated" => {
-            let metadata_endpoint = std::env::var("GREENMQTT_METADATA_ENDPOINT")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .or_else(|| state_endpoint.map(ToString::to_string))
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "replicated dist mode requires GREENMQTT_METADATA_ENDPOINT or GREENMQTT_STATE_ENDPOINT"
-                    )
-                })?;
-            let range_endpoint = std::env::var("GREENMQTT_RANGE_ENDPOINT")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .or_else(|| state_endpoint.map(ToString::to_string))
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "replicated dist mode requires GREENMQTT_RANGE_ENDPOINT or GREENMQTT_STATE_ENDPOINT"
-                    )
-                })?;
-            let router: Arc<dyn KvRangeRouter> =
-                Arc::new(MetadataGrpcClient::connect(metadata_endpoint).await?);
-            let executor: Arc<dyn KvRangeExecutor> =
-                Arc::new(KvRangeGrpcClient::connect(range_endpoint).await?);
+    match resolved_state_mode("GREENMQTT_DIST_MODE")? {
+        StateMode::Legacy => Ok(default_dist),
+        StateMode::Replicated => {
+            let (metadata_endpoint, range_endpoint) =
+                resolved_replicated_endpoints(state_endpoint, "dist")?;
+            let (router, executor) =
+                replicated_range_clients(&metadata_endpoint, &range_endpoint).await?;
             Ok(Arc::new(ReplicatedDistHandle::new(router, executor)))
         }
-        other => anyhow::bail!("unsupported GREENMQTT_DIST_MODE: {other}"),
     }
 }
 
@@ -2759,37 +3010,15 @@ async fn configured_sessiondict_service(
     default_sessiondict: Arc<dyn SessionDirectory>,
     state_endpoint: Option<&str>,
 ) -> anyhow::Result<Arc<dyn SessionDirectory>> {
-    let mode = std::env::var("GREENMQTT_SESSIONDICT_MODE")
-        .unwrap_or_else(|_| "legacy".to_string())
-        .to_lowercase();
-    match mode.as_str() {
-        "legacy" => Ok(default_sessiondict),
-        "replicated" => {
-            let metadata_endpoint = std::env::var("GREENMQTT_METADATA_ENDPOINT")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .or_else(|| state_endpoint.map(ToString::to_string))
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "replicated sessiondict mode requires GREENMQTT_METADATA_ENDPOINT or GREENMQTT_STATE_ENDPOINT"
-                    )
-                })?;
-            let range_endpoint = std::env::var("GREENMQTT_RANGE_ENDPOINT")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .or_else(|| state_endpoint.map(ToString::to_string))
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "replicated sessiondict mode requires GREENMQTT_RANGE_ENDPOINT or GREENMQTT_STATE_ENDPOINT"
-                    )
-                })?;
-            let router: Arc<dyn KvRangeRouter> =
-                Arc::new(MetadataGrpcClient::connect(metadata_endpoint).await?);
-            let executor: Arc<dyn KvRangeExecutor> =
-                Arc::new(KvRangeGrpcClient::connect(range_endpoint).await?);
+    match resolved_state_mode("GREENMQTT_SESSIONDICT_MODE")? {
+        StateMode::Legacy => Ok(default_sessiondict),
+        StateMode::Replicated => {
+            let (metadata_endpoint, range_endpoint) =
+                resolved_replicated_endpoints(state_endpoint, "sessiondict")?;
+            let (router, executor) =
+                replicated_range_clients(&metadata_endpoint, &range_endpoint).await?;
             Ok(Arc::new(ReplicatedSessionDictHandle::new(router, executor)))
         }
-        other => anyhow::bail!("unsupported GREENMQTT_SESSIONDICT_MODE: {other}"),
     }
 }
 
@@ -2797,37 +3026,15 @@ async fn configured_inbox_service(
     default_inbox: Arc<dyn InboxService>,
     state_endpoint: Option<&str>,
 ) -> anyhow::Result<Arc<dyn InboxService>> {
-    let mode = std::env::var("GREENMQTT_INBOX_MODE")
-        .unwrap_or_else(|_| "legacy".to_string())
-        .to_lowercase();
-    match mode.as_str() {
-        "legacy" => Ok(default_inbox),
-        "replicated" => {
-            let metadata_endpoint = std::env::var("GREENMQTT_METADATA_ENDPOINT")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .or_else(|| state_endpoint.map(ToString::to_string))
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "replicated inbox mode requires GREENMQTT_METADATA_ENDPOINT or GREENMQTT_STATE_ENDPOINT"
-                    )
-                })?;
-            let range_endpoint = std::env::var("GREENMQTT_RANGE_ENDPOINT")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .or_else(|| state_endpoint.map(ToString::to_string))
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "replicated inbox mode requires GREENMQTT_RANGE_ENDPOINT or GREENMQTT_STATE_ENDPOINT"
-                    )
-                })?;
-            let router: Arc<dyn KvRangeRouter> =
-                Arc::new(MetadataGrpcClient::connect(metadata_endpoint).await?);
-            let executor: Arc<dyn KvRangeExecutor> =
-                Arc::new(KvRangeGrpcClient::connect(range_endpoint).await?);
+    match resolved_state_mode("GREENMQTT_INBOX_MODE")? {
+        StateMode::Legacy => Ok(default_inbox),
+        StateMode::Replicated => {
+            let (metadata_endpoint, range_endpoint) =
+                resolved_replicated_endpoints(state_endpoint, "inbox")?;
+            let (router, executor) =
+                replicated_range_clients(&metadata_endpoint, &range_endpoint).await?;
             Ok(Arc::new(ReplicatedInboxHandle::new(router, executor)))
         }
-        other => anyhow::bail!("unsupported GREENMQTT_INBOX_MODE: {other}"),
     }
 }
 
@@ -2837,6 +3044,60 @@ fn compare_data_dir(backend: &str) -> PathBuf {
         .expect("clock went backwards")
         .as_nanos();
     std::env::temp_dir().join(format!("greenmqtt-compare-{backend}-{timestamp}"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StateMode {
+    Legacy,
+    Replicated,
+}
+
+fn parse_state_mode(value: &str) -> anyhow::Result<StateMode> {
+    match value {
+        "legacy" => Ok(StateMode::Legacy),
+        "replicated" => Ok(StateMode::Replicated),
+        other => anyhow::bail!("unsupported state mode: {other}"),
+    }
+}
+
+fn resolved_state_mode(service_env_var: &str) -> anyhow::Result<StateMode> {
+    if let Some(value) = std::env::var(service_env_var)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return parse_state_mode(&value.to_lowercase())
+            .map_err(|_| anyhow::anyhow!("unsupported {service_env_var}: {value}"));
+    }
+    let global = std::env::var("GREENMQTT_STATE_MODE")
+        .unwrap_or_else(|_| "legacy".to_string())
+        .to_lowercase();
+    parse_state_mode(&global)
+        .map_err(|_| anyhow::anyhow!("unsupported GREENMQTT_STATE_MODE: {global}"))
+}
+
+fn resolved_replicated_endpoints(
+    state_endpoint: Option<&str>,
+    service_name: &str,
+) -> anyhow::Result<(String, String)> {
+    let metadata_endpoint = std::env::var("GREENMQTT_METADATA_ENDPOINT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| state_endpoint.map(ToString::to_string))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "replicated {service_name} mode requires GREENMQTT_METADATA_ENDPOINT or GREENMQTT_STATE_ENDPOINT"
+            )
+        })?;
+    let range_endpoint = std::env::var("GREENMQTT_RANGE_ENDPOINT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| state_endpoint.map(ToString::to_string))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "replicated {service_name} mode requires GREENMQTT_RANGE_ENDPOINT or GREENMQTT_STATE_ENDPOINT"
+            )
+        })?;
+    Ok((metadata_endpoint, range_endpoint))
 }
 
 async fn compare_bench_broker(
@@ -2860,7 +3121,7 @@ async fn compare_bench_broker(
         "sled" | "rocksdb" => {
             let path = compare_data_dir(backend);
             let (sessiondict, dist, inbox, retain) =
-                durable_services(path.clone(), backend).await?;
+                durable_services(path.clone(), backend, node_id).await?;
             (sessiondict, dist, inbox, retain, Some(path))
         }
         "redis" => {

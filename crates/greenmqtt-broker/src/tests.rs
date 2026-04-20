@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use greenmqtt_core::{
     ClientIdentity, ConnectRequest, Delivery, InflightMessage, InflightPhase, NodeId,
     OfflineMessage, PublishProperties, PublishRequest, RetainedMessage, RouteRecord, SessionKind,
-    SessionRecord, TopicName,
+    SessionRecord, TenantQuota, TopicName,
 };
 use greenmqtt_dist::{DistHandle, DistRouter};
 use greenmqtt_inbox::{InboxHandle, InboxService, PersistentInboxHandle};
@@ -4024,6 +4024,188 @@ async fn local_stats_track_publish_drain_requeue_and_disconnect() {
 }
 
 #[tokio::test]
+async fn local_hot_state_breakdown_excludes_durable_service_records() {
+    let broker = test_broker();
+    broker
+        .sessiondict
+        .register(SessionRecord {
+            session_id: "remote-session".into(),
+            node_id: 9,
+            kind: SessionKind::Persistent,
+            identity: ClientIdentity {
+                tenant_id: "tenant-a".into(),
+                user_id: "user-remote".into(),
+                client_id: "remote".into(),
+            },
+            session_expiry_interval_secs: Some(60),
+            expires_at_ms: Some(1234),
+        })
+        .await
+        .unwrap();
+    broker
+        .dist
+        .add_route(RouteRecord {
+            tenant_id: "tenant-a".into(),
+            topic_filter: "devices/+/state".into(),
+            session_id: "remote-session".into(),
+            node_id: 9,
+            subscription_identifier: None,
+            no_local: false,
+            retain_as_published: false,
+            shared_group: None,
+            kind: SessionKind::Persistent,
+        })
+        .await
+        .unwrap();
+    broker
+        .inbox
+        .subscribe(greenmqtt_core::Subscription {
+            session_id: "remote-session".into(),
+            tenant_id: "tenant-a".into(),
+            topic_filter: "devices/+/state".into(),
+            qos: 1,
+            subscription_identifier: None,
+            no_local: false,
+            retain_as_published: false,
+            retain_handling: 0,
+            shared_group: None,
+            kind: SessionKind::Persistent,
+        })
+        .await
+        .unwrap();
+    broker
+        .inbox
+        .enqueue(OfflineMessage {
+            tenant_id: "tenant-a".into(),
+            session_id: "remote-session".into(),
+            topic: "devices/a/state".into(),
+            payload: b"offline".to_vec().into(),
+            qos: 1,
+            retain: false,
+            from_session_id: "publisher".into(),
+            properties: PublishProperties::default(),
+        })
+        .await
+        .unwrap();
+    broker
+        .retain
+        .retain(RetainedMessage {
+            tenant_id: "tenant-a".into(),
+            topic: "devices/a/state".into(),
+            payload: b"retained".to_vec().into(),
+            qos: 1,
+        })
+        .await
+        .unwrap();
+
+    let breakdown = broker.local_hot_state_breakdown();
+    assert_eq!(breakdown.live_connections, 0);
+    assert_eq!(breakdown.transient_send_queue_entries, 0);
+    assert_eq!(breakdown.short_lived_tracking_entries, 0);
+    assert_eq!(broker.local_hot_state_entries(), 0);
+
+    let stats = broker.stats().await.unwrap();
+    assert_eq!(stats.global_session_records, 1);
+    assert_eq!(stats.route_records, 1);
+    assert_eq!(stats.subscription_records, 1);
+    assert_eq!(stats.offline_messages, 1);
+    assert_eq!(stats.retained_messages, 1);
+}
+
+#[tokio::test]
+async fn local_hot_state_breakdown_tracks_connections_queues_and_short_lived_markers() {
+    let mut broker = test_broker();
+    broker.set_connect_debounce_window(Duration::from_secs(30));
+    broker.set_tenant_quota(
+        "tenant-a",
+        TenantQuota {
+            max_connections: 10,
+            max_subscriptions: 10,
+            max_msg_per_sec: 10,
+            max_memory_bytes: 1024,
+        },
+    );
+    let broker = Arc::new(broker);
+
+    let subscriber = broker
+        .connect(ConnectRequest {
+            identity: ClientIdentity {
+                tenant_id: "tenant-a".into(),
+                user_id: "user-a".into(),
+                client_id: "sub".into(),
+            },
+            node_id: 1,
+            kind: SessionKind::Persistent,
+            clean_start: true,
+            session_expiry_interval_secs: None,
+        })
+        .await
+        .unwrap();
+    let publisher = broker
+        .connect(ConnectRequest {
+            identity: ClientIdentity {
+                tenant_id: "tenant-a".into(),
+                user_id: "user-b".into(),
+                client_id: "pub".into(),
+            },
+            node_id: 1,
+            kind: SessionKind::Transient,
+            clean_start: true,
+            session_expiry_interval_secs: None,
+        })
+        .await
+        .unwrap();
+    broker
+        .subscribe(
+            &subscriber.session.session_id,
+            "devices/+/state",
+            1,
+            None,
+            false,
+            false,
+            0,
+            None,
+        )
+        .await
+        .unwrap();
+    broker
+        .publish(
+            &publisher.session.session_id,
+            PublishRequest {
+                topic: "devices/d1/state".into(),
+                payload: b"up".to_vec().into(),
+                qos: 1,
+                retain: false,
+                properties: PublishProperties::default(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!broker.connect_debounce_exceeded(&publisher.session.identity));
+    assert!(broker.connect_debounce_exceeded(&publisher.session.identity));
+    broker
+        .schedule_delayed_will(
+            &subscriber.session.session_id,
+            PublishRequest {
+                topic: "devices/d1/state".into(),
+                payload: b"later".to_vec().into(),
+                qos: 1,
+                retain: false,
+                properties: PublishProperties::default(),
+            },
+            30,
+        )
+        .await
+        .unwrap();
+
+    let breakdown = broker.local_hot_state_breakdown();
+    assert_eq!(breakdown.live_connections, 2);
+    assert_eq!(breakdown.transient_send_queue_entries, 1);
+    assert_eq!(breakdown.short_lived_tracking_entries, 2);
+    assert_eq!(broker.local_hot_state_entries(), 5);
+}
+
+#[tokio::test]
 async fn repair_orphan_session_state_cleans_inbox_routes_and_local_buffers() {
     let broker = test_broker();
     let ghost = "ghost-session".to_string();
@@ -4319,6 +4501,12 @@ async fn connect_debounce_allows_after_window_elapses() {
     assert!(!broker.connect_debounce_exceeded(&identity));
     sleep(Duration::from_millis(5)).await;
     assert!(!broker.connect_debounce_exceeded(&identity));
+    assert_eq!(
+        broker
+            .local_hot_state_breakdown()
+            .short_lived_tracking_entries,
+        1
+    );
 }
 
 #[tokio::test]

@@ -1,13 +1,13 @@
 use super::{
     inbox_session_shard, inbox_tenant_scan_shard, inflight_session_shard,
     inflight_tenant_scan_shard, subscription_shard, InboxHandle, InboxService,
-    PersistentInboxHandle, ReplicatedInboxHandle,
+    PersistentInboxHandle, ReplicatedInboxHandle, OFFLINE_KEY_PREFIX,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
 use greenmqtt_core::{
-    InflightMessage, InflightPhase, OfflineMessage, PublishProperties, RangeBoundary,
-    RangeReplica, ReplicaRole, ReplicaSyncState, ReplicatedRangeDescriptor, ServiceShardKey,
+    InflightMessage, InflightPhase, OfflineMessage, PublishProperties, RangeBoundary, RangeReplica,
+    ReplicaRole, ReplicaSyncState, ReplicatedRangeDescriptor, ServiceShardKey,
     ServiceShardLifecycle, SessionKind, Subscription,
 };
 use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter, MemoryKvRangeRouter};
@@ -40,7 +40,8 @@ impl KvRangeExecutor for LocalKvRangeExecutor {
         limit: usize,
     ) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
         let range = self.engine.open_range(range_id).await?;
-        range.reader()
+        range
+            .reader()
             .scan(&boundary.unwrap_or_else(RangeBoundary::full), limit)
             .await
     }
@@ -2079,7 +2080,10 @@ async fn replicated_inbox_handles_subscriptions_offline_and_inflight_over_kv_ran
         kind: SessionKind::Persistent,
     };
     inbox.subscribe(subscription.clone()).await.unwrap();
-    assert_eq!(inbox.list_subscriptions(&"s1".into()).await.unwrap(), vec![subscription]);
+    assert_eq!(
+        inbox.list_subscriptions(&"s1".into()).await.unwrap(),
+        vec![subscription]
+    );
 
     inbox
         .enqueue(OfflineMessage {
@@ -2116,4 +2120,148 @@ async fn replicated_inbox_handles_subscriptions_offline_and_inflight_over_kv_ran
     assert_eq!(inbox.fetch_inflight(&"s1".into()).await.unwrap().len(), 1);
     inbox.ack_inflight(&"s1".into(), 42).await.unwrap();
     assert!(inbox.fetch_inflight(&"s1".into()).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn replicated_inbox_resumes_offline_sequence_after_restart() {
+    let engine = MemoryKvEngine::default();
+    engine
+        .bootstrap(KvRangeBootstrap {
+            range_id: "inbox-range-t1".into(),
+            boundary: RangeBoundary::full(),
+        })
+        .await
+        .unwrap();
+    let router = Arc::new(MemoryKvRangeRouter::default());
+    router
+        .upsert(ReplicatedRangeDescriptor::new(
+            "inbox-range-t1",
+            inbox_tenant_scan_shard("t1"),
+            RangeBoundary::full(),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ))
+        .await
+        .unwrap();
+
+    let executor = Arc::new(LocalKvRangeExecutor {
+        engine: engine.clone(),
+    });
+    let inbox = ReplicatedInboxHandle::new(router.clone(), executor.clone());
+    inbox
+        .enqueue(OfflineMessage {
+            tenant_id: "t1".into(),
+            session_id: "s1".into(),
+            topic: "devices/a/state".into(),
+            payload: b"first".to_vec().into(),
+            qos: 1,
+            retain: false,
+            from_session_id: "src".into(),
+            properties: PublishProperties::default(),
+        })
+        .await
+        .unwrap();
+    drop(inbox);
+
+    let reopened = ReplicatedInboxHandle::new(router, executor);
+    reopened
+        .enqueue(OfflineMessage {
+            tenant_id: "t1".into(),
+            session_id: "s1".into(),
+            topic: "devices/b/state".into(),
+            payload: b"second".to_vec().into(),
+            qos: 1,
+            retain: false,
+            from_session_id: "src".into(),
+            properties: PublishProperties::default(),
+        })
+        .await
+        .unwrap();
+
+    let messages = reopened.peek(&"s1".into()).await.unwrap();
+    assert_eq!(messages.len(), 2);
+    assert!(messages.iter().any(|message| message.payload.as_ref() == b"first"));
+    assert!(messages.iter().any(|message| message.payload.as_ref() == b"second"));
+}
+
+#[tokio::test]
+async fn replicated_inbox_replaying_same_offline_mutation_is_idempotent() {
+    let engine = MemoryKvEngine::default();
+    engine
+        .bootstrap(KvRangeBootstrap {
+            range_id: "inbox-range-replay".into(),
+            boundary: RangeBoundary::full(),
+        })
+        .await
+        .unwrap();
+    let router = Arc::new(MemoryKvRangeRouter::default());
+    router
+        .upsert(ReplicatedRangeDescriptor::new(
+            "inbox-range-replay",
+            inbox_tenant_scan_shard("t1"),
+            RangeBoundary::full(),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ))
+        .await
+        .unwrap();
+
+    let executor = Arc::new(LocalKvRangeExecutor {
+        engine: engine.clone(),
+    });
+    let inbox = ReplicatedInboxHandle::new(router, executor.clone());
+    inbox
+        .enqueue(OfflineMessage {
+            tenant_id: "t1".into(),
+            session_id: "s1".into(),
+            topic: "devices/a/state".into(),
+            payload: b"first".to_vec().into(),
+            qos: 1,
+            retain: false,
+            from_session_id: "src".into(),
+            properties: PublishProperties::default(),
+        })
+        .await
+        .unwrap();
+
+    let entries = executor
+        .scan("inbox-range-replay", None, usize::MAX)
+        .await
+        .unwrap();
+    let (key, value) = entries
+        .into_iter()
+        .find(|(key, _)| key.starts_with(OFFLINE_KEY_PREFIX))
+        .unwrap();
+    executor
+        .apply(
+            "inbox-range-replay",
+            vec![KvMutation {
+                key,
+                value: Some(value),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let messages = inbox.peek(&"s1".into()).await.unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].payload.as_ref(), b"first");
 }

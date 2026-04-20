@@ -1,12 +1,11 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use greenmqtt_core::{RangeBoundary, RangeId};
-use rocksdb::{
-    checkpoint::Checkpoint, Direction, IteratorMode, Options, WriteBatch, DB,
-};
+use rocksdb::{checkpoint::Checkpoint, Direction, IteratorMode, Options, WriteBatch, DB};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -35,6 +34,10 @@ pub struct KvRangeCheckpoint {
 pub struct KvRangeSnapshot {
     pub range_id: RangeId,
     pub boundary: RangeBoundary,
+    pub term: u64,
+    pub index: u64,
+    pub checksum: u64,
+    pub layout_version: u32,
     pub data_path: String,
 }
 
@@ -79,12 +82,27 @@ pub trait KvEngine: Send + Sync {
     async fn open_range(&self, range_id: &str) -> anyhow::Result<Box<dyn KvRangeSpace>>;
     async fn destroy_range(&self, range_id: &str) -> anyhow::Result<()>;
     async fn list_ranges(&self) -> anyhow::Result<Vec<RangeId>>;
+    async fn restore_snapshot(
+        &self,
+        bootstrap: KvRangeBootstrap,
+        snapshot: &KvRangeSnapshot,
+    ) -> anyhow::Result<()>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct PersistedRangeMeta {
     range_id: RangeId,
     boundary: RangeBoundary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SnapshotManifest {
+    range_id: RangeId,
+    term: u64,
+    index: u64,
+    boundary: RangeBoundary,
+    checksum: u64,
+    layout_version: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -172,7 +190,37 @@ fn write_range_meta(
 }
 
 fn read_range_meta(root: &Path, range_id: &str) -> anyhow::Result<PersistedRangeMeta> {
-    Ok(bincode::deserialize(&fs::read(range_meta_path(root, range_id))?)?)
+    Ok(bincode::deserialize(&fs::read(range_meta_path(
+        root, range_id,
+    ))?)?)
+}
+
+fn copy_dir_recursive(source: &Path, target: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(target)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&source_path, &target_path)?;
+        } else {
+            fs::copy(source_path, target_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn snapshot_manifest_path(snapshot_dir: &Path) -> PathBuf {
+    snapshot_dir.join("manifest.bin")
+}
+
+fn kv_checksum(entries: &[(Bytes, Bytes)]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for (key, value) in entries {
+        key.hash(&mut hasher);
+        value.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 fn decode_wal_offset(value: &[u8]) -> anyhow::Result<u64> {
@@ -277,6 +325,7 @@ struct MemoryKvRangeIo {
     boundary: RangeBoundary,
     data: Arc<RwLock<BTreeMap<Vec<u8>, Bytes>>>,
     checkpoints: Arc<RwLock<HashMap<String, BTreeMap<Vec<u8>, Bytes>>>>,
+    snapshots: Arc<RwLock<HashMap<String, BTreeMap<Vec<u8>, Bytes>>>>,
 }
 
 impl MemoryKvRangeSpace {
@@ -288,6 +337,7 @@ impl MemoryKvRangeSpace {
                 boundary,
                 data: Arc::new(RwLock::new(BTreeMap::new())),
                 checkpoints: Arc::new(RwLock::new(HashMap::new())),
+                snapshots: Arc::new(RwLock::new(HashMap::new())),
             },
         }
     }
@@ -296,7 +346,12 @@ impl MemoryKvRangeSpace {
 #[async_trait]
 impl KvRangeReader for MemoryKvRangeIo {
     async fn get(&self, key: &[u8]) -> anyhow::Result<Option<Bytes>> {
-        Ok(self.data.read().expect("range data poisoned").get(key).cloned())
+        Ok(self
+            .data
+            .read()
+            .expect("range data poisoned")
+            .get(key)
+            .cloned())
     }
 
     async fn scan(
@@ -321,7 +376,10 @@ impl KvRangeWriter for MemoryKvRangeIo {
     async fn apply(&self, mutations: Vec<KvMutation>) -> anyhow::Result<()> {
         let mut data = self.data.write().expect("range data poisoned");
         for mutation in mutations {
-            anyhow::ensure!(self.boundary.contains(&mutation.key), "mutation outside range boundary");
+            anyhow::ensure!(
+                self.boundary.contains(&mutation.key),
+                "mutation outside range boundary"
+            );
             match mutation.value {
                 Some(value) => {
                     data.insert(mutation.key.to_vec(), value);
@@ -372,10 +430,35 @@ impl KvRangeSpace for MemoryKvRangeSpace {
     }
 
     async fn snapshot(&self) -> anyhow::Result<KvRangeSnapshot> {
+        let snapshot_id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock drift before unix epoch")
+            .as_nanos();
+        let snapshot_key = format!("snapshot-{snapshot_id}");
+        let snapshot = self.io.data.read().expect("range data poisoned").clone();
+        self.io
+            .snapshots
+            .write()
+            .expect("range snapshots poisoned")
+            .insert(snapshot_key.clone(), snapshot);
+        let checksum = kv_checksum(
+            &self
+                .io
+                .data
+                .read()
+                .expect("range data poisoned")
+                .iter()
+                .map(|(key, value)| (Bytes::copy_from_slice(key), value.clone()))
+                .collect::<Vec<_>>(),
+        );
         Ok(KvRangeSnapshot {
             range_id: self.range_id.clone(),
             boundary: self.boundary.clone(),
-            data_path: format!("memory://{}/snapshot", self.range_id),
+            term: 0,
+            index: 0,
+            checksum,
+            layout_version: 1,
+            data_path: format!("memory://{}/snapshots/{}", self.range_id, snapshot_key),
         })
     }
 
@@ -385,6 +468,11 @@ impl KvRangeSpace for MemoryKvRangeSpace {
             .checkpoints
             .write()
             .expect("range checkpoints poisoned")
+            .clear();
+        self.io
+            .snapshots
+            .write()
+            .expect("range snapshots poisoned")
             .clear();
         Ok(())
     }
@@ -427,6 +515,45 @@ impl KvEngine for MemoryKvEngine {
             .cloned()
             .collect())
     }
+
+    async fn restore_snapshot(
+        &self,
+        bootstrap: KvRangeBootstrap,
+        snapshot: &KvRangeSnapshot,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            snapshot.data_path.starts_with("memory://"),
+            "memory engine can only restore memory snapshots"
+        );
+        let snapshot_id = snapshot
+            .data_path
+            .rsplit('/')
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("invalid memory snapshot path"))?;
+        let source = self
+            .ranges
+            .read()
+            .expect("engine ranges poisoned")
+            .get(&snapshot.range_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("source range `{}` not found", snapshot.range_id))?;
+        let restored = source
+            .io
+            .snapshots
+            .read()
+            .expect("range snapshots poisoned")
+            .get(snapshot_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("memory snapshot `{snapshot_id}` not found"))?;
+        let range_id = bootstrap.range_id.clone();
+        let range = MemoryKvRangeSpace::new(bootstrap.range_id, bootstrap.boundary);
+        *range.io.data.write().expect("range data poisoned") = restored;
+        self.ranges
+            .write()
+            .expect("engine ranges poisoned")
+            .insert(range_id, range);
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -446,7 +573,10 @@ impl KvRangeReader for RocksDbKvRangeSpace {
             .as_deref()
             .or(self.boundary.start_key.as_deref())
             .unwrap_or_default();
-        let upper_bound = boundary.end_key.as_deref().or(self.boundary.end_key.as_deref());
+        let upper_bound = boundary
+            .end_key
+            .as_deref()
+            .or(self.boundary.end_key.as_deref());
         let mut entries = Vec::new();
         for item in self
             .db
@@ -489,10 +619,8 @@ impl KvRangeWriter for RocksDbKvRangeSpace {
     async fn compact(&self, boundary: Option<RangeBoundary>) -> anyhow::Result<()> {
         match boundary {
             Some(boundary) => {
-                self.db.compact_range(
-                    boundary.start_key.as_deref(),
-                    boundary.end_key.as_deref(),
-                );
+                self.db
+                    .compact_range(boundary.start_key.as_deref(), boundary.end_key.as_deref());
             }
             None => {
                 self.db.compact_range(
@@ -548,9 +676,30 @@ impl KvRangeSpace for RocksDbKvRangeSpace {
             .join(format!("snapshot-{snapshot_id}"));
         fs::create_dir_all(snapshot_dir.parent().expect("snapshot has parent"))?;
         Checkpoint::new(&self.db)?.create_checkpoint(&snapshot_dir)?;
+        let entries = self
+            .reader()
+            .scan(&RangeBoundary::full(), usize::MAX)
+            .await?;
+        let checksum = kv_checksum(&entries);
+        let manifest = SnapshotManifest {
+            range_id: self.range_id.clone(),
+            term: 0,
+            index: 0,
+            boundary: self.boundary.clone(),
+            checksum,
+            layout_version: 1,
+        };
+        fs::write(
+            snapshot_manifest_path(&snapshot_dir),
+            bincode::serialize(&manifest)?,
+        )?;
         Ok(KvRangeSnapshot {
             range_id: self.range_id.clone(),
             boundary: self.boundary.clone(),
+            term: 0,
+            index: 0,
+            checksum,
+            layout_version: 1,
             data_path: snapshot_dir.display().to_string(),
         })
     }
@@ -679,13 +828,41 @@ impl KvEngine for RocksDbKvEngine {
         range_ids.sort();
         Ok(range_ids)
     }
+
+    async fn restore_snapshot(
+        &self,
+        bootstrap: KvRangeBootstrap,
+        snapshot: &KvRangeSnapshot,
+    ) -> anyhow::Result<()> {
+        let target_root = range_root(&self.root, &bootstrap.range_id);
+        if target_root.exists() {
+            fs::remove_dir_all(&target_root)?;
+        }
+        let data_dir = range_data_dir(&self.root, &bootstrap.range_id);
+        fs::create_dir_all(data_dir.parent().expect("range data has parent"))?;
+        copy_dir_recursive(Path::new(&snapshot.data_path), &data_dir)?;
+        anyhow::ensure!(
+            snapshot_manifest_path(Path::new(&snapshot.data_path)).exists(),
+            "snapshot manifest missing for {}",
+            snapshot.range_id
+        );
+        fs::create_dir_all(range_checkpoint_root(&self.root, &bootstrap.range_id))?;
+        fs::create_dir_all(range_snapshot_root(&self.root, &bootstrap.range_id))?;
+        fs::create_dir_all(wal_db_dir(&self.root, &bootstrap.range_id))?;
+        write_range_meta(&self.root, &bootstrap)?;
+        let wal = self.open_wal(&bootstrap.range_id)?;
+        if wal.db.get(WAL_NEXT_OFFSET_KEY)?.is_none() {
+            wal.db.put(WAL_NEXT_OFFSET_KEY, encode_wal_offset(1))?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        KvEngine, KvMutation, KvRangeBootstrap, KvWalStore, MemoryKvEngine, MemoryWalStore,
-        RocksDbKvEngine,
+        snapshot_manifest_path, KvEngine, KvMutation, KvRangeBootstrap, KvWalStore, MemoryKvEngine,
+        MemoryWalStore, RocksDbKvEngine,
     };
     use greenmqtt_core::RangeBoundary;
 
@@ -727,7 +904,8 @@ mod tests {
             .await
             .unwrap();
         let range = engine.open_range("range-a").await.unwrap();
-        range.writer()
+        range
+            .writer()
             .apply(vec![KvMutation {
                 key: Bytes::from_static(b"m"),
                 value: Some(Bytes::from_static(b"value")),
@@ -738,7 +916,48 @@ mod tests {
             range.reader().get(b"m").await.unwrap(),
             Some(Bytes::from_static(b"value"))
         );
-        assert_eq!(engine.list_ranges().await.unwrap(), vec!["range-a".to_string()]);
+        assert_eq!(
+            engine.list_ranges().await.unwrap(),
+            vec!["range-a".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_kv_engine_restores_range_from_snapshot() {
+        let engine = MemoryKvEngine::default();
+        engine
+            .bootstrap(KvRangeBootstrap {
+                range_id: "range-src".into(),
+                boundary: RangeBoundary::full(),
+            })
+            .await
+            .unwrap();
+        let range = engine.open_range("range-src").await.unwrap();
+        range
+            .writer()
+            .apply(vec![KvMutation {
+                key: Bytes::from_static(b"alpha"),
+                value: Some(Bytes::from_static(b"one")),
+            }])
+            .await
+            .unwrap();
+        let snapshot = range.snapshot().await.unwrap();
+
+        engine
+            .restore_snapshot(
+                KvRangeBootstrap {
+                    range_id: "range-restored".into(),
+                    boundary: RangeBoundary::full(),
+                },
+                &snapshot,
+            )
+            .await
+            .unwrap();
+        let restored = engine.open_range("range-restored").await.unwrap();
+        assert_eq!(
+            restored.reader().get(b"alpha").await.unwrap(),
+            Some(Bytes::from_static(b"one"))
+        );
     }
 
     #[tokio::test]
@@ -765,7 +984,8 @@ mod tests {
             .await
             .unwrap();
         let range = engine.open_range("range-r").await.unwrap();
-        range.writer()
+        range
+            .writer()
             .apply(vec![
                 KvMutation {
                     key: Bytes::from_static(b"mango"),
@@ -783,7 +1003,8 @@ mod tests {
             Some(Bytes::from_static(b"yellow"))
         );
         assert_eq!(
-            range.reader()
+            range
+                .reader()
                 .scan(
                     &RangeBoundary::new(Some(b"m".to_vec()), Some(b"z".to_vec())),
                     10
@@ -798,7 +1019,53 @@ mod tests {
         assert!(std::path::Path::new(&checkpoint.path).exists());
         let snapshot = range.snapshot().await.unwrap();
         assert!(std::path::Path::new(&snapshot.data_path).exists());
-        assert_eq!(engine.list_ranges().await.unwrap(), vec!["range-r".to_string()]);
+        assert!(snapshot_manifest_path(std::path::Path::new(&snapshot.data_path)).exists());
+        assert_eq!(snapshot.layout_version, 1);
+        assert!(snapshot.checksum > 0);
+        assert_eq!(
+            engine.list_ranges().await.unwrap(),
+            vec!["range-r".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn rocksdb_kv_engine_restores_range_from_snapshot() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let engine = RocksDbKvEngine::open(tempdir.path()).unwrap();
+        engine
+            .bootstrap(KvRangeBootstrap {
+                range_id: "range-src".into(),
+                boundary: RangeBoundary::full(),
+            })
+            .await
+            .unwrap();
+        let source = engine.open_range("range-src").await.unwrap();
+        source
+            .writer()
+            .apply(vec![KvMutation {
+                key: Bytes::from_static(b"beta"),
+                value: Some(Bytes::from_static(b"two")),
+            }])
+            .await
+            .unwrap();
+        let snapshot = source.snapshot().await.unwrap();
+        drop(source);
+
+        engine
+            .restore_snapshot(
+                KvRangeBootstrap {
+                    range_id: "range-restored".into(),
+                    boundary: RangeBoundary::full(),
+                },
+                &snapshot,
+            )
+            .await
+            .unwrap();
+        let restored = engine.open_range("range-restored").await.unwrap();
+        assert_eq!(
+            restored.reader().get(b"beta").await.unwrap(),
+            Some(Bytes::from_static(b"two"))
+        );
     }
 
     #[tokio::test]

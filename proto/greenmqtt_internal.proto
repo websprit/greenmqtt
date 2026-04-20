@@ -388,6 +388,31 @@ message NamedBalancerStateRecord {
   BalancerStateRecord state = 2;
 }
 
+message ServiceEndpointRecord {
+  string kind = 1;
+  uint64 node_id = 2;
+  string endpoint = 3;
+}
+
+message ClusterNodeMembershipRecord {
+  uint64 node_id = 1;
+  uint64 epoch = 2;
+  string lifecycle = 3;
+  repeated ServiceEndpointRecord endpoints = 4;
+}
+
+message MemberLookupRequest {
+  uint64 node_id = 1;
+}
+
+message MemberRecordReply {
+  ClusterNodeMembershipRecord member = 1;
+}
+
+message MemberListReply {
+  repeated ClusterNodeMembershipRecord members = 1;
+}
+
 message BalancerStateUpsertRequest {
   string name = 1;
   BalancerStateRecord state = 2;
@@ -463,7 +488,75 @@ message KvRangeSnapshotRequest {
 message KvRangeSnapshotReply {
   string range_id = 1;
   RangeBoundaryRecord boundary = 2;
-  string data_path = 3;
+  uint64 term = 3;
+  uint64 index = 4;
+  uint64 checksum = 5;
+  uint32 layout_version = 6;
+  string data_path = 7;
+}
+
+message RaftLogEntryRecord {
+  uint64 term = 1;
+  uint64 index = 2;
+  bytes command = 3;
+}
+
+message RaftSnapshotRecord {
+  string range_id = 1;
+  uint64 term = 2;
+  uint64 index = 3;
+  bytes payload = 4;
+}
+
+message RaftAppendEntriesRequestRecord {
+  uint64 term = 1;
+  uint64 leader_id = 2;
+  uint64 prev_log_index = 3;
+  uint64 prev_log_term = 4;
+  repeated RaftLogEntryRecord entries = 5;
+  uint64 leader_commit = 6;
+}
+
+message RaftAppendEntriesResponseRecord {
+  uint64 term = 1;
+  bool success = 2;
+  uint64 match_index = 3;
+}
+
+message RaftRequestVoteRequestRecord {
+  uint64 term = 1;
+  uint64 candidate_id = 2;
+  uint64 last_log_index = 3;
+  uint64 last_log_term = 4;
+}
+
+message RaftRequestVoteResponseRecord {
+  uint64 term = 1;
+  bool vote_granted = 2;
+}
+
+message RaftInstallSnapshotRequestRecord {
+  uint64 term = 1;
+  uint64 leader_id = 2;
+  RaftSnapshotRecord snapshot = 3;
+}
+
+message RaftInstallSnapshotResponseRecord {
+  uint64 term = 1;
+  bool accepted = 2;
+}
+
+message RaftTransportRequest {
+  string range_id = 1;
+  uint64 from_node_id = 2;
+  oneof payload {
+    RaftAppendEntriesRequestRecord append_entries = 3;
+    RaftAppendEntriesResponseRecord append_entries_response = 4;
+    RaftRequestVoteRequestRecord request_vote = 5;
+    RaftRequestVoteResponseRecord request_vote_response = 6;
+    RaftInstallSnapshotRequestRecord install_snapshot = 7;
+    RaftInstallSnapshotResponseRecord install_snapshot_response = 8;
+  }
 }
 
 service SessionDictService {
@@ -520,6 +613,11 @@ service BrokerPeerService {
 }
 
 service MetadataService {
+  rpc UpsertMember(MemberRecordReply) returns (MemberRecordReply);
+  rpc LookupMember(MemberLookupRequest) returns (MemberRecordReply);
+  rpc RemoveMember(MemberLookupRequest) returns (MemberRecordReply);
+  rpc ListMembers(.google.protobuf.Empty) returns (MemberListReply);
+
   rpc UpsertRange(RangeUpsertRequest) returns (RangeRecordReply);
   rpc LookupRange(RangeLookupRequest) returns (RangeRecordReply);
   rpc RemoveRange(RangeLookupRequest) returns (RangeRecordReply);
@@ -538,4 +636,8 @@ service KvRangeService {
   rpc Apply(KvRangeApplyRequest) returns (.google.protobuf.Empty);
   rpc Checkpoint(KvRangeCheckpointRequest) returns (KvRangeCheckpointReply);
   rpc Snapshot(KvRangeSnapshotRequest) returns (KvRangeSnapshotReply);
+}
+
+service RaftTransportService {
+  rpc Send(RaftTransportRequest) returns (.google.protobuf.Empty);
 }

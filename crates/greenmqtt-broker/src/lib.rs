@@ -52,6 +52,13 @@ pub struct BrokerStats {
     pub retained_messages: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct LocalHotStateBreakdown {
+    pub live_connections: usize,
+    pub transient_send_queue_entries: usize,
+    pub short_lived_tracking_entries: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionSummary {
     pub session_id: SessionId,
@@ -172,6 +179,17 @@ impl ShardedWillGenerations {
                     .sum::<usize>()
             })
             .sum()
+    }
+
+    fn prune_older_than(&self, minimum_value: u64) -> usize {
+        let mut removed = 0usize;
+        for shard in &self.shards {
+            let mut guard = shard.write().expect("broker poisoned");
+            let before = guard.len();
+            guard.retain(|_, value| *value >= minimum_value);
+            removed += before.saturating_sub(guard.len());
+        }
+        removed
     }
 }
 

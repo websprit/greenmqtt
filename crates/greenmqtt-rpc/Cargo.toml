@@ -16,6 +16,7 @@ greenmqtt-dist = { path = "../greenmqtt-dist" }
 greenmqtt-inbox = { path = "../greenmqtt-inbox" }
 greenmqtt-kv-client = { path = "../greenmqtt-kv-client" }
 greenmqtt-kv-engine = { path = "../greenmqtt-kv-engine" }
+greenmqtt-kv-raft = { path = "../greenmqtt-kv-raft" }
 greenmqtt-kv-server = { path = "../greenmqtt-kv-server" }
 greenmqtt-plugin-api = { path = "../greenmqtt-plugin-api" }
 greenmqtt-proto = { path = "../greenmqtt-proto" }
@@ -28,5 +29,4 @@ tokio.workspace = true
 tonic.workspace = true
 
 [dev-dependencies]
-greenmqtt-kv-raft = { path = "../greenmqtt-kv-raft" }
 tempfile = "3.27.0"

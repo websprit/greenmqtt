@@ -3,19 +3,22 @@ use bytes::Bytes;
 use greenmqtt_broker::{DeliverySink, PeerForwarder, PeerRegistry};
 use greenmqtt_core::{
     BalancerState, BalancerStateRegistry, ClientIdentity, ClusterMembershipRegistry,
-    ClusterNodeMembership, Delivery, InflightMessage, MetadataRegistry, NodeId,
-    OfflineMessage, ReplicatedRangeDescriptor, ReplicatedRangeRegistry, RetainedMessage,
-    RouteRecord, ServiceEndpoint, ServiceEndpointRegistry, ServiceKind, ServiceShardAssignment,
-    ServiceShardKey, ServiceShardKind, ServiceShardLifecycle, ServiceShardRecoveryControl,
-    ServiceShardTransition, ServiceShardTransitionKind, Subscription,
+    ClusterNodeMembership, Delivery, InflightMessage, MetadataRegistry, NodeId, OfflineMessage,
+    ReplicatedRangeDescriptor, ReplicatedRangeRegistry, RetainedMessage, RouteRecord,
+    ServiceEndpoint, ServiceEndpointRegistry, ServiceKind, ServiceShardAssignment, ServiceShardKey,
+    ServiceShardKind, ServiceShardLifecycle, ServiceShardRecoveryControl, ServiceShardTransition,
+    ServiceShardTransitionKind, Subscription,
 };
 use greenmqtt_dist::{dist_tenant_shard, DistRouter};
 use greenmqtt_inbox::{
     inbox_session_shard, inbox_tenant_scan_shard, inflight_tenant_scan_shard, InboxService,
 };
-use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter, RangeRoute};
-use greenmqtt_kv_engine::{KvEngine, KvMutation, KvRangeBootstrap, KvRangeCheckpoint, KvRangeSnapshot, RocksDbKvEngine};
-use greenmqtt_kv_server::KvRangeHost;
+use greenmqtt_kv_client::{KvRangeExecutor, KvRangeExecutorFactory, KvRangeRouter, RangeRoute};
+use greenmqtt_kv_engine::{
+    KvEngine, KvMutation, KvRangeBootstrap, KvRangeCheckpoint, KvRangeSnapshot, RocksDbKvEngine,
+};
+use greenmqtt_kv_raft::RaftMessage;
+use greenmqtt_kv_server::{KvRangeHost, ReplicaTransport};
 use greenmqtt_proto::internal::{
     broker_peer_service_client::BrokerPeerServiceClient,
     broker_peer_service_server::{BrokerPeerService, BrokerPeerServiceServer},
@@ -23,43 +26,46 @@ use greenmqtt_proto::internal::{
     dist_service_server::{DistService, DistServiceServer},
     inbox_service_client::InboxServiceClient,
     inbox_service_server::{InboxService as ProtoInboxService, InboxServiceServer},
+    kv_range_service_client::KvRangeServiceClient,
+    kv_range_service_server::{KvRangeService, KvRangeServiceServer},
+    metadata_service_client::MetadataServiceClient,
+    metadata_service_server::{MetadataService, MetadataServiceServer},
+    raft_transport_service_client::RaftTransportServiceClient,
+    raft_transport_service_server::{RaftTransportService, RaftTransportServiceServer},
     retain_service_client::RetainServiceClient,
     retain_service_server::{RetainService, RetainServiceServer},
     session_dict_service_client::SessionDictServiceClient,
     session_dict_service_server::{SessionDictService, SessionDictServiceServer},
-    metadata_service_client::MetadataServiceClient,
-    metadata_service_server::{MetadataService, MetadataServiceServer},
-    kv_range_service_client::KvRangeServiceClient,
-    kv_range_service_server::{KvRangeService, KvRangeServiceServer},
-    AddRouteRequest, CountReply, InboxAckInflightRequest, InboxAttachRequest, InboxDetachRequest,
-    InboxEnqueueRequest, InboxFetchInflightReply, InboxFetchInflightRequest, InboxFetchReply,
-    InboxFetchRequest, InboxListAllSubscriptionsRequest, InboxListMessagesRequest,
-    InboxListSubscriptionsReply, InboxListSubscriptionsRequest, InboxLookupSubscriptionReply,
-    InboxLookupSubscriptionRequest, InboxPurgeSessionRequest, InboxStageInflightRequest,
-    InboxStatsReply, InboxSubscribeRequest, InboxUnsubscribeReply, InboxUnsubscribeRequest,
-    ListRoutesReply, ListRoutesRequest, ListSessionRoutesReply, ListSessionRoutesRequest,
-    ListSessionsReply, ListSessionsRequest, LookupSessionByIdRequest, LookupSessionReply,
-    LookupSessionRequest, MatchTopicReply, MatchTopicRequest, PushDeliveriesReply,
-    PushDeliveriesRequest, PushDeliveryReply, PushDeliveryRequest, RegisterSessionReply,
+    AddRouteRequest, BalancerStateListReply, BalancerStateReply, BalancerStateRequest,
+    BalancerStateUpsertReply, BalancerStateUpsertRequest, CountReply, InboxAckInflightRequest,
+    InboxAttachRequest, InboxDetachRequest, InboxEnqueueRequest, InboxFetchInflightReply,
+    InboxFetchInflightRequest, InboxFetchReply, InboxFetchRequest,
+    InboxListAllSubscriptionsRequest, InboxListMessagesRequest, InboxListSubscriptionsReply,
+    InboxListSubscriptionsRequest, InboxLookupSubscriptionReply, InboxLookupSubscriptionRequest,
+    InboxPurgeSessionRequest, InboxStageInflightRequest, InboxStatsReply, InboxSubscribeRequest,
+    InboxUnsubscribeReply, InboxUnsubscribeRequest, KvRangeApplyRequest, KvRangeCheckpointReply,
+    KvRangeCheckpointRequest, KvRangeGetReply, KvRangeGetRequest, KvRangeScanReply,
+    KvRangeScanRequest, KvRangeSnapshotReply, KvRangeSnapshotRequest, ListRoutesReply,
+    ListRoutesRequest, ListSessionRoutesReply, ListSessionRoutesRequest, ListSessionsReply,
+    ListSessionsRequest, LookupSessionByIdRequest, LookupSessionReply, LookupSessionRequest,
+    MatchTopicReply, MatchTopicRequest, MemberListReply, MemberLookupRequest, MemberRecordReply,
+    NamedBalancerStateRecord, PushDeliveriesReply, PushDeliveriesRequest, PushDeliveryReply,
+    PushDeliveryRequest, RaftTransportRequest, RangeListReply, RangeListRequest,
+    RangeLookupRequest, RangeRecordReply, RangeUpsertRequest, RegisterSessionReply,
     RegisterSessionRequest, RemoveRouteRequest, RemoveSessionRoutesReply,
     RemoveSessionRoutesRequest, RetainMatchReply, RetainMatchRequest, RetainWriteRequest,
-    ShardSnapshotChunk, ShardSnapshotRequest, UnregisterSessionRequest, RangeListReply,
-    RangeListRequest, RangeLookupRequest, RangeRecordReply, RangeUpsertRequest,
-    RouteRangeRequest, BalancerStateListReply, BalancerStateReply, BalancerStateRequest,
-    BalancerStateUpsertReply, BalancerStateUpsertRequest, NamedBalancerStateRecord,
-    KvRangeApplyRequest, KvRangeCheckpointRequest, KvRangeGetReply, KvRangeGetRequest,
-    KvRangeScanReply, KvRangeScanRequest, KvRangeSnapshotRequest, KvRangeCheckpointReply,
-    KvRangeSnapshotReply,
+    RouteRangeRequest, ShardSnapshotChunk, ShardSnapshotRequest, UnregisterSessionRequest,
 };
 use greenmqtt_proto::{
-    from_proto_balancer_state, from_proto_client_identity, from_proto_delivery,
-    from_proto_inflight, from_proto_offline, from_proto_replicated_range, from_proto_retain,
+    from_proto_balancer_state, from_proto_client_identity, from_proto_cluster_node_membership,
+    from_proto_delivery, from_proto_inflight, from_proto_kv_mutation,
+    from_proto_kv_range_checkpoint, from_proto_kv_range_snapshot, from_proto_offline,
+    from_proto_raft_transport_request, from_proto_replicated_range, from_proto_retain,
     from_proto_route, from_proto_session, from_proto_shard_kind, from_proto_subscription,
-    from_proto_kv_mutation, from_proto_kv_range_checkpoint, from_proto_kv_range_snapshot,
-    to_proto_balancer_state, to_proto_delivery, to_proto_inflight, to_proto_offline,
-    to_proto_replicated_range, to_proto_retain, to_proto_route, to_proto_session,
-    to_proto_shard_kind, to_proto_subscription, to_proto_kv_entry, to_proto_kv_range_checkpoint,
-    to_proto_kv_range_snapshot,
+    to_proto_balancer_state, to_proto_cluster_node_membership, to_proto_delivery,
+    to_proto_inflight, to_proto_kv_entry, to_proto_kv_range_checkpoint, to_proto_kv_range_snapshot,
+    to_proto_offline, to_proto_raft_transport_request, to_proto_replicated_range, to_proto_retain,
+    to_proto_route, to_proto_session, to_proto_shard_kind, to_proto_subscription,
 };
 use greenmqtt_retain::{retain_tenant_shard, RetainService as RetainStoreService};
 use greenmqtt_sessiondict::{session_identity_shard, SessionDirectory};
@@ -72,6 +78,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex;
+use tokio::time::Duration;
 use tonic::transport::{Channel, Server};
 use tonic::{Request, Response, Status};
 
@@ -117,6 +124,14 @@ pub struct MetadataGrpcClient {
 pub struct KvRangeGrpcClient {
     inner: Arc<Mutex<KvRangeServiceClient<Channel>>>,
 }
+
+#[derive(Clone)]
+pub struct RaftTransportGrpcClient {
+    inner: Arc<Mutex<RaftTransportServiceClient<Channel>>>,
+}
+
+#[derive(Clone, Default)]
+pub struct KvRangeGrpcExecutorFactory;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct SessionDictShardSnapshot {
@@ -215,6 +230,32 @@ struct MetadataRpc {
 #[derive(Clone)]
 struct KvRangeRpc {
     inner: Option<Arc<dyn KvRangeHost>>,
+}
+
+#[derive(Clone)]
+struct RaftTransportRpc {
+    inner: Option<Arc<dyn KvRangeHost>>,
+}
+
+async fn apply_committed_entries_for_range(
+    hosted: &greenmqtt_kv_server::HostedRange,
+) -> anyhow::Result<usize> {
+    let entries = hosted.raft.committed_entries().await?;
+    if entries.is_empty() {
+        return Ok(0);
+    }
+    let mut applied = 0usize;
+    let mut last_index = None;
+    for entry in &entries {
+        let mutations: Vec<KvMutation> = bincode::deserialize(&entry.command)?;
+        hosted.space.writer().apply(mutations).await?;
+        applied += 1;
+        last_index = Some(entry.index);
+    }
+    if let Some(index) = last_index {
+        hosted.raft.mark_applied(index).await?;
+    }
+    Ok(applied)
 }
 
 impl SessionDictShardSnapshot {
@@ -951,7 +992,8 @@ impl PersistentMetadataRegistry {
 
     async fn read_value<T: DeserializeOwned>(&self, key: Bytes) -> anyhow::Result<Option<T>> {
         let range = self.engine.open_range(&self.range_id).await?;
-        range.reader()
+        range
+            .reader()
             .get(&key)
             .await?
             .map(|value| decode_metadata_value(&value))
@@ -960,7 +1002,8 @@ impl PersistentMetadataRegistry {
 
     async fn write_value<T: Serialize>(&self, key: Bytes, value: &T) -> anyhow::Result<()> {
         let range = self.engine.open_range(&self.range_id).await?;
-        range.writer()
+        range
+            .writer()
             .apply(vec![KvMutation {
                 key,
                 value: Some(encode_metadata_value(value)?),
@@ -972,7 +1015,8 @@ impl PersistentMetadataRegistry {
         let previous = self.read_value::<T>(key.clone()).await?;
         if previous.is_some() {
             let range = self.engine.open_range(&self.range_id).await?;
-            range.writer()
+            range
+                .writer()
                 .apply(vec![KvMutation { key, value: None }])
                 .await?;
         }
@@ -1056,7 +1100,9 @@ impl ServiceEndpointRegistry for PersistentMetadataRegistry {
         assignment: ServiceShardAssignment,
     ) -> anyhow::Result<Option<ServiceShardAssignment>> {
         let key = assignment_key(&assignment.shard)?;
-        let previous = self.read_value::<ServiceShardAssignment>(key.clone()).await?;
+        let previous = self
+            .read_value::<ServiceShardAssignment>(key.clone())
+            .await?;
         self.write_value(key, &assignment).await?;
         Ok(previous)
     }
@@ -1079,7 +1125,9 @@ impl ServiceEndpointRegistry for PersistentMetadataRegistry {
         &self,
         kind: Option<ServiceShardKind>,
     ) -> anyhow::Result<Vec<ServiceShardAssignment>> {
-        let mut assignments = self.scan_prefix::<ServiceShardAssignment>(ASSIGNMENT_PREFIX).await?;
+        let mut assignments = self
+            .scan_prefix::<ServiceShardAssignment>(ASSIGNMENT_PREFIX)
+            .await?;
         if let Some(kind) = kind {
             assignments.retain(|assignment| assignment.shard.kind == kind);
         }
@@ -1153,7 +1201,9 @@ impl ReplicatedRangeRegistry for PersistentMetadataRegistry {
         descriptor: ReplicatedRangeDescriptor,
     ) -> anyhow::Result<Option<ReplicatedRangeDescriptor>> {
         let key = range_key(&descriptor.id);
-        let previous = self.read_value::<ReplicatedRangeDescriptor>(key.clone()).await?;
+        let previous = self
+            .read_value::<ReplicatedRangeDescriptor>(key.clone())
+            .await?;
         self.write_value(key, &descriptor).await?;
         Ok(previous)
     }
@@ -1176,7 +1226,9 @@ impl ReplicatedRangeRegistry for PersistentMetadataRegistry {
         &self,
         shard_kind: Option<ServiceShardKind>,
     ) -> anyhow::Result<Vec<ReplicatedRangeDescriptor>> {
-        let mut ranges = self.scan_prefix::<ReplicatedRangeDescriptor>(RANGE_PREFIX).await?;
+        let mut ranges = self
+            .scan_prefix::<ReplicatedRangeDescriptor>(RANGE_PREFIX)
+            .await?;
         if let Some(kind) = shard_kind {
             ranges.retain(|descriptor| descriptor.shard.kind == kind);
         }
@@ -1332,7 +1384,9 @@ impl ClusterMembershipRegistry for PersistentMetadataRegistry {
         member: ClusterNodeMembership,
     ) -> anyhow::Result<Option<ClusterNodeMembership>> {
         let key = member_key(member.node_id);
-        let previous = self.read_value::<ClusterNodeMembership>(key.clone()).await?;
+        let previous = self
+            .read_value::<ClusterNodeMembership>(key.clone())
+            .await?;
         self.write_value(key, &member).await?;
         Ok(previous)
     }
@@ -1344,12 +1398,17 @@ impl ClusterMembershipRegistry for PersistentMetadataRegistry {
         self.read_value(member_key(node_id)).await
     }
 
-    async fn remove_member(&self, node_id: NodeId) -> anyhow::Result<Option<ClusterNodeMembership>> {
+    async fn remove_member(
+        &self,
+        node_id: NodeId,
+    ) -> anyhow::Result<Option<ClusterNodeMembership>> {
         self.delete_value(member_key(node_id)).await
     }
 
     async fn list_members(&self) -> anyhow::Result<Vec<ClusterNodeMembership>> {
-        let mut members = self.scan_prefix::<ClusterNodeMembership>(MEMBER_PREFIX).await?;
+        let mut members = self
+            .scan_prefix::<ClusterNodeMembership>(MEMBER_PREFIX)
+            .await?;
         members.sort_by_key(|member| member.node_id);
         Ok(members)
     }
@@ -2165,6 +2224,54 @@ impl MetadataGrpcClient {
         })
     }
 
+    pub async fn upsert_member(
+        &self,
+        member: ClusterNodeMembership,
+    ) -> anyhow::Result<Option<ClusterNodeMembership>> {
+        let mut client = self.inner.lock().await;
+        let reply = client
+            .upsert_member(MemberRecordReply {
+                member: Some(to_proto_cluster_node_membership(&member)),
+            })
+            .await?
+            .into_inner();
+        Ok(reply.member.map(from_proto_cluster_node_membership))
+    }
+
+    pub async fn lookup_member(
+        &self,
+        node_id: NodeId,
+    ) -> anyhow::Result<Option<ClusterNodeMembership>> {
+        let mut client = self.inner.lock().await;
+        let reply = client
+            .lookup_member(MemberLookupRequest { node_id })
+            .await?
+            .into_inner();
+        Ok(reply.member.map(from_proto_cluster_node_membership))
+    }
+
+    pub async fn remove_member(
+        &self,
+        node_id: NodeId,
+    ) -> anyhow::Result<Option<ClusterNodeMembership>> {
+        let mut client = self.inner.lock().await;
+        let reply = client
+            .remove_member(MemberLookupRequest { node_id })
+            .await?
+            .into_inner();
+        Ok(reply.member.map(from_proto_cluster_node_membership))
+    }
+
+    pub async fn list_members(&self) -> anyhow::Result<Vec<ClusterNodeMembership>> {
+        let mut client = self.inner.lock().await;
+        let reply = client.list_members(()).await?.into_inner();
+        Ok(reply
+            .members
+            .into_iter()
+            .map(from_proto_cluster_node_membership)
+            .collect())
+    }
+
     pub async fn upsert_range(
         &self,
         descriptor: ReplicatedRangeDescriptor,
@@ -2290,14 +2397,15 @@ impl MetadataGrpcClient {
 
     pub async fn list_balancer_states(&self) -> anyhow::Result<BTreeMap<String, BalancerState>> {
         let mut client = self.inner.lock().await;
-        let reply = client
-            .list_balancer_states(())
-            .await?
-            .into_inner();
+        let reply = client.list_balancer_states(()).await?.into_inner();
         Ok(reply
             .entries
             .into_iter()
-            .filter_map(|entry| entry.state.map(|state| (entry.name, from_proto_balancer_state(state))))
+            .filter_map(|entry| {
+                entry
+                    .state
+                    .map(|state| (entry.name, from_proto_balancer_state(state)))
+            })
             .collect())
     }
 }
@@ -2305,7 +2413,9 @@ impl MetadataGrpcClient {
 impl KvRangeGrpcClient {
     pub async fn connect(endpoint: impl Into<String>) -> anyhow::Result<Self> {
         Ok(Self {
-            inner: Arc::new(Mutex::new(KvRangeServiceClient::connect(endpoint.into()).await?)),
+            inner: Arc::new(Mutex::new(
+                KvRangeServiceClient::connect(endpoint.into()).await?,
+            )),
         })
     }
 
@@ -2387,6 +2497,47 @@ impl KvRangeGrpcClient {
     }
 }
 
+impl RaftTransportGrpcClient {
+    pub async fn connect(endpoint: impl Into<String>) -> anyhow::Result<Self> {
+        Ok(Self {
+            inner: Arc::new(Mutex::new(
+                RaftTransportServiceClient::connect(endpoint.into()).await?,
+            )),
+        })
+    }
+
+    pub async fn send(
+        &self,
+        range_id: &str,
+        from_node_id: NodeId,
+        message: &RaftMessage,
+    ) -> anyhow::Result<()> {
+        let mut client = self.inner.lock().await;
+        client
+            .send(to_proto_raft_transport_request(
+                range_id,
+                from_node_id,
+                message,
+            ))
+            .await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ReplicaTransport for RaftTransportGrpcClient {
+    async fn send(
+        &self,
+        from_node_id: NodeId,
+        target_node_id: NodeId,
+        range_id: &str,
+        message: &RaftMessage,
+    ) -> anyhow::Result<()> {
+        let _ = target_node_id;
+        Self::send(self, range_id, from_node_id, message).await
+    }
+}
+
 #[async_trait]
 impl KvRangeExecutor for KvRangeGrpcClient {
     async fn get(&self, range_id: &str, key: &[u8]) -> anyhow::Result<Option<Bytes>> {
@@ -2420,6 +2571,43 @@ impl KvRangeExecutor for KvRangeGrpcClient {
 }
 
 #[async_trait]
+impl KvRangeExecutorFactory for KvRangeGrpcExecutorFactory {
+    async fn connect(&self, endpoint: &str) -> anyhow::Result<Arc<dyn KvRangeExecutor>> {
+        Ok(Arc::new(
+            KvRangeGrpcClient::connect(endpoint.to_string()).await?,
+        ))
+    }
+}
+
+#[async_trait]
+impl ClusterMembershipRegistry for MetadataGrpcClient {
+    async fn upsert_member(
+        &self,
+        member: ClusterNodeMembership,
+    ) -> anyhow::Result<Option<ClusterNodeMembership>> {
+        Self::upsert_member(self, member).await
+    }
+
+    async fn resolve_member(
+        &self,
+        node_id: NodeId,
+    ) -> anyhow::Result<Option<ClusterNodeMembership>> {
+        Self::lookup_member(self, node_id).await
+    }
+
+    async fn remove_member(
+        &self,
+        node_id: NodeId,
+    ) -> anyhow::Result<Option<ClusterNodeMembership>> {
+        Self::remove_member(self, node_id).await
+    }
+
+    async fn list_members(&self) -> anyhow::Result<Vec<ClusterNodeMembership>> {
+        Self::list_members(self).await
+    }
+}
+
+#[async_trait]
 impl KvRangeRouter for MetadataGrpcClient {
     async fn upsert(&self, descriptor: ReplicatedRangeDescriptor) -> anyhow::Result<()> {
         let _ = self.upsert_range(descriptor).await?;
@@ -2435,7 +2623,10 @@ impl KvRangeRouter for MetadataGrpcClient {
     }
 
     async fn by_id(&self, range_id: &str) -> anyhow::Result<Option<RangeRoute>> {
-        Ok(self.lookup_range(range_id).await?.map(RangeRoute::from_descriptor))
+        Ok(self
+            .lookup_range(range_id)
+            .await?
+            .map(RangeRoute::from_descriptor))
     }
 
     async fn route_key(
@@ -2443,12 +2634,19 @@ impl KvRangeRouter for MetadataGrpcClient {
         shard: &ServiceShardKey,
         key: &[u8],
     ) -> anyhow::Result<Option<RangeRoute>> {
-        Ok(self.route_range(shard, key).await?.map(RangeRoute::from_descriptor))
+        Ok(self
+            .route_range(shard, key)
+            .await?
+            .map(RangeRoute::from_descriptor))
     }
 
     async fn route_shard(&self, shard: &ServiceShardKey) -> anyhow::Result<Vec<RangeRoute>> {
         Ok(self
-            .list_ranges(Some(shard.kind.clone()), Some(&shard.tenant_id), Some(&shard.scope))
+            .list_ranges(
+                Some(shard.kind.clone()),
+                Some(&shard.tenant_id),
+                Some(&shard.scope),
+            )
             .await?
             .into_iter()
             .map(RangeRoute::from_descriptor)
@@ -2542,6 +2740,9 @@ impl RpcRuntime {
                 inner: self.assignment_registry.clone(),
             }))
             .add_service(KvRangeServiceServer::new(KvRangeRpc {
+                inner: self.range_host.clone(),
+            }))
+            .add_service(RaftTransportServiceServer::new(RaftTransportRpc {
                 inner: self.range_host.clone(),
             }))
             .serve(bind)
@@ -3754,6 +3955,78 @@ impl BrokerPeerService for BrokerPeerRpc {
 
 #[tonic::async_trait]
 impl MetadataService for MetadataRpc {
+    async fn upsert_member(
+        &self,
+        request: Request<MemberRecordReply>,
+    ) -> Result<Response<MemberRecordReply>, Status> {
+        let registry = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("metadata registry unavailable"))?;
+        let member = request
+            .into_inner()
+            .member
+            .ok_or_else(|| Status::invalid_argument("missing cluster member"))?;
+        let previous = registry
+            .upsert_member(from_proto_cluster_node_membership(member))
+            .await
+            .map_err(internal_status)?;
+        Ok(Response::new(MemberRecordReply {
+            member: previous.as_ref().map(to_proto_cluster_node_membership),
+        }))
+    }
+
+    async fn lookup_member(
+        &self,
+        request: Request<MemberLookupRequest>,
+    ) -> Result<Response<MemberRecordReply>, Status> {
+        let registry = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("metadata registry unavailable"))?;
+        let member = registry
+            .resolve_member(request.into_inner().node_id)
+            .await
+            .map_err(internal_status)?;
+        Ok(Response::new(MemberRecordReply {
+            member: member.as_ref().map(to_proto_cluster_node_membership),
+        }))
+    }
+
+    async fn remove_member(
+        &self,
+        request: Request<MemberLookupRequest>,
+    ) -> Result<Response<MemberRecordReply>, Status> {
+        let registry = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("metadata registry unavailable"))?;
+        let member = registry
+            .remove_member(request.into_inner().node_id)
+            .await
+            .map_err(internal_status)?;
+        Ok(Response::new(MemberRecordReply {
+            member: member.as_ref().map(to_proto_cluster_node_membership),
+        }))
+    }
+
+    async fn list_members(
+        &self,
+        _request: Request<()>,
+    ) -> Result<Response<MemberListReply>, Status> {
+        let registry = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("metadata registry unavailable"))?;
+        let members = registry.list_members().await.map_err(internal_status)?;
+        Ok(Response::new(MemberListReply {
+            members: members
+                .iter()
+                .map(to_proto_cluster_node_membership)
+                .collect(),
+        }))
+    }
+
     async fn upsert_range(
         &self,
         request: Request<RangeUpsertRequest>,
@@ -3958,6 +4231,7 @@ impl KvRangeService for KvRangeRpc {
             .await
             .map_err(internal_status)?
             .ok_or_else(|| Status::not_found("range not found"))?;
+        hosted.raft.read_index().await.map_err(internal_status)?;
         let value = hosted
             .space
             .reader()
@@ -3984,6 +4258,7 @@ impl KvRangeService for KvRangeRpc {
             .await
             .map_err(internal_status)?
             .ok_or_else(|| Status::not_found("range not found"))?;
+        hosted.raft.read_index().await.map_err(internal_status)?;
         let boundary = request
             .boundary
             .map(greenmqtt_proto::from_proto_range_boundary)
@@ -4014,13 +4289,37 @@ impl KvRangeService for KvRangeRpc {
             .mutations
             .into_iter()
             .map(from_proto_kv_mutation)
-            .collect();
-        hosted
-            .space
-            .writer()
-            .apply(mutations)
+            .collect::<Vec<_>>();
+        let proposed_index = hosted
+            .raft
+            .propose(Bytes::from(
+                bincode::serialize(&mutations)
+                    .map_err(|error| internal_status(anyhow::Error::from(error)))?,
+            ))
             .await
             .map_err(internal_status)?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let _ = apply_committed_entries_for_range(&hosted)
+                .await
+                .map_err(internal_status)?;
+            if hosted
+                .raft
+                .status()
+                .await
+                .map_err(internal_status)?
+                .applied_index
+                >= proposed_index
+            {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Status::deadline_exceeded(
+                    "timed out waiting for raft command to apply",
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         Ok(Response::new(()))
     }
 
@@ -4038,6 +4337,7 @@ impl KvRangeService for KvRangeRpc {
             .await
             .map_err(internal_status)?
             .ok_or_else(|| Status::not_found("range not found"))?;
+        hosted.raft.read_index().await.map_err(internal_status)?;
         let checkpoint = hosted
             .space
             .checkpoint(&request.checkpoint_id)
@@ -4060,8 +4360,32 @@ impl KvRangeService for KvRangeRpc {
             .await
             .map_err(internal_status)?
             .ok_or_else(|| Status::not_found("range not found"))?;
+        hosted.raft.read_index().await.map_err(internal_status)?;
         let snapshot = hosted.space.snapshot().await.map_err(internal_status)?;
         Ok(Response::new(to_proto_kv_range_snapshot(&snapshot)))
+    }
+}
+
+#[tonic::async_trait]
+impl RaftTransportService for RaftTransportRpc {
+    async fn send(&self, request: Request<RaftTransportRequest>) -> Result<Response<()>, Status> {
+        let host = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("kv range host unavailable"))?;
+        let (range_id, from_node_id, message) =
+            from_proto_raft_transport_request(request.into_inner()).map_err(internal_status)?;
+        let hosted = host
+            .open_range(&range_id)
+            .await
+            .map_err(internal_status)?
+            .ok_or_else(|| Status::not_found("range not found"))?;
+        hosted
+            .raft
+            .receive(from_node_id, message)
+            .await
+            .map_err(internal_status)?;
+        Ok(Response::new(()))
     }
 }
 

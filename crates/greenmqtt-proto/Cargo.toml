@@ -5,8 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 greenmqtt-core = { path = "../greenmqtt-core" }
 greenmqtt-kv-engine = { path = "../greenmqtt-kv-engine" }
+greenmqtt-kv-raft = { path = "../greenmqtt-kv-raft" }
 bytes.workspace = true
 tonic.workspace = true
 prost = "0.14.3"

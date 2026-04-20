@@ -1,29 +1,34 @@
 use super::{
     collect_listener_profiles, configured_acl, configured_acl_for_profile, configured_auth,
-    configured_auth_for_profile, configured_hooks, configured_hooks_for_profile,
-    configured_listener_profiles, configured_webhook, durable_services, listener_specs_from_env,
-    parse_acl_rules, parse_bench_scenario, parse_bench_scenarios, parse_bridge_rules,
-    parse_compare_backends, parse_identity_matchers, parse_listener_specs,
-    parse_topic_rewrite_rules, redis_services, render_shard_response_text, run_bench,
-    run_compare_bench, run_compare_soak, run_profile_bench, run_shard_command, run_soak,
-    shard_command_request, validate_bench_report, validate_soak_report, BenchConfig, BenchReport,
-    BenchScenario, BenchThresholds, ListenerSpec, OutputMode, SoakConfig, SoakReport,
-    SoakThresholds,
+    configured_auth_for_profile, configured_dist_service, configured_hooks,
+    configured_hooks_for_profile, configured_inbox_service, configured_listener_profiles,
+    configured_retain_service, configured_sessiondict_service, configured_webhook,
+    durable_services, listener_specs_from_env, parse_acl_rules, parse_bench_scenario,
+    parse_bench_scenarios, parse_bridge_rules, parse_compare_backends, parse_identity_matchers,
+    parse_listener_specs, parse_topic_rewrite_rules, redis_services, render_shard_response_text,
+    resolved_state_mode, run_bench, run_compare_bench, run_compare_soak, run_profile_bench,
+    run_shard_command, run_soak, shard_command_request, validate_bench_report,
+    validate_soak_report, BenchConfig, BenchReport, BenchScenario, BenchThresholds, ListenerSpec,
+    OutputMode, SoakConfig, SoakReport, SoakThresholds, StateMode,
 };
 use greenmqtt_broker::{BrokerConfig, BrokerRuntime};
 use greenmqtt_core::{
     ClientIdentity, ClusterMembershipRegistry, ClusterNodeLifecycle, ClusterNodeMembership,
-    PublishProperties, PublishRequest, ServiceEndpoint, ServiceEndpointRegistry, ServiceKind,
-    ServiceShardAssignment, ServiceShardKey, ServiceShardLifecycle,
+    ConnectRequest, OfflineMessage, PublishProperties, PublishRequest, ReplicatedRangeRegistry,
+    RouteRecord, ServiceEndpoint, ServiceEndpointRegistry, ServiceKind, ServiceShardAssignment,
+    ServiceShardKey, ServiceShardLifecycle, SessionKind, SessionRecord, Subscription,
 };
 use greenmqtt_dist::DistHandle;
 use greenmqtt_inbox::InboxHandle;
+use greenmqtt_kv_engine::{KvEngine, KvRangeBootstrap, MemoryKvEngine};
+use greenmqtt_kv_raft::{MemoryRaftNode, RaftClusterConfig, RaftNode};
+use greenmqtt_kv_server::{HostedRange, KvRangeHost, MemoryKvRangeHost};
 use greenmqtt_plugin_api::{
-    with_listener_profile, AclAction, AclDecision, AclProvider, AuthProvider, ConfiguredAcl,
-    ConfiguredAuth, ConfiguredEventHook, EventHook,
+    with_listener_profile, AclAction, AclDecision, AclProvider, AllowAllAcl, AllowAllAuth,
+    AuthProvider, ConfiguredAcl, ConfiguredAuth, ConfiguredEventHook, EventHook, NoopEventHook,
 };
 use greenmqtt_retain::RetainHandle;
-use greenmqtt_rpc::StaticServiceEndpointRegistry;
+use greenmqtt_rpc::{StaticPeerForwarder, StaticServiceEndpointRegistry};
 use greenmqtt_sessiondict::SessionDictHandle;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use std::io::{Read, Write};
@@ -96,6 +101,65 @@ fn test_broker() -> Arc<BrokerRuntime<ConfiguredAuth, ConfiguredAcl, ConfiguredE
         Arc::new(InboxHandle::default()),
         Arc::new(RetainHandle::default()),
     ))
+}
+
+async fn add_hosted_range(
+    engine: &MemoryKvEngine,
+    host: &MemoryKvRangeHost,
+    registry: &StaticServiceEndpointRegistry,
+    range_id: &str,
+    shard: ServiceShardKey,
+) {
+    let descriptor = greenmqtt_core::ReplicatedRangeDescriptor::new(
+        range_id.to_string(),
+        shard.clone(),
+        greenmqtt_core::RangeBoundary::full(),
+        1,
+        1,
+        Some(1),
+        vec![greenmqtt_core::RangeReplica::new(
+            1,
+            greenmqtt_core::ReplicaRole::Voter,
+            greenmqtt_core::ReplicaSyncState::Replicating,
+        )],
+        0,
+        0,
+        ServiceShardLifecycle::Serving,
+    );
+    add_hosted_range_with_descriptor(engine, host, descriptor.clone(), 1).await;
+    registry.upsert_range(descriptor).await.unwrap();
+}
+
+async fn add_hosted_range_with_descriptor(
+    engine: &MemoryKvEngine,
+    host: &MemoryKvRangeHost,
+    descriptor: greenmqtt_core::ReplicatedRangeDescriptor,
+    local_node_id: u64,
+) {
+    engine
+        .bootstrap(KvRangeBootstrap {
+            range_id: descriptor.id.clone(),
+            boundary: greenmqtt_core::RangeBoundary::full(),
+        })
+        .await
+        .unwrap();
+    let raft_impl = Arc::new(MemoryRaftNode::new(
+        local_node_id,
+        descriptor.id.clone(),
+        RaftClusterConfig {
+            voters: vec![local_node_id],
+            learners: Vec::new(),
+        },
+    ));
+    raft_impl.recover().await.unwrap();
+    let raft: Arc<dyn RaftNode> = raft_impl;
+    host.add_range(HostedRange {
+        descriptor: descriptor.clone(),
+        raft,
+        space: Arc::from(engine.open_range(&descriptor.id).await.unwrap()),
+    })
+    .await
+    .unwrap();
 }
 
 #[test]
@@ -190,6 +254,974 @@ fn shard_cli_command_drives_http_shard_move() {
         assert_eq!(assignment.owner_node_id(), 9);
 
         server.join().unwrap();
+    });
+}
+
+#[test]
+fn configured_services_can_run_under_global_replicated_state_mode() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let bind = "127.0.0.1:50066".parse().unwrap();
+        let registry = Arc::new(StaticServiceEndpointRegistry::default());
+        let host = Arc::new(MemoryKvRangeHost::default());
+        let engine = MemoryKvEngine::default();
+        registry
+            .upsert_member(ClusterNodeMembership::new(
+                1,
+                1,
+                ClusterNodeLifecycle::Serving,
+                vec![
+                    ServiceEndpoint::new(ServiceKind::SessionDict, 1, "http://127.0.0.1:50066"),
+                    ServiceEndpoint::new(ServiceKind::Dist, 1, "http://127.0.0.1:50066"),
+                    ServiceEndpoint::new(ServiceKind::Inbox, 1, "http://127.0.0.1:50066"),
+                    ServiceEndpoint::new(ServiceKind::Retain, 1, "http://127.0.0.1:50066"),
+                ],
+            ))
+            .await
+            .unwrap();
+
+        add_hosted_range(
+            &engine,
+            &host,
+            &registry,
+            "retain-range-t1",
+            greenmqtt_retain::retain_tenant_shard("t1"),
+        )
+        .await;
+        add_hosted_range(
+            &engine,
+            &host,
+            &registry,
+            "dist-range-t1",
+            greenmqtt_dist::dist_tenant_shard("t1"),
+        )
+        .await;
+        add_hosted_range(
+            &engine,
+            &host,
+            &registry,
+            "sessiondict-range-t1",
+            greenmqtt_sessiondict::session_scan_shard("t1"),
+        )
+        .await;
+        add_hosted_range(
+            &engine,
+            &host,
+            &registry,
+            "inbox-range-t1",
+            greenmqtt_inbox::inbox_tenant_scan_shard("t1"),
+        )
+        .await;
+        add_hosted_range(
+            &engine,
+            &host,
+            &registry,
+            "inflight-range-t1",
+            greenmqtt_inbox::inflight_tenant_scan_shard("t1"),
+        )
+        .await;
+
+        let server = tokio::spawn(
+            greenmqtt_rpc::RpcRuntime {
+                sessiondict: Arc::new(SessionDictHandle::default()),
+                dist: Arc::new(DistHandle::default()),
+                inbox: Arc::new(InboxHandle::default()),
+                retain: Arc::new(RetainHandle::default()),
+                peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
+                assignment_registry: Some(registry),
+                range_host: Some(host),
+            }
+            .serve(bind),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let endpoint = "http://127.0.0.1:50066";
+        let previous = std::env::var("GREENMQTT_STATE_MODE").ok();
+        std::env::set_var("GREENMQTT_STATE_MODE", "replicated");
+        let sessiondict =
+            configured_sessiondict_service(Arc::new(SessionDictHandle::default()), Some(endpoint))
+                .await
+                .unwrap();
+        let dist = configured_dist_service(Arc::new(DistHandle::default()), Some(endpoint))
+            .await
+            .unwrap();
+        let inbox = configured_inbox_service(Arc::new(InboxHandle::default()), Some(endpoint))
+            .await
+            .unwrap();
+        let retain = configured_retain_service(Arc::new(RetainHandle::default()), Some(endpoint))
+            .await
+            .unwrap();
+
+        let identity = ClientIdentity {
+            tenant_id: "t1".into(),
+            user_id: "u1".into(),
+            client_id: "c1".into(),
+        };
+        sessiondict
+            .register(SessionRecord {
+                session_id: "s1".into(),
+                node_id: 1,
+                kind: SessionKind::Persistent,
+                identity: identity.clone(),
+                session_expiry_interval_secs: Some(60),
+                expires_at_ms: Some(1),
+            })
+            .await
+            .unwrap();
+        assert!(sessiondict
+            .lookup_identity(&identity)
+            .await
+            .unwrap()
+            .is_some());
+
+        dist.add_route(RouteRecord {
+            tenant_id: "t1".into(),
+            topic_filter: "metrics/#".into(),
+            session_id: "s1".into(),
+            node_id: 1,
+            subscription_identifier: None,
+            no_local: false,
+            retain_as_published: false,
+            shared_group: None,
+            kind: SessionKind::Persistent,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            dist.match_topic("t1", &"metrics/cpu".into())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        inbox
+            .subscribe(Subscription {
+                session_id: "s1".into(),
+                tenant_id: "t1".into(),
+                topic_filter: "devices/+/state".into(),
+                qos: 1,
+                subscription_identifier: None,
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: 0,
+                shared_group: None,
+                kind: SessionKind::Persistent,
+            })
+            .await
+            .unwrap();
+        inbox
+            .enqueue(OfflineMessage {
+                tenant_id: "t1".into(),
+                session_id: "s1".into(),
+                topic: "devices/a/state".into(),
+                payload: b"offline".to_vec().into(),
+                qos: 1,
+                retain: false,
+                from_session_id: "src".into(),
+                properties: PublishProperties::default(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(inbox.fetch(&"s1".into()).await.unwrap().len(), 1);
+
+        retain
+            .retain(greenmqtt_core::RetainedMessage {
+                tenant_id: "t1".into(),
+                topic: "devices/a/state".into(),
+                payload: b"up".to_vec().into(),
+                qos: 1,
+            })
+            .await
+            .unwrap();
+        assert!(retain
+            .lookup_topic("t1", "devices/a/state")
+            .await
+            .unwrap()
+            .is_some());
+
+        match previous {
+            Some(value) => std::env::set_var("GREENMQTT_STATE_MODE", value),
+            None => std::env::remove_var("GREENMQTT_STATE_MODE"),
+        }
+
+        server.abort();
+    });
+}
+
+#[test]
+fn broker_can_use_replicated_service_clients_under_global_state_mode() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let bind = "127.0.0.1:50067".parse().unwrap();
+        let registry = Arc::new(StaticServiceEndpointRegistry::default());
+        let host = Arc::new(MemoryKvRangeHost::default());
+        let engine = MemoryKvEngine::default();
+        registry
+            .upsert_member(ClusterNodeMembership::new(
+                1,
+                1,
+                ClusterNodeLifecycle::Serving,
+                vec![
+                    ServiceEndpoint::new(ServiceKind::SessionDict, 1, "http://127.0.0.1:50067"),
+                    ServiceEndpoint::new(ServiceKind::Dist, 1, "http://127.0.0.1:50067"),
+                    ServiceEndpoint::new(ServiceKind::Inbox, 1, "http://127.0.0.1:50067"),
+                    ServiceEndpoint::new(ServiceKind::Retain, 1, "http://127.0.0.1:50067"),
+                ],
+            ))
+            .await
+            .unwrap();
+
+        for (range_id, shard) in [
+            (
+                "retain-range-t1",
+                greenmqtt_retain::retain_tenant_shard("t1"),
+            ),
+            ("dist-range-t1", greenmqtt_dist::dist_tenant_shard("t1")),
+            (
+                "sessiondict-range-t1",
+                greenmqtt_sessiondict::session_scan_shard("t1"),
+            ),
+            (
+                "inbox-range-t1",
+                greenmqtt_inbox::inbox_tenant_scan_shard("t1"),
+            ),
+            (
+                "inflight-range-t1",
+                greenmqtt_inbox::inflight_tenant_scan_shard("t1"),
+            ),
+        ] {
+            add_hosted_range(&engine, &host, &registry, range_id, shard).await;
+        }
+
+        let server = tokio::spawn(
+            greenmqtt_rpc::RpcRuntime {
+                sessiondict: Arc::new(SessionDictHandle::default()),
+                dist: Arc::new(DistHandle::default()),
+                inbox: Arc::new(InboxHandle::default()),
+                retain: Arc::new(RetainHandle::default()),
+                peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
+                assignment_registry: Some(registry),
+                range_host: Some(host),
+            }
+            .serve(bind),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let endpoint = "http://127.0.0.1:50067";
+        let previous = std::env::var("GREENMQTT_STATE_MODE").ok();
+        std::env::set_var("GREENMQTT_STATE_MODE", "replicated");
+        let broker = Arc::new(BrokerRuntime::with_cluster(
+            BrokerConfig {
+                node_id: 1,
+                enable_tcp: true,
+                enable_tls: false,
+                enable_ws: false,
+                enable_wss: false,
+                enable_quic: false,
+                server_keep_alive_secs: None,
+                max_packet_size: None,
+                response_information: None,
+                server_reference: None,
+                audit_log_path: None,
+            },
+            AllowAllAuth,
+            AllowAllAcl,
+            NoopEventHook,
+            Arc::new(StaticPeerForwarder::default()),
+            configured_sessiondict_service(Arc::new(SessionDictHandle::default()), Some(endpoint))
+                .await
+                .unwrap(),
+            configured_dist_service(Arc::new(DistHandle::default()), Some(endpoint))
+                .await
+                .unwrap(),
+            configured_inbox_service(Arc::new(InboxHandle::default()), Some(endpoint))
+                .await
+                .unwrap(),
+            configured_retain_service(Arc::new(RetainHandle::default()), Some(endpoint))
+                .await
+                .unwrap(),
+        ));
+
+        let subscriber = broker
+            .connect(ConnectRequest {
+                identity: ClientIdentity {
+                    tenant_id: "t1".into(),
+                    user_id: "u1".into(),
+                    client_id: "sub".into(),
+                },
+                node_id: 1,
+                kind: SessionKind::Persistent,
+                clean_start: true,
+                session_expiry_interval_secs: None,
+            })
+            .await
+            .unwrap();
+        broker
+            .subscribe(
+                &subscriber.session.session_id,
+                "devices/+/state",
+                1,
+                None,
+                false,
+                false,
+                0,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let publisher = broker
+            .connect(ConnectRequest {
+                identity: ClientIdentity {
+                    tenant_id: "t1".into(),
+                    user_id: "u2".into(),
+                    client_id: "pub".into(),
+                },
+                node_id: 1,
+                kind: SessionKind::Transient,
+                clean_start: true,
+                session_expiry_interval_secs: None,
+            })
+            .await
+            .unwrap();
+        let outcome = broker
+            .publish(
+                &publisher.session.session_id,
+                PublishRequest {
+                    topic: "devices/a/state".into(),
+                    payload: b"replicated".to_vec().into(),
+                    qos: 1,
+                    retain: false,
+                    properties: PublishProperties::default(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.online_deliveries, 1);
+
+        let deliveries = broker
+            .drain_deliveries(&subscriber.session.session_id)
+            .await
+            .unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].payload, b"replicated".to_vec());
+
+        let stats = broker.stats().await.unwrap();
+        assert_eq!(stats.global_session_records, 2);
+        assert_eq!(stats.route_records, 1);
+        assert_eq!(stats.subscription_records, 1);
+
+        match previous {
+            Some(value) => std::env::set_var("GREENMQTT_STATE_MODE", value),
+            None => std::env::remove_var("GREENMQTT_STATE_MODE"),
+        }
+
+        server.abort();
+    });
+}
+
+#[test]
+fn configured_retain_service_survives_leader_failover() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let metadata_bind = "127.0.0.1:50068".parse().unwrap();
+        let retain_bind_1 = "127.0.0.1:50069".parse().unwrap();
+        let retain_bind_2 = "127.0.0.1:50070".parse().unwrap();
+        let registry = Arc::new(StaticServiceEndpointRegistry::default());
+        let retain_range = "retain-range-t1";
+        let shard = greenmqtt_retain::retain_tenant_shard("t1");
+
+        registry
+            .upsert_member(ClusterNodeMembership::new(
+                7,
+                1,
+                ClusterNodeLifecycle::Serving,
+                vec![ServiceEndpoint::new(
+                    ServiceKind::Retain,
+                    7,
+                    "http://127.0.0.1:50069",
+                )],
+            ))
+            .await
+            .unwrap();
+        registry
+            .upsert_member(ClusterNodeMembership::new(
+                9,
+                1,
+                ClusterNodeLifecycle::Serving,
+                vec![ServiceEndpoint::new(
+                    ServiceKind::Retain,
+                    9,
+                    "http://127.0.0.1:50070",
+                )],
+            ))
+            .await
+            .unwrap();
+        registry
+            .upsert_range(greenmqtt_core::ReplicatedRangeDescriptor::new(
+                retain_range,
+                shard.clone(),
+                greenmqtt_core::RangeBoundary::full(),
+                1,
+                1,
+                Some(7),
+                vec![greenmqtt_core::RangeReplica::new(
+                    7,
+                    greenmqtt_core::ReplicaRole::Voter,
+                    greenmqtt_core::ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ))
+            .await
+            .unwrap();
+
+        let metadata_server = tokio::spawn(
+            greenmqtt_rpc::RpcRuntime {
+                sessiondict: Arc::new(SessionDictHandle::default()),
+                dist: Arc::new(DistHandle::default()),
+                inbox: Arc::new(InboxHandle::default()),
+                retain: Arc::new(RetainHandle::default()),
+                peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
+                assignment_registry: Some(registry.clone()),
+                range_host: None,
+            }
+            .serve(metadata_bind),
+        );
+
+        let host_1 = Arc::new(MemoryKvRangeHost::default());
+        let engine_1 = MemoryKvEngine::default();
+        add_hosted_range_with_descriptor(
+            &engine_1,
+            &host_1,
+            greenmqtt_core::ReplicatedRangeDescriptor::new(
+                retain_range,
+                shard.clone(),
+                greenmqtt_core::RangeBoundary::full(),
+                1,
+                1,
+                Some(7),
+                vec![greenmqtt_core::RangeReplica::new(
+                    7,
+                    greenmqtt_core::ReplicaRole::Voter,
+                    greenmqtt_core::ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ),
+            7,
+        )
+        .await;
+        let server_1 = tokio::spawn(
+            greenmqtt_rpc::RpcRuntime {
+                sessiondict: Arc::new(SessionDictHandle::default()),
+                dist: Arc::new(DistHandle::default()),
+                inbox: Arc::new(InboxHandle::default()),
+                retain: Arc::new(RetainHandle::default()),
+                peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
+                assignment_registry: Some(registry.clone()),
+                range_host: Some(host_1),
+            }
+            .serve(retain_bind_1),
+        );
+
+        let host_2 = Arc::new(MemoryKvRangeHost::default());
+        let engine_2 = MemoryKvEngine::default();
+        add_hosted_range_with_descriptor(
+            &engine_2,
+            &host_2,
+            greenmqtt_core::ReplicatedRangeDescriptor::new(
+                retain_range,
+                shard.clone(),
+                greenmqtt_core::RangeBoundary::full(),
+                1,
+                1,
+                Some(9),
+                vec![greenmqtt_core::RangeReplica::new(
+                    9,
+                    greenmqtt_core::ReplicaRole::Voter,
+                    greenmqtt_core::ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ),
+            9,
+        )
+        .await;
+        let server_2 = tokio::spawn(
+            greenmqtt_rpc::RpcRuntime {
+                sessiondict: Arc::new(SessionDictHandle::default()),
+                dist: Arc::new(DistHandle::default()),
+                inbox: Arc::new(InboxHandle::default()),
+                retain: Arc::new(RetainHandle::default()),
+                peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
+                assignment_registry: Some(registry.clone()),
+                range_host: Some(host_2),
+            }
+            .serve(retain_bind_2),
+        );
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let previous_state_mode = std::env::var("GREENMQTT_STATE_MODE").ok();
+        let previous_metadata = std::env::var("GREENMQTT_METADATA_ENDPOINT").ok();
+        let previous_range = std::env::var("GREENMQTT_RANGE_ENDPOINT").ok();
+        std::env::set_var("GREENMQTT_STATE_MODE", "replicated");
+        std::env::set_var("GREENMQTT_METADATA_ENDPOINT", "http://127.0.0.1:50068");
+        std::env::set_var("GREENMQTT_RANGE_ENDPOINT", "http://127.0.0.1:50069");
+
+        let retain = configured_retain_service(Arc::new(RetainHandle::default()), None)
+            .await
+            .unwrap();
+        retain
+            .retain(greenmqtt_core::RetainedMessage {
+                tenant_id: "t1".into(),
+                topic: "devices/a/state".into(),
+                payload: b"before".to_vec().into(),
+                qos: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            retain
+                .lookup_topic("t1", "devices/a/state")
+                .await
+                .unwrap()
+                .unwrap()
+                .payload,
+            b"before".as_slice()
+        );
+
+        registry
+            .upsert_range(greenmqtt_core::ReplicatedRangeDescriptor::new(
+                retain_range,
+                shard,
+                greenmqtt_core::RangeBoundary::full(),
+                2,
+                2,
+                Some(9),
+                vec![greenmqtt_core::RangeReplica::new(
+                    9,
+                    greenmqtt_core::ReplicaRole::Voter,
+                    greenmqtt_core::ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ))
+            .await
+            .unwrap();
+        server_1.abort();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        retain
+            .retain(greenmqtt_core::RetainedMessage {
+                tenant_id: "t1".into(),
+                topic: "devices/b/state".into(),
+                payload: b"after".to_vec().into(),
+                qos: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            retain
+                .lookup_topic("t1", "devices/b/state")
+                .await
+                .unwrap()
+                .unwrap()
+                .payload,
+            b"after".as_slice()
+        );
+
+        match previous_state_mode {
+            Some(value) => std::env::set_var("GREENMQTT_STATE_MODE", value),
+            None => std::env::remove_var("GREENMQTT_STATE_MODE"),
+        }
+        match previous_metadata {
+            Some(value) => std::env::set_var("GREENMQTT_METADATA_ENDPOINT", value),
+            None => std::env::remove_var("GREENMQTT_METADATA_ENDPOINT"),
+        }
+        match previous_range {
+            Some(value) => std::env::set_var("GREENMQTT_RANGE_ENDPOINT", value),
+            None => std::env::remove_var("GREENMQTT_RANGE_ENDPOINT"),
+        }
+
+        metadata_server.abort();
+        server_2.abort();
+    });
+}
+
+#[test]
+fn broker_can_continue_after_retain_leader_move_under_replicated_state_mode() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let metadata_bind = "127.0.0.1:50071".parse().unwrap();
+        let stable_bind = "127.0.0.1:50072".parse().unwrap();
+        let retain_bind_1 = "127.0.0.1:50073".parse().unwrap();
+        let retain_bind_2 = "127.0.0.1:50074".parse().unwrap();
+        let registry = Arc::new(StaticServiceEndpointRegistry::default());
+
+        registry
+            .upsert_member(ClusterNodeMembership::new(
+                1,
+                1,
+                ClusterNodeLifecycle::Serving,
+                vec![
+                    ServiceEndpoint::new(ServiceKind::SessionDict, 1, "http://127.0.0.1:50072"),
+                    ServiceEndpoint::new(ServiceKind::Dist, 1, "http://127.0.0.1:50072"),
+                    ServiceEndpoint::new(ServiceKind::Inbox, 1, "http://127.0.0.1:50072"),
+                ],
+            ))
+            .await
+            .unwrap();
+        registry
+            .upsert_member(ClusterNodeMembership::new(
+                7,
+                1,
+                ClusterNodeLifecycle::Serving,
+                vec![ServiceEndpoint::new(
+                    ServiceKind::Retain,
+                    7,
+                    "http://127.0.0.1:50073",
+                )],
+            ))
+            .await
+            .unwrap();
+        registry
+            .upsert_member(ClusterNodeMembership::new(
+                9,
+                1,
+                ClusterNodeLifecycle::Serving,
+                vec![ServiceEndpoint::new(
+                    ServiceKind::Retain,
+                    9,
+                    "http://127.0.0.1:50074",
+                )],
+            ))
+            .await
+            .unwrap();
+
+        let stable_host = Arc::new(MemoryKvRangeHost::default());
+        let stable_engine = MemoryKvEngine::default();
+        for (range_id, shard) in [
+            (
+                "sessiondict-range-t1",
+                greenmqtt_sessiondict::session_scan_shard("t1"),
+            ),
+            ("dist-range-t1", greenmqtt_dist::dist_tenant_shard("t1")),
+            (
+                "inbox-range-t1",
+                greenmqtt_inbox::inbox_tenant_scan_shard("t1"),
+            ),
+            (
+                "inflight-range-t1",
+                greenmqtt_inbox::inflight_tenant_scan_shard("t1"),
+            ),
+        ] {
+            let descriptor = greenmqtt_core::ReplicatedRangeDescriptor::new(
+                range_id,
+                shard.clone(),
+                greenmqtt_core::RangeBoundary::full(),
+                1,
+                1,
+                Some(1),
+                vec![greenmqtt_core::RangeReplica::new(
+                    1,
+                    greenmqtt_core::ReplicaRole::Voter,
+                    greenmqtt_core::ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            );
+            add_hosted_range_with_descriptor(&stable_engine, &stable_host, descriptor.clone(), 1)
+                .await;
+            registry.upsert_range(descriptor).await.unwrap();
+        }
+
+        let retain_shard = greenmqtt_retain::retain_tenant_shard("t1");
+        registry
+            .upsert_range(greenmqtt_core::ReplicatedRangeDescriptor::new(
+                "retain-range-t1",
+                retain_shard.clone(),
+                greenmqtt_core::RangeBoundary::full(),
+                1,
+                1,
+                Some(7),
+                vec![greenmqtt_core::RangeReplica::new(
+                    7,
+                    greenmqtt_core::ReplicaRole::Voter,
+                    greenmqtt_core::ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ))
+            .await
+            .unwrap();
+
+        let metadata_server = tokio::spawn(
+            greenmqtt_rpc::RpcRuntime {
+                sessiondict: Arc::new(SessionDictHandle::default()),
+                dist: Arc::new(DistHandle::default()),
+                inbox: Arc::new(InboxHandle::default()),
+                retain: Arc::new(RetainHandle::default()),
+                peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
+                assignment_registry: Some(registry.clone()),
+                range_host: None,
+            }
+            .serve(metadata_bind),
+        );
+        let stable_server = tokio::spawn(
+            greenmqtt_rpc::RpcRuntime {
+                sessiondict: Arc::new(SessionDictHandle::default()),
+                dist: Arc::new(DistHandle::default()),
+                inbox: Arc::new(InboxHandle::default()),
+                retain: Arc::new(RetainHandle::default()),
+                peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
+                assignment_registry: Some(registry.clone()),
+                range_host: Some(stable_host),
+            }
+            .serve(stable_bind),
+        );
+
+        let retain_host_1 = Arc::new(MemoryKvRangeHost::default());
+        let retain_engine_1 = MemoryKvEngine::default();
+        add_hosted_range_with_descriptor(
+            &retain_engine_1,
+            &retain_host_1,
+            greenmqtt_core::ReplicatedRangeDescriptor::new(
+                "retain-range-t1",
+                retain_shard.clone(),
+                greenmqtt_core::RangeBoundary::full(),
+                1,
+                1,
+                Some(7),
+                vec![greenmqtt_core::RangeReplica::new(
+                    7,
+                    greenmqtt_core::ReplicaRole::Voter,
+                    greenmqtt_core::ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ),
+            7,
+        )
+        .await;
+        let retain_server_1 = tokio::spawn(
+            greenmqtt_rpc::RpcRuntime {
+                sessiondict: Arc::new(SessionDictHandle::default()),
+                dist: Arc::new(DistHandle::default()),
+                inbox: Arc::new(InboxHandle::default()),
+                retain: Arc::new(RetainHandle::default()),
+                peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
+                assignment_registry: Some(registry.clone()),
+                range_host: Some(retain_host_1),
+            }
+            .serve(retain_bind_1),
+        );
+
+        let retain_host_2 = Arc::new(MemoryKvRangeHost::default());
+        let retain_engine_2 = MemoryKvEngine::default();
+        add_hosted_range_with_descriptor(
+            &retain_engine_2,
+            &retain_host_2,
+            greenmqtt_core::ReplicatedRangeDescriptor::new(
+                "retain-range-t1",
+                retain_shard.clone(),
+                greenmqtt_core::RangeBoundary::full(),
+                1,
+                1,
+                Some(9),
+                vec![greenmqtt_core::RangeReplica::new(
+                    9,
+                    greenmqtt_core::ReplicaRole::Voter,
+                    greenmqtt_core::ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ),
+            9,
+        )
+        .await;
+        let retain_server_2 = tokio::spawn(
+            greenmqtt_rpc::RpcRuntime {
+                sessiondict: Arc::new(SessionDictHandle::default()),
+                dist: Arc::new(DistHandle::default()),
+                inbox: Arc::new(InboxHandle::default()),
+                retain: Arc::new(RetainHandle::default()),
+                peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
+                assignment_registry: Some(registry.clone()),
+                range_host: Some(retain_host_2),
+            }
+            .serve(retain_bind_2),
+        );
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let previous_state_mode = std::env::var("GREENMQTT_STATE_MODE").ok();
+        let previous_metadata = std::env::var("GREENMQTT_METADATA_ENDPOINT").ok();
+        let previous_range = std::env::var("GREENMQTT_RANGE_ENDPOINT").ok();
+        std::env::set_var("GREENMQTT_STATE_MODE", "replicated");
+        std::env::set_var("GREENMQTT_METADATA_ENDPOINT", "http://127.0.0.1:50071");
+        std::env::set_var("GREENMQTT_RANGE_ENDPOINT", "http://127.0.0.1:50073");
+
+        let broker = Arc::new(BrokerRuntime::with_cluster(
+            BrokerConfig {
+                node_id: 1,
+                enable_tcp: true,
+                enable_tls: false,
+                enable_ws: false,
+                enable_wss: false,
+                enable_quic: false,
+                server_keep_alive_secs: None,
+                max_packet_size: None,
+                response_information: None,
+                server_reference: None,
+                audit_log_path: None,
+            },
+            AllowAllAuth,
+            AllowAllAcl,
+            NoopEventHook,
+            Arc::new(StaticPeerForwarder::default()),
+            configured_sessiondict_service(Arc::new(SessionDictHandle::default()), None)
+                .await
+                .unwrap(),
+            configured_dist_service(Arc::new(DistHandle::default()), None)
+                .await
+                .unwrap(),
+            configured_inbox_service(Arc::new(InboxHandle::default()), None)
+                .await
+                .unwrap(),
+            configured_retain_service(Arc::new(RetainHandle::default()), None)
+                .await
+                .unwrap(),
+        ));
+        let retain = configured_retain_service(Arc::new(RetainHandle::default()), None)
+            .await
+            .unwrap();
+
+        let publisher = broker
+            .connect(ConnectRequest {
+                identity: ClientIdentity {
+                    tenant_id: "t1".into(),
+                    user_id: "u1".into(),
+                    client_id: "pub".into(),
+                },
+                node_id: 1,
+                kind: SessionKind::Persistent,
+                clean_start: true,
+                session_expiry_interval_secs: None,
+            })
+            .await
+            .unwrap();
+        broker
+            .publish(
+                &publisher.session.session_id,
+                PublishRequest {
+                    topic: "devices/before/state".into(),
+                    payload: b"before".to_vec().into(),
+                    qos: 1,
+                    retain: true,
+                    properties: PublishProperties::default(),
+                },
+            )
+            .await
+            .unwrap();
+
+        registry
+            .upsert_range(greenmqtt_core::ReplicatedRangeDescriptor::new(
+                "retain-range-t1",
+                retain_shard,
+                greenmqtt_core::RangeBoundary::full(),
+                2,
+                2,
+                Some(9),
+                vec![greenmqtt_core::RangeReplica::new(
+                    9,
+                    greenmqtt_core::ReplicaRole::Voter,
+                    greenmqtt_core::ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ))
+            .await
+            .unwrap();
+        retain_server_1.abort();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let outcome = broker
+            .publish(
+                &publisher.session.session_id,
+                PublishRequest {
+                    topic: "devices/after/state".into(),
+                    payload: b"after".to_vec().into(),
+                    qos: 1,
+                    retain: true,
+                    properties: PublishProperties::default(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.matched_routes, 0);
+
+        assert_eq!(
+            retain
+                .lookup_topic("t1", "devices/after/state")
+                .await
+                .unwrap()
+                .unwrap()
+                .payload,
+            b"after".as_slice()
+        );
+
+        match previous_state_mode {
+            Some(value) => std::env::set_var("GREENMQTT_STATE_MODE", value),
+            None => std::env::remove_var("GREENMQTT_STATE_MODE"),
+        }
+        match previous_metadata {
+            Some(value) => std::env::set_var("GREENMQTT_METADATA_ENDPOINT", value),
+            None => std::env::remove_var("GREENMQTT_METADATA_ENDPOINT"),
+        }
+        match previous_range {
+            Some(value) => std::env::set_var("GREENMQTT_RANGE_ENDPOINT", value),
+            None => std::env::remove_var("GREENMQTT_RANGE_ENDPOINT"),
+        }
+
+        metadata_server.abort();
+        stable_server.abort();
+        retain_server_2.abort();
+    });
+}
+
+#[test]
+fn resolved_state_mode_falls_back_to_global_setting() {
+    with_env_var("GREENMQTT_STATE_MODE", Some("replicated"), || {
+        with_env_var("GREENMQTT_RETAIN_MODE", None, || {
+            assert_eq!(
+                resolved_state_mode("GREENMQTT_RETAIN_MODE").unwrap(),
+                StateMode::Replicated
+            );
+        })
+    });
+}
+
+#[test]
+fn resolved_state_mode_prefers_service_override_over_global_setting() {
+    with_env_var("GREENMQTT_STATE_MODE", Some("replicated"), || {
+        with_env_var("GREENMQTT_RETAIN_MODE", Some("legacy"), || {
+            assert_eq!(
+                resolved_state_mode("GREENMQTT_RETAIN_MODE").unwrap(),
+                StateMode::Legacy
+            );
+        })
     });
 }
 
@@ -353,8 +1385,9 @@ async fn durable_test_broker(
     PathBuf,
 ) {
     let data_dir = temp_data_dir(backend);
-    let (sessiondict, dist, inbox, retain) =
-        durable_services(data_dir.clone(), backend).await.unwrap();
+    let (sessiondict, dist, inbox, retain) = durable_services(data_dir.clone(), backend, 1)
+        .await
+        .unwrap();
     let broker = Arc::new(BrokerRuntime::with_plugins(
         BrokerConfig {
             node_id: 1,
@@ -378,6 +1411,113 @@ async fn durable_test_broker(
         retain,
     ));
     (broker, data_dir)
+}
+
+#[tokio::test]
+async fn rocksdb_durable_services_persist_via_range_scoped_engine() {
+    let data_dir = temp_data_dir("rocksdb-range-engine");
+    let (sessiondict, dist, inbox, retain) = durable_services(data_dir.clone(), "rocksdb", 1)
+        .await
+        .unwrap();
+
+    let identity = ClientIdentity {
+        tenant_id: "t1".into(),
+        user_id: "u1".into(),
+        client_id: "c1".into(),
+    };
+    sessiondict
+        .register(SessionRecord {
+            session_id: "s1".into(),
+            node_id: 1,
+            kind: SessionKind::Persistent,
+            identity: identity.clone(),
+            session_expiry_interval_secs: Some(60),
+            expires_at_ms: Some(1234),
+        })
+        .await
+        .unwrap();
+    dist.add_route(RouteRecord {
+        tenant_id: "t1".into(),
+        topic_filter: "devices/+/state".into(),
+        session_id: "s1".into(),
+        node_id: 1,
+        subscription_identifier: None,
+        no_local: false,
+        retain_as_published: false,
+        shared_group: None,
+        kind: SessionKind::Persistent,
+    })
+    .await
+    .unwrap();
+    inbox
+        .subscribe(Subscription {
+            session_id: "s1".into(),
+            tenant_id: "t1".into(),
+            topic_filter: "devices/+/state".into(),
+            qos: 1,
+            subscription_identifier: None,
+            no_local: false,
+            retain_as_published: false,
+            retain_handling: 0,
+            shared_group: None,
+            kind: SessionKind::Persistent,
+        })
+        .await
+        .unwrap();
+    inbox
+        .enqueue(OfflineMessage {
+            tenant_id: "t1".into(),
+            session_id: "s1".into(),
+            topic: "devices/a/state".into(),
+            payload: b"offline".to_vec().into(),
+            qos: 1,
+            retain: false,
+            from_session_id: "src".into(),
+            properties: PublishProperties::default(),
+        })
+        .await
+        .unwrap();
+    retain
+        .retain(greenmqtt_core::RetainedMessage {
+            tenant_id: "t1".into(),
+            topic: "devices/a/state".into(),
+            payload: b"up".to_vec().into(),
+            qos: 1,
+        })
+        .await
+        .unwrap();
+
+    drop(sessiondict);
+    drop(dist);
+    drop(inbox);
+    drop(retain);
+
+    assert!(data_dir.join("range-engine").exists());
+    assert!(!data_dir.join("sessions").exists());
+
+    let (sessiondict, dist, inbox, retain) = durable_services(data_dir.clone(), "rocksdb", 1)
+        .await
+        .unwrap();
+    assert!(sessiondict
+        .lookup_identity(&identity)
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        dist.match_topic("t1", &"devices/a/state".into())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(inbox.fetch(&"s1".into()).await.unwrap().len(), 1);
+    assert!(retain
+        .lookup_topic("t1", "devices/a/state")
+        .await
+        .unwrap()
+        .is_some());
+
+    let _ = std::fs::remove_dir_all(data_dir);
 }
 
 struct RedisTestServer {

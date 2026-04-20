@@ -14,7 +14,12 @@ service:
   type: ClusterIP
 
 greenmqtt:
-  storageBackend: redis
-  redisUrl: redis://greenmqtt-redis:6379/
+  storageBackend: memory
   extraEnv:
     GREENMQTT_PEERS: "1=http://greenmqtt-0.greenmqtt-headless:50051,2=http://greenmqtt-1.greenmqtt-headless:50051,3=http://greenmqtt-2.greenmqtt-headless:50051"
+
+storeTopology:
+  enabled: true
+  replicaCount: 1
+  greenmqtt:
+    storageBackend: rocksdb

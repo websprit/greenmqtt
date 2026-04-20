@@ -768,12 +768,16 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bytes",
  "greenmqtt-broker",
  "greenmqtt-core",
  "greenmqtt-dist",
  "greenmqtt-http-api",
  "greenmqtt-inbox",
  "greenmqtt-kv-client",
+ "greenmqtt-kv-engine",
+ "greenmqtt-kv-raft",
+ "greenmqtt-kv-server",
  "greenmqtt-plugin-api",
  "greenmqtt-retain",
  "greenmqtt-rpc",
@@ -795,6 +799,7 @@ dependencies = [
  "async-trait",
  "foca",
  "greenmqtt-core",
+ "greenmqtt-rpc",
  "serde",
  "tokio",
 ]
@@ -869,6 +874,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "greenmqtt-cluster",
  "greenmqtt-core",
  "greenmqtt-rpc",
  "tokio",
@@ -908,9 +914,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bincode",
  "bytes",
  "greenmqtt-core",
+ "rocksdb",
  "serde",
+ "tempfile",
  "tokio",
 ]
 
@@ -920,7 +929,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bincode",
+ "bytes",
  "greenmqtt-core",
+ "greenmqtt-kv-balance",
  "greenmqtt-kv-engine",
  "greenmqtt-kv-raft",
  "serde",
@@ -943,9 +955,11 @@ dependencies = [
 name = "greenmqtt-proto"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "bytes",
  "greenmqtt-core",
  "greenmqtt-kv-engine",
+ "greenmqtt-kv-raft",
  "prost",
  "protoc-bin-vendored",
  "tonic",

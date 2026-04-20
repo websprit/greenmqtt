@@ -211,8 +211,11 @@ where
         let Some(window_ms) = self.connect_debounce_window_ms else {
             return false;
         };
-        let key = Self::will_identity_key(identity);
         let now = now_millis();
+        let minimum_allowed = now.saturating_sub(window_ms);
+        self.recent_connect_attempts
+            .prune_older_than(minimum_allowed);
+        let key = Self::will_identity_key(identity);
         let previous = self.recent_connect_attempts.get_copied(&key);
         self.recent_connect_attempts.insert(key, now);
         previous.is_some_and(|last| now.saturating_sub(last) < window_ms)

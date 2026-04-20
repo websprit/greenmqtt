@@ -198,8 +198,13 @@ impl ReplicatedSessionDictHandle {
         Self { router, executor }
     }
 
-    async fn tenant_routes(&self, tenant_id: &str) -> anyhow::Result<Vec<greenmqtt_kv_client::RangeRoute>> {
-        self.router.route_shard(&session_scan_shard(tenant_id)).await
+    async fn tenant_routes(
+        &self,
+        tenant_id: &str,
+    ) -> anyhow::Result<Vec<greenmqtt_kv_client::RangeRoute>> {
+        self.router
+            .route_shard(&session_scan_shard(tenant_id))
+            .await
     }
 
     async fn apply_grouped(
@@ -214,7 +219,9 @@ impl ReplicatedSessionDictHandle {
                 .router
                 .route_key(&shard, &mutation.key)
                 .await?
-                .ok_or_else(|| anyhow::anyhow!("no sessiondict range available for tenant {tenant_id}"))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!("no sessiondict range available for tenant {tenant_id}")
+                })?;
             grouped
                 .entry(route.descriptor.id.clone())
                 .or_default()
@@ -226,7 +233,10 @@ impl ReplicatedSessionDictHandle {
         Ok(())
     }
 
-    async fn scan_session_records_for_tenant(&self, tenant_id: &str) -> anyhow::Result<Vec<SessionRecord>> {
+    async fn scan_session_records_for_tenant(
+        &self,
+        tenant_id: &str,
+    ) -> anyhow::Result<Vec<SessionRecord>> {
         let mut records = Vec::new();
         for route in self.tenant_routes(tenant_id).await? {
             for (key, value) in self
@@ -252,11 +262,7 @@ impl ReplicatedSessionDictHandle {
             if descriptor.shard.kind != ServiceShardKind::SessionDict {
                 continue;
             }
-            for (key, value) in self
-                .executor
-                .scan(&descriptor.id, None, usize::MAX)
-                .await?
-            {
+            for (key, value) in self.executor.scan(&descriptor.id, None, usize::MAX).await? {
                 if key.starts_with(SESSION_KEY_PREFIX) {
                     records.push(decode_session_record(&value)?);
                 }
@@ -272,10 +278,7 @@ const SESSION_KEY_PREFIX: &[u8] = b"session\0";
 
 fn encoded_identity_key(identity: &ClientIdentity) -> Bytes {
     let mut key = Vec::with_capacity(
-        IDENTITY_KEY_PREFIX.len()
-            + identity.user_id.len()
-            + identity.client_id.len()
-            + 2,
+        IDENTITY_KEY_PREFIX.len() + identity.user_id.len() + identity.client_id.len() + 2,
     );
     key.extend_from_slice(IDENTITY_KEY_PREFIX);
     key.extend_from_slice(identity.user_id.as_bytes());
@@ -580,7 +583,8 @@ impl SessionDirectory for ReplicatedSessionDictHandle {
             key: encoded_session_key(&record.session_id),
             value: Some(encoded),
         });
-        self.apply_grouped(&record.identity.tenant_id, mutations).await?;
+        self.apply_grouped(&record.identity.tenant_id, mutations)
+            .await?;
         Ok(replaced)
     }
 
@@ -714,7 +718,8 @@ mod tests {
             limit: usize,
         ) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
             let range = self.engine.open_range(range_id).await?;
-            range.reader()
+            range
+                .reader()
                 .scan(&boundary.unwrap_or_else(RangeBoundary::full), limit)
                 .await
         }
@@ -851,6 +856,63 @@ mod tests {
         assert!(service.lookup_identity(&identity).await.unwrap().is_none());
         assert!(service.lookup_session("s1").await.unwrap().is_none());
         assert_eq!(service.session_count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn replicated_sessiondict_reapplying_same_record_keeps_single_session() {
+        let engine = MemoryKvEngine::default();
+        engine
+            .bootstrap(KvRangeBootstrap {
+                range_id: "session-range-idem".into(),
+                boundary: RangeBoundary::full(),
+            })
+            .await
+            .unwrap();
+        let router = Arc::new(MemoryKvRangeRouter::default());
+        router
+            .upsert(ReplicatedRangeDescriptor::new(
+                "session-range-idem",
+                session_scan_shard("t1"),
+                RangeBoundary::full(),
+                1,
+                1,
+                Some(1),
+                vec![RangeReplica::new(
+                    1,
+                    ReplicaRole::Voter,
+                    ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ))
+            .await
+            .unwrap();
+        let service = ReplicatedSessionDictHandle::new(
+            router,
+            Arc::new(LocalKvRangeExecutor {
+                engine: engine.clone(),
+            }),
+        );
+        let identity = ClientIdentity {
+            tenant_id: "t1".into(),
+            user_id: "u1".into(),
+            client_id: "c1".into(),
+        };
+        let record = SessionRecord {
+            session_id: "s1".into(),
+            node_id: 1,
+            kind: SessionKind::Persistent,
+            identity,
+            session_expiry_interval_secs: None,
+            expires_at_ms: None,
+        };
+
+        service.register(record.clone()).await.unwrap();
+        service.register(record).await.unwrap();
+
+        assert_eq!(service.list_sessions(Some("t1")).await.unwrap().len(), 1);
+        assert_eq!(service.session_count().await.unwrap(), 1);
     }
 
     #[test]

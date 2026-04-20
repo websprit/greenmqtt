@@ -7,10 +7,13 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+bincode = "1.3.3"
+bytes.workspace = true
 greenmqtt-core = { path = "../greenmqtt-core" }
+greenmqtt-kv-balance = { path = "../greenmqtt-kv-balance" }
 greenmqtt-kv-engine = { path = "../greenmqtt-kv-engine" }
 greenmqtt-kv-raft = { path = "../greenmqtt-kv-raft" }
 serde.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true

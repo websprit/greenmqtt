@@ -50,7 +50,7 @@ Naming rules:
   - [x] WAL / log storage
   - [x] checkpoint and snapshot read/write
   - [x] compaction hooks
-- [ ] Refactor current RocksDB business stores into range-scoped primitives instead of
+- [x] Refactor current RocksDB business stores into range-scoped primitives instead of
   exposing `RocksSessionStore`, `RocksRouteStore`, `RocksInboxStore`, and `RocksRetainStore`
   as the final abstraction.
 
@@ -73,48 +73,48 @@ Naming rules:
 
 ## Phase 4: Cluster and Balancing
 
-- [ ] Upgrade `greenmqtt-cluster` from membership shell to real cluster control:
-  - [ ] service advertisement
-  - [ ] node lifecycle transitions
-  - [ ] failure detection integration
-  - [ ] store join/leave workflows
-- [ ] Add continuous balancing control similar to a base-kv balancer layer:
-  - [ ] bootstrap
-  - [ ] replica count balancing
-  - [ ] leader balancing
-  - [ ] split and merge
-  - [ ] unreachable replica cleanup
-  - [ ] recovery balancing
+- [x] Upgrade `greenmqtt-cluster` from membership shell to real cluster control:
+  - [x] service advertisement
+  - [x] node lifecycle transitions
+  - [x] failure detection integration
+  - [x] store join/leave workflows
+- [x] Add continuous balancing control similar to a base-kv balancer layer:
+  - [x] bootstrap
+  - [x] replica count balancing
+  - [x] leader balancing
+  - [x] split and merge
+  - [x] unreachable replica cleanup
+  - [x] recovery balancing
 
 ## Phase 5: Service Migration
 
-- [ ] Migrate `retain` onto replicated ranges first.
-- [ ] Migrate `dist` onto replicated ranges next.
-- [ ] Migrate `sessiondict` onto replicated ranges.
-- [ ] Migrate `inbox` and inflight tracking last.
-- [ ] Preserve existing service-facing traits as facades during transition, then simplify.
+- [x] Migrate `retain` onto replicated ranges first.
+- [x] Migrate `dist` onto replicated ranges next.
+- [x] Migrate `sessiondict` onto replicated ranges.
+- [x] Migrate `inbox` and inflight tracking last.
+- [x] Preserve existing service-facing traits as facades during transition, then simplify.
 
 ## Phase 6: Broker Refactor
 
-- [ ] Make broker depend on service clients only, not local durable implementations.
-- [ ] Remove direct assumptions that durable state is local.
-- [ ] Route mutation requests to range leaders.
-- [ ] Restrict local state to:
-  - [ ] live connections
-  - [ ] transient send queues
-  - [ ] short-lived admission and quota tracking
+- [x] Make broker depend on service clients only, not local durable implementations.
+- [x] Remove direct assumptions that durable state is local.
+- [x] Route mutation requests to range leaders.
+- [x] Restrict local state to:
+  - [x] live connections
+  - [x] transient send queues
+  - [x] short-lived admission and quota tracking
 
 ## Phase 7: Verification and Operations
 
-- [ ] Add tests for:
-  - [ ] three-replica write commit semantics
-  - [ ] leader failover
-  - [ ] node restart recovery
-  - [ ] snapshot restore
-  - [ ] range split / merge
-  - [ ] broker reconnect after leader move
-- [ ] Extend Helm and local-k8s deployment to model store topology separately from broker topology.
-- [ ] Remove Redis as the default multi-node shared state path only after replicated ranges
+ - [x] Add tests for:
+  - [x] three-replica write commit semantics
+  - [x] leader failover
+  - [x] node restart recovery
+  - [x] snapshot restore
+  - [x] range split / merge
+  - [x] broker reconnect after leader move
+- [x] Extend Helm and local-k8s deployment to model store topology separately from broker topology.
+- [x] Remove Redis as the default multi-node shared state path only after replicated ranges
   cover all four state services.
 
 ## Current Status Notes
@@ -135,8 +135,9 @@ Naming rules:
 - `greenmqtt-rpc` now exposes gRPC metadata APIs plus generic range get/scan/apply/checkpoint/snapshot
   RPCs backed by the in-memory range host.
 - `greenmqtt-kv-balance` now provides a minimal metadata controller that can bootstrap missing
-  ranges, fail over assignments from offline members, and persist balancer state through the
-  control-plane registry.
+  ranges, reconcile replica counts, rebalance leaders, clean unreachable replicas, recover
+  leader-less ranges, split and merge adjacent ranges, fail over assignments from offline
+  members, and persist balancer state through the control-plane registry.
 - `greenmqtt-retain` now includes a range-backed retain implementation that works over both
   local executors and the gRPC kv-range executor, and CLI/runtime wiring now supports an opt-in
   replicated retain mode while legacy retain remains the default.
@@ -147,4 +148,42 @@ Naming rules:
   remains the default.
 - `greenmqtt-inbox` now includes a range-backed inbox/inflight implementation, and CLI/runtime
   wiring now supports an opt-in replicated inbox mode while legacy inbox remains the default.
+- `greenmqtt-cluster` now has a minimal coordinator that advertises local services, applies
+  failure-detector membership changes into the control-plane registry, updates local lifecycle
+  state, and can trigger join/leave workflows through the balance controller.
+- CLI/runtime service selection now supports a shared `GREENMQTT_STATE_MODE` with per-service
+  overrides, and that precedence is now covered by tests, which reduces the work needed to flip
+  the default broker path to replicated services.
+- A CLI integration test now proves that all four durable services can run together under
+  `GREENMQTT_STATE_MODE=replicated` against a single metadata plus kv-range endpoint.
+- `greenmqtt-kv-client` now has a leader-routed kv-range executor that resolves member endpoints
+  from metadata and falls back to a direct range endpoint only when routing metadata is absent.
+- `greenmqtt-rpc` metadata service now exposes cluster member CRUD/list operations, and a restart
+  test now proves that persisted member plus range routing survives process restart.
+- A broker integration test now proves that `BrokerRuntime` can run end-to-end on replicated
+  service clients under `GREENMQTT_STATE_MODE=replicated`, instead of depending on local durable
+  state implementations.
+- CLI integration tests now also prove that a replicated retain client survives leader failover,
+  and that a broker using replicated service clients can continue publishing retained messages
+  after the retain leader moves to a new node and the old node goes away.
+- `greenmqtt-retain` now has a replicated-range test that exercises split routing, merges the two
+  ranges back into a single merged range, and verifies retained lookups still work afterwards.
+- `greenmqtt-kv-engine` now supports restoring a range from a snapshot for both memory and
+  RocksDB engines, and `greenmqtt-retain` now has a replicated-range test proving a restored
+  snapshot range can still serve retained lookups after the router switches over.
+- The `greenmqtt-cli` rocksdb backend now boots a local `RocksDbKvEngine` and serves
+  `sessiondict/dist/inbox/retain` through replicated service facades over fixed local ranges,
+  instead of wiring the old `Rocks*Store` business adapters into the broker path. A guard now
+  rejects legacy-only rocksdb directory layouts instead of silently reading empty state.
+- `greenmqtt-cli` now supports a `state-serve` mode that exposes state RPC without starting a
+  broker or MQTT listeners. The Helm chart now has optional `storeTopology` rendering for a
+  dedicated store StatefulSet and store Service, and the local 3-node k8s values now default to
+  a broker topology backed by a separate RocksDB store pod instead of Redis.
+- `MemoryRaftNode` now simulates quorum-gated commit progression for multi-voter clusters instead
+  of committing immediately on `propose`, and `greenmqtt-kv-raft` now has a test proving a
+  three-replica cluster only advances commit index after a majority acknowledgement.
+- `greenmqtt-broker` now exposes a `LocalHotStateBreakdown` that explicitly counts only live
+  connections, transient send-queue entries, and short-lived tracking markers. The debounce window
+  now prunes stale recent-connect markers so that local admission tracking stays bounded, and
+  broker tests now prove durable service records do not appear in local hot-state accounting.
 - RocksDB-backed range engine and real replicated raft behavior remain unfinished.

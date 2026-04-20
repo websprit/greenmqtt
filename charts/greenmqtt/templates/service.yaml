@@ -12,6 +12,7 @@ spec:
   type: {{ .Values.service.type }}
   selector:
     {{- include "greenmqtt.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: broker
   ports:
     - name: mqtt
       port: {{ .Values.service.mqtt.port }}
@@ -50,6 +51,7 @@ spec:
   publishNotReadyAddresses: true
   selector:
     {{- include "greenmqtt.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: broker
   ports:
     - name: mqtt
       port: {{ .Values.service.mqtt.port }}

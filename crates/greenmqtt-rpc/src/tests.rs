@@ -1,26 +1,31 @@
 use crate::{
     DistGrpcClient, InboxGrpcClient, KvRangeGrpcClient, MetadataGrpcClient, NoopDeliverySink,
-    PeriodicAntiEntropyReconciler, PersistentMetadataRegistry, RetainGrpcClient, RpcRuntime,
-    SessionDictGrpcClient, StaticPeerForwarder,
+    PeriodicAntiEntropyReconciler, PersistentMetadataRegistry, RaftTransportGrpcClient,
+    RetainGrpcClient, RpcRuntime, SessionDictGrpcClient, StaticPeerForwarder,
     StaticServiceEndpointRegistry,
 };
 use greenmqtt_broker::{BrokerConfig, BrokerRuntime, DefaultBroker, PeerRegistry};
 use greenmqtt_core::{
     BalancerState, BalancerStateRegistry, ClientIdentity, ClusterMembershipRegistry,
-    ClusterNodeLifecycle, ClusterNodeMembership, ConnectRequest, InflightMessage,
-    OfflineMessage, PublishProperties, PublishRequest, RangeBoundary, RangeReplica,
-    ReplicaRole, ReplicaSyncState, ReplicatedRangeDescriptor, ReplicatedRangeRegistry,
-    RetainedMessage, RouteRecord, ServiceEndpoint, ServiceEndpointRegistry, ServiceKind,
-    ServiceShardAssignment, ServiceShardKey, ServiceShardKind, ServiceShardLifecycle,
-    ServiceShardRecoveryControl, ServiceShardTransition, SessionKind, SessionRecord, Subscription,
+    ClusterNodeLifecycle, ClusterNodeMembership, ConnectRequest, InflightMessage, OfflineMessage,
+    PublishProperties, PublishRequest, RangeBoundary, RangeReplica, ReplicaRole, ReplicaSyncState,
+    ReplicatedRangeDescriptor, ReplicatedRangeRegistry, RetainedMessage, RouteRecord,
+    ServiceEndpoint, ServiceEndpointRegistry, ServiceKind, ServiceShardAssignment, ServiceShardKey,
+    ServiceShardKind, ServiceShardLifecycle, ServiceShardRecoveryControl, ServiceShardTransition,
+    SessionKind, SessionRecord, Subscription,
 };
 use greenmqtt_dist::{DistHandle, DistRouter};
 use greenmqtt_inbox::PersistentInboxHandle;
 use greenmqtt_inbox::{InboxHandle, InboxService};
 use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter, MemoryKvRangeRouter};
-use greenmqtt_kv_engine::{KvEngine, KvMutation, KvRangeBootstrap, MemoryKvEngine, RocksDbKvEngine};
+use greenmqtt_kv_engine::{
+    KvEngine, KvMutation, KvRangeBootstrap, MemoryKvEngine, RocksDbKvEngine,
+};
+use greenmqtt_kv_raft::{
+    AppendEntriesRequest, AppendEntriesResponse, MemoryRaftNode, MemoryRaftStateStore, RaftMessage,
+    RaftNode, RaftStateStore, RequestVoteResponse,
+};
 use greenmqtt_kv_server::{HostedRange, KvRangeHost, MemoryKvRangeHost};
-use greenmqtt_kv_raft::{MemoryRaftNode, RaftClusterConfig, RaftNode};
 use greenmqtt_plugin_api::{AllowAllAcl, AllowAllAuth, NoopEventHook};
 use greenmqtt_proto::internal::{
     dist_service_client::DistServiceClient, inbox_service_client::InboxServiceClient,
@@ -331,6 +336,19 @@ async fn grpc_round_trip_for_metadata_service() {
     let client = MetadataGrpcClient::connect("http://127.0.0.1:50062")
         .await
         .unwrap();
+    client
+        .upsert_member(ClusterNodeMembership::new(
+            7,
+            1,
+            ClusterNodeLifecycle::Serving,
+            vec![ServiceEndpoint::new(
+                ServiceKind::Retain,
+                7,
+                "http://127.0.0.1:50062",
+            )],
+        ))
+        .await
+        .unwrap();
     let shard = ServiceShardKey::retain("t1");
     client
         .upsert_range(ReplicatedRangeDescriptor::new(
@@ -372,10 +390,113 @@ async fn grpc_round_trip_for_metadata_service() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].config_version, 2);
 
+    let members = client.list_members().await.unwrap();
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].node_id, 7);
+    assert_eq!(
+        client.lookup_member(7).await.unwrap().unwrap().endpoints[0].kind,
+        ServiceKind::Retain
+    );
+
     let states = client.list_balancer_states().await.unwrap();
     assert_eq!(states["replica-count"].load_rules["target_voters"], "3");
 
     server.abort();
+}
+
+#[tokio::test]
+async fn metadata_service_restores_members_and_ranges_after_restart() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let bind = "127.0.0.1:50100".parse().unwrap();
+    let server = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: Some(Arc::new(
+                PersistentMetadataRegistry::open(tempdir.path())
+                    .await
+                    .unwrap(),
+            )),
+            range_host: None,
+        }
+        .serve(bind),
+    );
+    sleep(Duration::from_millis(50)).await;
+
+    let client = MetadataGrpcClient::connect("http://127.0.0.1:50100")
+        .await
+        .unwrap();
+    client
+        .upsert_member(ClusterNodeMembership::new(
+            7,
+            1,
+            ClusterNodeLifecycle::Serving,
+            vec![ServiceEndpoint::new(
+                ServiceKind::Retain,
+                7,
+                "http://127.0.0.1:50100",
+            )],
+        ))
+        .await
+        .unwrap();
+    client
+        .upsert_range(ReplicatedRangeDescriptor::new(
+            "retain-range-1",
+            ServiceShardKey::retain("t1"),
+            RangeBoundary::full(),
+            1,
+            1,
+            Some(7),
+            vec![RangeReplica::new(
+                7,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ))
+        .await
+        .unwrap();
+
+    server.abort();
+    sleep(Duration::from_millis(50)).await;
+
+    let restarted = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: Some(Arc::new(
+                PersistentMetadataRegistry::open(tempdir.path())
+                    .await
+                    .unwrap(),
+            )),
+            range_host: None,
+        }
+        .serve(bind),
+    );
+    sleep(Duration::from_millis(50)).await;
+
+    let restarted_client = MetadataGrpcClient::connect("http://127.0.0.1:50100")
+        .await
+        .unwrap();
+    let member = restarted_client.lookup_member(7).await.unwrap().unwrap();
+    assert_eq!(member.endpoints[0].kind, ServiceKind::Retain);
+    let routed = restarted_client
+        .route_range(&ServiceShardKey::retain("t1"), b"metric")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(routed.id, "retain-range-1");
+    assert_eq!(routed.leader_node_id, Some(7));
+
+    restarted.abort();
 }
 
 #[tokio::test]
@@ -391,16 +512,9 @@ async fn grpc_round_trip_for_kv_range_service() {
         .unwrap();
     let host = Arc::new(MemoryKvRangeHost::default());
     let range = engine.open_range("range-1").await.unwrap();
-    let raft_impl = Arc::new(MemoryRaftNode::new(
-        1,
-        "range-1",
-        RaftClusterConfig {
-            voters: vec![1, 2, 3],
-            learners: Vec::new(),
-        },
-    ));
+    let raft_impl = Arc::new(MemoryRaftNode::single_node(1, "range-1"));
     raft_impl.recover().await.unwrap();
-    let raft: Arc<dyn RaftNode> = raft_impl;
+    let raft: Arc<dyn RaftNode> = raft_impl.clone();
     host.add_range(HostedRange {
         descriptor: ReplicatedRangeDescriptor::new(
             "range-1",
@@ -409,10 +523,11 @@ async fn grpc_round_trip_for_kv_range_service() {
             1,
             1,
             Some(1),
-            vec![
-                RangeReplica::new(1, ReplicaRole::Voter, ReplicaSyncState::Replicating),
-                RangeReplica::new(2, ReplicaRole::Voter, ReplicaSyncState::Replicating),
-            ],
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
             0,
             0,
             ServiceShardLifecycle::Serving,
@@ -455,6 +570,9 @@ async fn grpc_round_trip_for_kv_range_service() {
         )
         .await
         .unwrap();
+    let status = raft_impl.status().await.unwrap();
+    assert_eq!(status.commit_index, 1);
+    assert_eq!(status.applied_index, 1);
 
     let mango = client.get("range-1", b"mango").await.unwrap().unwrap();
     assert_eq!(mango, b"yellow".as_slice());
@@ -492,14 +610,7 @@ async fn grpc_round_trip_for_kv_range_service_with_rocksdb_backend() {
         .unwrap();
     let host = Arc::new(MemoryKvRangeHost::default());
     let range = engine.open_range("range-r").await.unwrap();
-    let raft_impl = Arc::new(MemoryRaftNode::new(
-        1,
-        "range-r",
-        RaftClusterConfig {
-            voters: vec![1, 2, 3],
-            learners: Vec::new(),
-        },
-    ));
+    let raft_impl = Arc::new(MemoryRaftNode::single_node(1, "range-r"));
     raft_impl.recover().await.unwrap();
     let raft: Arc<dyn RaftNode> = raft_impl;
     host.add_range(HostedRange {
@@ -510,10 +621,11 @@ async fn grpc_round_trip_for_kv_range_service_with_rocksdb_backend() {
             1,
             1,
             Some(1),
-            vec![
-                RangeReplica::new(1, ReplicaRole::Voter, ReplicaSyncState::Replicating),
-                RangeReplica::new(2, ReplicaRole::Voter, ReplicaSyncState::Replicating),
-            ],
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
             0,
             0,
             ServiceShardLifecycle::Serving,
@@ -561,6 +673,380 @@ async fn grpc_round_trip_for_kv_range_service_with_rocksdb_backend() {
 }
 
 #[tokio::test]
+async fn kv_range_service_rejects_reads_from_follower_replica() {
+    let bind = "127.0.0.1:50101".parse().unwrap();
+    let engine = MemoryKvEngine::default();
+    engine
+        .bootstrap(KvRangeBootstrap {
+            range_id: "range-follower".into(),
+            boundary: RangeBoundary::full(),
+        })
+        .await
+        .unwrap();
+    let range = engine.open_range("range-follower").await.unwrap();
+    range
+        .writer()
+        .apply(vec![KvMutation {
+            key: b"alpha".as_slice().into(),
+            value: Some(b"one".as_slice().into()),
+        }])
+        .await
+        .unwrap();
+    let host = Arc::new(MemoryKvRangeHost::default());
+    let raft_impl = Arc::new(MemoryRaftNode::new(
+        2,
+        "range-follower",
+        greenmqtt_kv_raft::RaftClusterConfig {
+            voters: vec![1, 2, 3],
+            learners: Vec::new(),
+        },
+    ));
+    raft_impl.recover().await.unwrap();
+    let raft: Arc<dyn RaftNode> = raft_impl;
+    host.add_range(HostedRange {
+        descriptor: ReplicatedRangeDescriptor::new(
+            "range-follower",
+            ServiceShardKey::retain("t1"),
+            RangeBoundary::full(),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                2,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ),
+        raft,
+        space: Arc::from(range),
+    })
+    .await
+    .unwrap();
+    let server = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: None,
+            range_host: Some(host),
+        }
+        .serve(bind),
+    );
+    sleep(Duration::from_millis(50)).await;
+
+    let client = KvRangeGrpcClient::connect("http://127.0.0.1:50101")
+        .await
+        .unwrap();
+    assert!(client.get("range-follower", b"alpha").await.is_err());
+    assert!(client.scan("range-follower", None, 10).await.is_err());
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn kv_range_service_requires_leader_lease_for_reads() {
+    let bind = "127.0.0.1:50102".parse().unwrap();
+    let engine = MemoryKvEngine::default();
+    engine
+        .bootstrap(KvRangeBootstrap {
+            range_id: "range-lease".into(),
+            boundary: RangeBoundary::full(),
+        })
+        .await
+        .unwrap();
+    let range = engine.open_range("range-lease").await.unwrap();
+    range
+        .writer()
+        .apply(vec![KvMutation {
+            key: b"alpha".as_slice().into(),
+            value: Some(b"one".as_slice().into()),
+        }])
+        .await
+        .unwrap();
+    let host = Arc::new(MemoryKvRangeHost::default());
+    let raft_impl = Arc::new(MemoryRaftNode::new(
+        1,
+        "range-lease",
+        greenmqtt_kv_raft::RaftClusterConfig {
+            voters: vec![1, 2, 3],
+            learners: Vec::new(),
+        },
+    ));
+    raft_impl.recover().await.unwrap();
+    for _ in 0..8 {
+        raft_impl.tick().await.unwrap();
+    }
+    raft_impl
+        .receive(
+            2,
+            RaftMessage::RequestVoteResponse(RequestVoteResponse {
+                term: raft_impl.status().await.unwrap().current_term,
+                vote_granted: true,
+            }),
+        )
+        .await
+        .unwrap();
+    let raft: Arc<dyn RaftNode> = raft_impl.clone();
+    host.add_range(HostedRange {
+        descriptor: ReplicatedRangeDescriptor::new(
+            "range-lease",
+            ServiceShardKey::retain("t1"),
+            RangeBoundary::full(),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ),
+        raft,
+        space: Arc::from(range),
+    })
+    .await
+    .unwrap();
+    let server = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: None,
+            range_host: Some(host),
+        }
+        .serve(bind),
+    );
+    sleep(Duration::from_millis(50)).await;
+
+    let client = KvRangeGrpcClient::connect("http://127.0.0.1:50102")
+        .await
+        .unwrap();
+    assert!(client.get("range-lease", b"alpha").await.is_err());
+
+    raft_impl
+        .receive(
+            2,
+            RaftMessage::AppendEntriesResponse(AppendEntriesResponse {
+                term: raft_impl.status().await.unwrap().current_term,
+                success: true,
+                match_index: 0,
+            }),
+        )
+        .await
+        .unwrap();
+    let value = client.get("range-lease", b"alpha").await.unwrap().unwrap();
+    assert_eq!(value, b"one".as_slice());
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn grpc_round_trip_for_raft_transport_service() {
+    let bind = "127.0.0.1:50103".parse().unwrap();
+    let engine = MemoryKvEngine::default();
+    engine
+        .bootstrap(KvRangeBootstrap {
+            range_id: "range-transport".into(),
+            boundary: RangeBoundary::full(),
+        })
+        .await
+        .unwrap();
+    let range = engine.open_range("range-transport").await.unwrap();
+    let host = Arc::new(MemoryKvRangeHost::default());
+    let state_store = Arc::new(MemoryRaftStateStore::default());
+    let raft_impl = Arc::new(MemoryRaftNode::with_state_store(
+        2,
+        "range-transport",
+        greenmqtt_kv_raft::RaftClusterConfig {
+            voters: vec![1, 2, 3],
+            learners: Vec::new(),
+        },
+        state_store.clone(),
+    ));
+    raft_impl.recover().await.unwrap();
+    let raft: Arc<dyn RaftNode> = raft_impl.clone();
+    host.add_range(HostedRange {
+        descriptor: ReplicatedRangeDescriptor::new(
+            "range-transport",
+            ServiceShardKey::retain("t1"),
+            RangeBoundary::full(),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                2,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ),
+        raft,
+        space: Arc::from(range),
+    })
+    .await
+    .unwrap();
+    let server = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: None,
+            range_host: Some(host),
+        }
+        .serve(bind),
+    );
+    sleep(Duration::from_millis(50)).await;
+
+    let client = RaftTransportGrpcClient::connect("http://127.0.0.1:50103")
+        .await
+        .unwrap();
+    client
+        .send(
+            "range-transport",
+            1,
+            &RaftMessage::AppendEntries(AppendEntriesRequest {
+                term: 1,
+                leader_id: 1,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![greenmqtt_kv_raft::RaftLogEntry {
+                    term: 1,
+                    index: 1,
+                    command: b"put:a".as_slice().into(),
+                }],
+                leader_commit: 1,
+            }),
+        )
+        .await
+        .unwrap();
+
+    let persisted = state_store.load("range-transport").await.unwrap().unwrap();
+    assert_eq!(persisted.current_term, 1);
+    assert_eq!(persisted.commit_index, 1);
+    assert_eq!(persisted.log.len(), 1);
+    let outbound = raft_impl.drain_outbox().await.unwrap();
+    assert!(outbound.iter().any(|message| matches!(
+        &message.message,
+        RaftMessage::AppendEntriesResponse(AppendEntriesResponse {
+            success: true,
+            match_index: 1,
+            ..
+        })
+    )));
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn raft_transport_service_delivers_install_snapshot_messages() {
+    let bind = "127.0.0.1:50104".parse().unwrap();
+    let engine = MemoryKvEngine::default();
+    engine
+        .bootstrap(KvRangeBootstrap {
+            range_id: "range-transport-snapshot".into(),
+            boundary: RangeBoundary::full(),
+        })
+        .await
+        .unwrap();
+    let range = engine.open_range("range-transport-snapshot").await.unwrap();
+    let host = Arc::new(MemoryKvRangeHost::default());
+    let state_store = Arc::new(MemoryRaftStateStore::default());
+    let raft_impl = Arc::new(MemoryRaftNode::with_state_store(
+        2,
+        "range-transport-snapshot",
+        greenmqtt_kv_raft::RaftClusterConfig {
+            voters: vec![1, 2, 3],
+            learners: Vec::new(),
+        },
+        state_store.clone(),
+    ));
+    raft_impl.recover().await.unwrap();
+    let raft: Arc<dyn RaftNode> = raft_impl.clone();
+    host.add_range(HostedRange {
+        descriptor: ReplicatedRangeDescriptor::new(
+            "range-transport-snapshot",
+            ServiceShardKey::retain("t1"),
+            RangeBoundary::full(),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                2,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ),
+        raft,
+        space: Arc::from(range),
+    })
+    .await
+    .unwrap();
+    let server = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: None,
+            range_host: Some(host),
+        }
+        .serve(bind),
+    );
+    sleep(Duration::from_millis(50)).await;
+
+    let client = RaftTransportGrpcClient::connect("http://127.0.0.1:50104")
+        .await
+        .unwrap();
+    client
+        .send(
+            "range-transport-snapshot",
+            1,
+            &RaftMessage::InstallSnapshot(greenmqtt_kv_raft::InstallSnapshotRequest {
+                term: 5,
+                leader_id: 1,
+                snapshot: greenmqtt_kv_raft::RaftSnapshot {
+                    range_id: "range-transport-snapshot".into(),
+                    term: 5,
+                    index: 7,
+                    payload: b"snapshot".as_slice().into(),
+                },
+            }),
+        )
+        .await
+        .unwrap();
+
+    let persisted = state_store
+        .load("range-transport-snapshot")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.current_term, 5);
+    assert_eq!(persisted.commit_index, 7);
+    assert_eq!(persisted.applied_index, 7);
+    assert!(persisted.latest_snapshot.is_some());
+
+    server.abort();
+}
+
+#[tokio::test]
 async fn replicated_retain_can_use_kv_range_grpc_executor() {
     let bind = "127.0.0.1:50065".parse().unwrap();
     let engine = MemoryKvEngine::default();
@@ -573,14 +1059,7 @@ async fn replicated_retain_can_use_kv_range_grpc_executor() {
         .unwrap();
     let host = Arc::new(MemoryKvRangeHost::default());
     let range = engine.open_range("retain-range-1").await.unwrap();
-    let raft_impl = Arc::new(MemoryRaftNode::new(
-        1,
-        "retain-range-1",
-        RaftClusterConfig {
-            voters: vec![1, 2, 3],
-            learners: Vec::new(),
-        },
-    ));
+    let raft_impl = Arc::new(MemoryRaftNode::single_node(1, "retain-range-1"));
     raft_impl.recover().await.unwrap();
     let raft: Arc<dyn RaftNode> = raft_impl;
     host.add_range(HostedRange {
@@ -638,8 +1117,11 @@ async fn replicated_retain_can_use_kv_range_grpc_executor() {
         ))
         .await
         .unwrap();
-    let executor: Arc<dyn KvRangeExecutor> =
-        Arc::new(KvRangeGrpcClient::connect("http://127.0.0.1:50065").await.unwrap());
+    let executor: Arc<dyn KvRangeExecutor> = Arc::new(
+        KvRangeGrpcClient::connect("http://127.0.0.1:50065")
+            .await
+            .unwrap(),
+    );
     let retain = ReplicatedRetainHandle::new(router, executor);
 
     retain
@@ -651,7 +1133,11 @@ async fn replicated_retain_can_use_kv_range_grpc_executor() {
         })
         .await
         .unwrap();
-    let retained = retain.lookup_topic("t1", "metrics/cpu").await.unwrap().unwrap();
+    let retained = retain
+        .lookup_topic("t1", "metrics/cpu")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(retained.payload, b"high".as_slice());
     assert_eq!(retain.match_topic("t1", "#").await.unwrap().len(), 1);
 
@@ -812,7 +1298,7 @@ async fn brokers_forward_cross_node_deliveries_over_grpc() {
             retain: broker1.retain.clone(),
             peer_sink: broker1.clone(),
             assignment_registry: None,
-        range_host: None,
+            range_host: None,
         }
         .serve(peer_bind_1),
     );
@@ -824,7 +1310,7 @@ async fn brokers_forward_cross_node_deliveries_over_grpc() {
             retain: broker2.retain.clone(),
             peer_sink: broker2.clone(),
             assignment_registry: None,
-        range_host: None,
+            range_host: None,
         }
         .serve(peer_bind_2),
     );
@@ -1215,7 +1701,11 @@ async fn persistent_metadata_registry_restores_assignments_ranges_and_balancer_s
     let reopened = PersistentMetadataRegistry::open(tempdir.path())
         .await
         .unwrap();
-    assert!(reopened.resolve_assignment(&ServiceShardKey::dist("t1")).await.unwrap().is_some());
+    assert!(reopened
+        .resolve_assignment(&ServiceShardKey::dist("t1"))
+        .await
+        .unwrap()
+        .is_some());
     assert!(reopened.resolve_range("range-a").await.unwrap().is_some());
     assert_eq!(
         reopened
@@ -1611,7 +2101,7 @@ async fn move_tenant_shard_via_registry_transfers_routes_and_updates_owner() {
             retain: Arc::new(RetainHandle::default()),
             peer_sink: Arc::new(NoopDeliverySink),
             assignment_registry: None,
-        range_host: None,
+            range_host: None,
         }
         .serve(bind1),
     );
@@ -1623,7 +2113,7 @@ async fn move_tenant_shard_via_registry_transfers_routes_and_updates_owner() {
             retain: Arc::new(RetainHandle::default()),
             peer_sink: Arc::new(NoopDeliverySink),
             assignment_registry: None,
-        range_host: None,
+            range_host: None,
         }
         .serve(bind2),
     );
@@ -1725,7 +2215,7 @@ async fn move_sessiondict_shard_via_registry_transfers_sessions_and_updates_owne
             retain: Arc::new(RetainHandle::default()),
             peer_sink: Arc::new(NoopDeliverySink),
             assignment_registry: None,
-        range_host: None,
+            range_host: None,
         }
         .serve(bind1),
     );
@@ -1737,7 +2227,7 @@ async fn move_sessiondict_shard_via_registry_transfers_sessions_and_updates_owne
             retain: Arc::new(RetainHandle::default()),
             peer_sink: Arc::new(NoopDeliverySink),
             assignment_registry: None,
-        range_host: None,
+            range_host: None,
         }
         .serve(bind2),
     );
@@ -1842,7 +2332,7 @@ async fn move_inbox_shard_via_registry_transfers_subscription_offline_and_inflig
             retain: Arc::new(RetainHandle::default()),
             peer_sink: Arc::new(NoopDeliverySink),
             assignment_registry: None,
-        range_host: None,
+            range_host: None,
         }
         .serve(bind1),
     );
@@ -1854,7 +2344,7 @@ async fn move_inbox_shard_via_registry_transfers_subscription_offline_and_inflig
             retain: Arc::new(RetainHandle::default()),
             peer_sink: Arc::new(NoopDeliverySink),
             assignment_registry: None,
-        range_host: None,
+            range_host: None,
         }
         .serve(bind2),
     );
@@ -2004,7 +2494,7 @@ async fn move_inbox_shard_preserves_messages_at_least_once_during_concurrent_enq
             retain: Arc::new(RetainHandle::default()),
             peer_sink: Arc::new(NoopDeliverySink),
             assignment_registry: None,
-        range_host: None,
+            range_host: None,
         }
         .serve(bind1),
     );
@@ -2016,7 +2506,7 @@ async fn move_inbox_shard_preserves_messages_at_least_once_during_concurrent_enq
             retain: Arc::new(RetainHandle::default()),
             peer_sink: Arc::new(NoopDeliverySink),
             assignment_registry: None,
-        range_host: None,
+            range_host: None,
         }
         .serve(bind2),
     );
@@ -2143,7 +2633,7 @@ async fn move_inbox_shard_survives_source_restart_mid_transfer() {
             retain: Arc::new(RetainHandle::default()),
             peer_sink: Arc::new(NoopDeliverySink),
             assignment_registry: None,
-        range_host: None,
+            range_host: None,
         }
         .serve(bind1),
     );
@@ -2155,7 +2645,7 @@ async fn move_inbox_shard_survives_source_restart_mid_transfer() {
             retain: Arc::new(RetainHandle::default()),
             peer_sink: Arc::new(NoopDeliverySink),
             assignment_registry: None,
-        range_host: None,
+            range_host: None,
         }
         .serve(bind2),
     );
@@ -2269,7 +2759,7 @@ async fn catch_up_inbox_shard_via_registry_restores_state_and_verifies_checksum(
             retain: Arc::new(RetainHandle::default()),
             peer_sink: Arc::new(NoopDeliverySink),
             assignment_registry: None,
-        range_host: None,
+            range_host: None,
         }
         .serve(bind1),
     );
@@ -2281,7 +2771,7 @@ async fn catch_up_inbox_shard_via_registry_restores_state_and_verifies_checksum(
             retain: Arc::new(RetainHandle::default()),
             peer_sink: Arc::new(NoopDeliverySink),
             assignment_registry: None,
-        range_host: None,
+            range_host: None,
         }
         .serve(bind2),
     );
@@ -2409,7 +2899,7 @@ async fn catch_up_sessiondict_shard_state_survives_restart_via_storage() {
             retain: Arc::new(RetainHandle::default()),
             peer_sink: Arc::new(NoopDeliverySink),
             assignment_registry: None,
-        range_host: None,
+            range_host: None,
         }
         .serve(bind1),
     );
@@ -2425,7 +2915,7 @@ async fn catch_up_sessiondict_shard_state_survives_restart_via_storage() {
             retain: Arc::new(RetainHandle::default()),
             peer_sink: Arc::new(NoopDeliverySink),
             assignment_registry: None,
-        range_host: None,
+            range_host: None,
         }
         .serve(bind2),
     );
@@ -2527,7 +3017,7 @@ async fn catch_up_inbox_shard_state_survives_restart_via_storage() {
             retain: Arc::new(RetainHandle::default()),
             peer_sink: Arc::new(NoopDeliverySink),
             assignment_registry: None,
-        range_host: None,
+            range_host: None,
         }
         .serve(bind1),
     );
@@ -2543,7 +3033,7 @@ async fn catch_up_inbox_shard_state_survives_restart_via_storage() {
             retain: Arc::new(RetainHandle::default()),
             peer_sink: Arc::new(NoopDeliverySink),
             assignment_registry: None,
-        range_host: None,
+            range_host: None,
         }
         .serve(bind2),
     );
@@ -2682,7 +3172,7 @@ async fn catch_up_inbox_shard_survives_target_restart_mid_recovery() {
             retain: Arc::new(RetainHandle::default()),
             peer_sink: Arc::new(NoopDeliverySink),
             assignment_registry: None,
-        range_host: None,
+            range_host: None,
         }
         .serve(bind1),
     );
@@ -2698,7 +3188,7 @@ async fn catch_up_inbox_shard_survives_target_restart_mid_recovery() {
             retain: Arc::new(RetainHandle::default()),
             peer_sink: Arc::new(NoopDeliverySink),
             assignment_registry: None,
-        range_host: None,
+            range_host: None,
         }
         .serve(bind2),
     );
@@ -2795,7 +3285,7 @@ async fn catch_up_inbox_shard_survives_target_restart_mid_recovery() {
             retain: Arc::new(RetainHandle::default()),
             peer_sink: Arc::new(NoopDeliverySink),
             assignment_registry: None,
-        range_host: None,
+            range_host: None,
         }
         .serve(bind2),
     );
@@ -2838,7 +3328,7 @@ async fn anti_entropy_repair_tenant_shard_via_registry_reconciles_target_routes(
             retain: Arc::new(RetainHandle::default()),
             peer_sink: Arc::new(NoopDeliverySink),
             assignment_registry: None,
-        range_host: None,
+            range_host: None,
         }
         .serve(bind1),
     );
@@ -2850,7 +3340,7 @@ async fn anti_entropy_repair_tenant_shard_via_registry_reconciles_target_routes(
             retain: Arc::new(RetainHandle::default()),
             peer_sink: Arc::new(NoopDeliverySink),
             assignment_registry: None,
-        range_host: None,
+            range_host: None,
         }
         .serve(bind2),
     );

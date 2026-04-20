@@ -105,3 +105,45 @@ greenmqtt:
   maxPacketSize: null
   extraEnv: {}
   extraEnvFrom: []
+
+storeTopology:
+  enabled: false
+  replicaCount: 1
+  nodeIdBase: 1001
+  persistence:
+    enabled: true
+    accessModes:
+      - ReadWriteOnce
+    size: 10Gi
+    storageClass: ""
+    mountPath: /var/lib/greenmqtt-state
+  service:
+    type: ClusterIP
+    annotations: {}
+    headlessAnnotations: {}
+    rpc:
+      port: 50051
+      targetPort: 50051
+      protocol: TCP
+      nodePort: null
+  readinessProbe:
+    tcpSocket:
+      port: rpc
+    initialDelaySeconds: 5
+    periodSeconds: 10
+  livenessProbe:
+    tcpSocket:
+      port: rpc
+    initialDelaySeconds: 10
+    periodSeconds: 10
+  startupProbe:
+    tcpSocket:
+      port: rpc
+    failureThreshold: 30
+    periodSeconds: 5
+  greenmqtt:
+    dataDir: /var/lib/greenmqtt-state/data
+    storageBackend: rocksdb
+    rpcBind: 0.0.0.0:50051
+    extraEnv: {}
+    extraEnvFrom: []

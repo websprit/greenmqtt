@@ -1,21 +1,23 @@
+{{- if .Values.storeTopology.enabled }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: {{ include "greenmqtt.fullname" . }}
+  name: {{ include "greenmqtt.storeFullname" . }}
   labels:
     {{- include "greenmqtt.labels" . | nindent 4 }}
+    app.kubernetes.io/component: store
 spec:
-  serviceName: {{ include "greenmqtt.headlessServiceName" . }}
-  replicas: {{ .Values.replicaCount }}
+  serviceName: {{ include "greenmqtt.storeHeadlessServiceName" . }}
+  replicas: {{ .Values.storeTopology.replicaCount }}
   selector:
     matchLabels:
       {{- include "greenmqtt.selectorLabels" . | nindent 6 }}
-      app.kubernetes.io/component: broker
+      app.kubernetes.io/component: store
   template:
     metadata:
       labels:
         {{- include "greenmqtt.selectorLabels" . | nindent 8 }}
-        app.kubernetes.io/component: broker
+        app.kubernetes.io/component: store
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -33,13 +35,13 @@ spec:
       securityContext:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- if not .Values.persistence.enabled }}
+      {{- if not .Values.storeTopology.persistence.enabled }}
       volumes:
         - name: data
           emptyDir: {}
       {{- end }}
       containers:
-        - name: greenmqtt
+        - name: greenmqtt-state
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command:
@@ -49,41 +51,35 @@ spec:
             - |
               ordinal="${HOSTNAME##*-}"
               case "${ordinal}" in
-                ''|*[!0-9]*) export GREENMQTT_NODE_ID="{{ .Values.nodeIdBase }}";;
-                *) export GREENMQTT_NODE_ID="$((ordinal + {{ .Values.nodeIdBase }}))";;
+                ''|*[!0-9]*) export GREENMQTT_NODE_ID="{{ .Values.storeTopology.nodeIdBase }}";;
+                *) export GREENMQTT_NODE_ID="$((ordinal + {{ .Values.storeTopology.nodeIdBase }}))";;
               esac
-              exec /usr/local/bin/greenmqtt serve
+              exec /usr/local/bin/greenmqtt state-serve
           ports:
-            - name: mqtt
-              containerPort: {{ .Values.service.mqtt.targetPort }}
-              protocol: {{ .Values.service.mqtt.protocol }}
-            - name: http
-              containerPort: {{ .Values.service.http.targetPort }}
-              protocol: {{ .Values.service.http.protocol }}
             - name: rpc
-              containerPort: {{ .Values.service.rpc.targetPort }}
-              protocol: {{ .Values.service.rpc.protocol }}
+              containerPort: {{ .Values.storeTopology.service.rpc.targetPort }}
+              protocol: {{ .Values.storeTopology.service.rpc.protocol }}
           env:
-            {{- include "greenmqtt.env" . | nindent 12 }}
-          {{- with .Values.greenmqtt.extraEnvFrom }}
+            {{- include "greenmqtt.storeEnv" . | nindent 12 }}
+          {{- with .Values.storeTopology.greenmqtt.extraEnvFrom }}
           envFrom:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          {{- with .Values.livenessProbe }}
+          {{- with .Values.storeTopology.livenessProbe }}
           livenessProbe:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          {{- with .Values.readinessProbe }}
+          {{- with .Values.storeTopology.readinessProbe }}
           readinessProbe:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          {{- with .Values.startupProbe }}
+          {{- with .Values.storeTopology.startupProbe }}
           startupProbe:
             {{- toYaml . | nindent 12 }}
           {{- end }}
           volumeMounts:
             - name: data
-              mountPath: {{ .Values.persistence.mountPath }}
+              mountPath: {{ .Values.storeTopology.persistence.mountPath }}
           {{- with .Values.securityContext }}
           securityContext:
             {{- toYaml . | nindent 12 }}
@@ -104,19 +100,21 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-  {{- if .Values.persistence.enabled }}
+  {{- if .Values.storeTopology.persistence.enabled }}
   volumeClaimTemplates:
     - metadata:
         name: data
         labels:
           {{- include "greenmqtt.labels" . | nindent 10 }}
+          app.kubernetes.io/component: store
       spec:
         accessModes:
-          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+          {{- toYaml .Values.storeTopology.persistence.accessModes | nindent 10 }}
         resources:
           requests:
-            storage: {{ .Values.persistence.size }}
-        {{- if .Values.persistence.storageClass }}
-        storageClassName: {{ .Values.persistence.storageClass }}
+            storage: {{ .Values.storeTopology.persistence.size }}
+        {{- if .Values.storeTopology.persistence.storageClass }}
+        storageClassName: {{ .Values.storeTopology.persistence.storageClass }}
         {{- end }}
   {{- end }}
+{{- end }}

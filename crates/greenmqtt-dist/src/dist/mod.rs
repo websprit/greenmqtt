@@ -1,18 +1,18 @@
 pub(crate) mod handle;
 pub(crate) mod persistent;
 
+use crate::trie::tenant_routes_from_vec;
 use async_trait::async_trait;
 use bytes::Bytes;
 use greenmqtt_core::{RouteRecord, TopicName};
-pub use handle::{dist_route_shard, dist_tenant_shard, DistHandle};
 use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter};
+pub use handle::{dist_route_shard, dist_tenant_shard, DistHandle};
 pub(crate) use handle::{
     exact_topic_loaded, insert_tenant_route, remove_tenant_route, retain_tenant_routes,
     rewrite_tenant_route_node, session_topic_shared_identity, shared_group_identity,
     tenant_filter_shared_identity, TenantRoutes,
 };
 pub use persistent::PersistentDistHandle;
-use crate::trie::tenant_routes_from_vec;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -299,7 +299,9 @@ impl DistRouter for ReplicatedDistHandle {
             .router
             .route_key(&shard, route.topic_filter.as_bytes())
             .await?
-            .ok_or_else(|| anyhow::anyhow!("no dist range available for tenant {}", route.tenant_id))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("no dist range available for tenant {}", route.tenant_id)
+            })?;
         self.executor
             .apply(
                 &range.descriptor.id,
@@ -317,7 +319,9 @@ impl DistRouter for ReplicatedDistHandle {
             .router
             .route_key(&shard, route.topic_filter.as_bytes())
             .await?
-            .ok_or_else(|| anyhow::anyhow!("no dist range available for tenant {}", route.tenant_id))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("no dist range available for tenant {}", route.tenant_id)
+            })?;
         self.executor
             .apply(
                 &range.descriptor.id,
@@ -358,13 +362,19 @@ impl DistRouter for ReplicatedDistHandle {
 
     async fn list_routes(&self, tenant_id: Option<&str>) -> anyhow::Result<Vec<RouteRecord>> {
         let descriptors = match tenant_id {
-            Some(tenant_id) => self.router.route_shard(&dist_tenant_shard(tenant_id)).await?,
+            Some(tenant_id) => {
+                self.router
+                    .route_shard(&dist_tenant_shard(tenant_id))
+                    .await?
+            }
             None => self
                 .router
                 .list()
                 .await?
                 .into_iter()
-                .filter(|descriptor| descriptor.shard.kind == greenmqtt_core::ServiceShardKind::Dist)
+                .filter(|descriptor| {
+                    descriptor.shard.kind == greenmqtt_core::ServiceShardKind::Dist
+                })
                 .map(greenmqtt_kv_client::RangeRoute::from_descriptor)
                 .collect(),
         };

@@ -11,3 +11,6 @@ foca = { version = "1.0.0", features = ["std", "serde"] }
 greenmqtt-core = { path = "../greenmqtt-core" }
 serde.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+greenmqtt-rpc = { path = "../greenmqtt-rpc" }

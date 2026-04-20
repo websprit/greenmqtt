@@ -1,0 +1,49 @@
+{{- if .Values.storeTopology.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "greenmqtt.storeFullname" . }}
+  labels:
+    {{- include "greenmqtt.labels" . | nindent 4 }}
+    app.kubernetes.io/component: store
+  {{- with .Values.storeTopology.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.storeTopology.service.type }}
+  selector:
+    {{- include "greenmqtt.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: store
+  ports:
+    - name: rpc
+      port: {{ .Values.storeTopology.service.rpc.port }}
+      targetPort: rpc
+      protocol: {{ .Values.storeTopology.service.rpc.protocol }}
+      {{- if and (eq .Values.storeTopology.service.type "NodePort") .Values.storeTopology.service.rpc.nodePort }}
+      nodePort: {{ .Values.storeTopology.service.rpc.nodePort }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "greenmqtt.storeHeadlessServiceName" . }}
+  labels:
+    {{- include "greenmqtt.labels" . | nindent 4 }}
+    app.kubernetes.io/component: store
+  {{- with .Values.storeTopology.service.headlessAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "greenmqtt.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: store
+  ports:
+    - name: rpc
+      port: {{ .Values.storeTopology.service.rpc.port }}
+      targetPort: rpc
+      protocol: {{ .Values.storeTopology.service.rpc.protocol }}
+{{- end }}

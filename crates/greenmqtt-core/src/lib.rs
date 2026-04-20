@@ -210,10 +210,7 @@ impl RangeBoundary {
             .start_key
             .as_deref()
             .is_none_or(|start_key| key >= start_key);
-        let upper_ok = self
-            .end_key
-            .as_deref()
-            .is_none_or(|end_key| key < end_key);
+        let upper_ok = self.end_key.as_deref().is_none_or(|end_key| key < end_key);
         lower_ok && upper_ok
     }
 }
@@ -398,12 +395,18 @@ pub trait BalancerStateRegistry: Send + Sync {
 }
 
 pub trait MetadataRegistry:
-    ServiceEndpointRegistry + ReplicatedRangeRegistry + BalancerStateRegistry
+    ServiceEndpointRegistry
+    + ReplicatedRangeRegistry
+    + BalancerStateRegistry
+    + ClusterMembershipRegistry
 {
 }
 
 impl<T> MetadataRegistry for T where
-    T: ServiceEndpointRegistry + ReplicatedRangeRegistry + BalancerStateRegistry
+    T: ServiceEndpointRegistry
+        + ReplicatedRangeRegistry
+        + BalancerStateRegistry
+        + ClusterMembershipRegistry
 {
 }
 

@@ -413,7 +413,9 @@ impl RetainService for ReplicatedRetainHandle {
             .router
             .route_key(&shard, message.topic.as_bytes())
             .await?
-            .ok_or_else(|| anyhow::anyhow!("no retain range available for tenant {}", message.tenant_id))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("no retain range available for tenant {}", message.tenant_id)
+            })?;
         self.executor
             .apply(
                 &route.descriptor.id,
@@ -524,8 +526,8 @@ impl Lifecycle for PersistentRetainHandle {
 #[cfg(test)]
 mod tests {
     use super::{
-        retain_tenant_shard, retained_message_shard, PersistentRetainHandle, ReplicatedRetainHandle,
-        RetainHandle, RetainService,
+        retain_tenant_shard, retained_message_shard, PersistentRetainHandle,
+        ReplicatedRetainHandle, RetainHandle, RetainService,
     };
     use async_trait::async_trait;
     use bytes::Bytes;
@@ -560,7 +562,8 @@ mod tests {
             limit: usize,
         ) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
             let range = self.engine.open_range(range_id).await?;
-            range.reader()
+            range
+                .reader()
                 .scan(&boundary.unwrap_or_else(RangeBoundary::full), limit)
                 .await
         }
@@ -1221,5 +1224,318 @@ mod tests {
         );
         assert_eq!(retain.match_topic("t1", "#").await.unwrap().len(), 2);
         assert_eq!(retain.retained_count().await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn replicated_retain_reapplying_same_topic_keeps_single_record() {
+        let engine = MemoryKvEngine::default();
+        engine
+            .bootstrap(KvRangeBootstrap {
+                range_id: "retain-range-idem".into(),
+                boundary: RangeBoundary::full(),
+            })
+            .await
+            .unwrap();
+        let router = Arc::new(MemoryKvRangeRouter::default());
+        router
+            .upsert(ReplicatedRangeDescriptor::new(
+                "retain-range-idem",
+                retain_tenant_shard("t1"),
+                RangeBoundary::full(),
+                1,
+                1,
+                Some(1),
+                vec![RangeReplica::new(
+                    1,
+                    ReplicaRole::Voter,
+                    ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ))
+            .await
+            .unwrap();
+        let retain = ReplicatedRetainHandle::new(
+            router,
+            Arc::new(LocalKvRangeExecutor {
+                engine: engine.clone(),
+            }),
+        );
+
+        let message = RetainedMessage {
+            tenant_id: "t1".into(),
+            topic: "devices/a/state".into(),
+            payload: b"up".to_vec().into(),
+            qos: 1,
+        };
+        retain.retain(message.clone()).await.unwrap();
+        retain.retain(message).await.unwrap();
+
+        assert_eq!(retain.retained_count().await.unwrap(), 1);
+        assert_eq!(retain.match_topic("t1", "#").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn replicated_retain_survives_range_split_and_merge() {
+        let engine = MemoryKvEngine::default();
+        let router = Arc::new(MemoryKvRangeRouter::default());
+        let shard = retain_tenant_shard("t1");
+        for descriptor in [
+            ReplicatedRangeDescriptor::new(
+                "retain-left",
+                shard.clone(),
+                RangeBoundary::new(None, Some(b"m".to_vec())),
+                1,
+                1,
+                Some(1),
+                vec![RangeReplica::new(
+                    1,
+                    ReplicaRole::Voter,
+                    ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ),
+            ReplicatedRangeDescriptor::new(
+                "retain-right",
+                shard.clone(),
+                RangeBoundary::new(Some(b"m".to_vec()), None),
+                1,
+                1,
+                Some(1),
+                vec![RangeReplica::new(
+                    1,
+                    ReplicaRole::Voter,
+                    ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ),
+        ] {
+            engine
+                .bootstrap(KvRangeBootstrap {
+                    range_id: descriptor.id.clone(),
+                    boundary: descriptor.boundary.clone(),
+                })
+                .await
+                .unwrap();
+            router.upsert(descriptor).await.unwrap();
+        }
+
+        let retain = ReplicatedRetainHandle::new(
+            router.clone(),
+            Arc::new(LocalKvRangeExecutor {
+                engine: engine.clone(),
+            }),
+        );
+
+        for (topic, payload, qos) in [
+            ("alerts/door", b"open".as_slice(), 1),
+            ("metrics/cpu", b"high".as_slice(), 0),
+        ] {
+            retain
+                .retain(RetainedMessage {
+                    tenant_id: "t1".into(),
+                    topic: topic.into(),
+                    payload: payload.to_vec().into(),
+                    qos,
+                })
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            retain
+                .lookup_topic("t1", "alerts/door")
+                .await
+                .unwrap()
+                .unwrap()
+                .payload,
+            b"open".as_slice()
+        );
+        assert_eq!(
+            retain
+                .lookup_topic("t1", "metrics/cpu")
+                .await
+                .unwrap()
+                .unwrap()
+                .payload,
+            b"high".as_slice()
+        );
+
+        engine
+            .bootstrap(KvRangeBootstrap {
+                range_id: "retain-merged".into(),
+                boundary: RangeBoundary::full(),
+            })
+            .await
+            .unwrap();
+        let left = engine.open_range("retain-left").await.unwrap();
+        let right = engine.open_range("retain-right").await.unwrap();
+        let merged = engine.open_range("retain-merged").await.unwrap();
+        let mut merged_mutations = Vec::new();
+        merged_mutations.extend(
+            left.reader()
+                .scan(&RangeBoundary::full(), usize::MAX)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(key, value)| KvMutation {
+                    key,
+                    value: Some(value),
+                }),
+        );
+        merged_mutations.extend(
+            right
+                .reader()
+                .scan(&RangeBoundary::full(), usize::MAX)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(key, value)| KvMutation {
+                    key,
+                    value: Some(value),
+                }),
+        );
+        merged.writer().apply(merged_mutations).await.unwrap();
+
+        router.remove("retain-left").await.unwrap();
+        router.remove("retain-right").await.unwrap();
+        router
+            .upsert(ReplicatedRangeDescriptor::new(
+                "retain-merged",
+                shard,
+                RangeBoundary::full(),
+                2,
+                2,
+                Some(1),
+                vec![RangeReplica::new(
+                    1,
+                    ReplicaRole::Voter,
+                    ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(retain.match_topic("t1", "#").await.unwrap().len(), 2);
+        assert_eq!(
+            retain
+                .lookup_topic("t1", "alerts/door")
+                .await
+                .unwrap()
+                .unwrap()
+                .payload,
+            b"open".as_slice()
+        );
+        assert_eq!(
+            retain
+                .lookup_topic("t1", "metrics/cpu")
+                .await
+                .unwrap()
+                .unwrap()
+                .payload,
+            b"high".as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn replicated_retain_can_read_from_restored_snapshot_range() {
+        let engine = MemoryKvEngine::default();
+        engine
+            .bootstrap(KvRangeBootstrap {
+                range_id: "retain-source".into(),
+                boundary: RangeBoundary::full(),
+            })
+            .await
+            .unwrap();
+
+        let router = Arc::new(MemoryKvRangeRouter::default());
+        let shard = retain_tenant_shard("t1");
+        router
+            .upsert(ReplicatedRangeDescriptor::new(
+                "retain-source",
+                shard.clone(),
+                RangeBoundary::full(),
+                1,
+                1,
+                Some(1),
+                vec![RangeReplica::new(
+                    1,
+                    ReplicaRole::Voter,
+                    ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ))
+            .await
+            .unwrap();
+
+        let retain = ReplicatedRetainHandle::new(
+            router.clone(),
+            Arc::new(LocalKvRangeExecutor {
+                engine: engine.clone(),
+            }),
+        );
+        retain
+            .retain(RetainedMessage {
+                tenant_id: "t1".into(),
+                topic: "devices/a/state".into(),
+                payload: b"restored".to_vec().into(),
+                qos: 1,
+            })
+            .await
+            .unwrap();
+
+        let source = engine.open_range("retain-source").await.unwrap();
+        let snapshot = source.snapshot().await.unwrap();
+        drop(source);
+        engine
+            .restore_snapshot(
+                KvRangeBootstrap {
+                    range_id: "retain-restored".into(),
+                    boundary: RangeBoundary::full(),
+                },
+                &snapshot,
+            )
+            .await
+            .unwrap();
+        router.remove("retain-source").await.unwrap();
+        router
+            .upsert(ReplicatedRangeDescriptor::new(
+                "retain-restored",
+                shard,
+                RangeBoundary::full(),
+                2,
+                2,
+                Some(1),
+                vec![RangeReplica::new(
+                    1,
+                    ReplicaRole::Voter,
+                    ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            retain
+                .lookup_topic("t1", "devices/a/state")
+                .await
+                .unwrap()
+                .unwrap()
+                .payload,
+            b"restored".as_slice()
+        );
     }
 }

@@ -49,11 +49,21 @@ where
         self.pending_will_generations.total_entries()
     }
 
-    pub fn local_hot_state_entries(&self) -> usize {
+    pub fn local_hot_state_breakdown(&self) -> LocalHotStateBreakdown {
         let stats = self.local_stats();
-        stats.local_online_sessions
-            + stats.local_pending_deliveries
-            + self.pending_delayed_will_count()
+        LocalHotStateBreakdown {
+            live_connections: stats.local_online_sessions,
+            transient_send_queue_entries: stats.local_pending_deliveries,
+            short_lived_tracking_entries: self.pending_delayed_will_count()
+                + self.recent_connect_attempts.total_entries(),
+        }
+    }
+
+    pub fn local_hot_state_entries(&self) -> usize {
+        let breakdown = self.local_hot_state_breakdown();
+        breakdown.live_connections
+            + breakdown.transient_send_queue_entries
+            + breakdown.short_lived_tracking_entries
     }
 
     pub fn approximate_local_hot_state_bytes(&self) -> usize {
@@ -69,6 +79,7 @@ where
                 .map(approx_delivery_bytes)
                 .sum::<usize>()
             + self.pending_will_generations.total_key_bytes()
+            + self.recent_connect_attempts.total_key_bytes()
     }
 
     pub(crate) fn local_stats(&self) -> BrokerStats {
