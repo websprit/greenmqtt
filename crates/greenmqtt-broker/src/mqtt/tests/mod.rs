@@ -33,7 +33,7 @@ pub(super) use rcgen::generate_simple_self_signed;
 pub(super) use std::net::SocketAddr;
 pub(super) use std::path::PathBuf;
 pub(super) use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
-pub(super) use std::sync::Arc;
+pub(super) use std::sync::{Arc, Mutex, OnceLock};
 pub(super) use tempfile::TempDir;
 pub(super) use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 pub(super) use tokio::net::{TcpListener as TokioTcpListener, TcpStream as TokioTcpStream};
@@ -61,6 +61,46 @@ pub(super) fn test_broker() -> Arc<DefaultBroker> {
         server_reference: None,
         audit_log_path: None,
     })
+}
+
+static TEST_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+pub(super) struct ScopedEnvVars {
+    previous: Vec<(String, Option<String>)>,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for ScopedEnvVars {
+    fn drop(&mut self) {
+        for (key, value) in self.previous.drain(..) {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
+pub(super) fn scoped_env_vars(vars: &[(&str, Option<&str>)]) -> ScopedEnvVars {
+    let guard = TEST_ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("test env lock poisoned");
+    let previous = vars
+        .iter()
+        .map(|(key, value)| {
+            let previous = std::env::var(key).ok();
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+            ((*key).to_string(), previous)
+        })
+        .collect();
+    ScopedEnvVars {
+        previous,
+        _guard: guard,
+    }
 }
 
 pub(super) fn next_test_bind() -> SocketAddr {

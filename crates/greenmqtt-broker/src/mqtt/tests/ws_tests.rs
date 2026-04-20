@@ -37,6 +37,50 @@ async fn mqtt_ws_connection_limit_rejects_second_client() {
 }
 
 #[tokio::test]
+async fn mqtt_ws_proxy_protocol_and_ingress_shaping_allow_end_to_end_connect() {
+    let _env = scoped_env_vars(&[
+        ("GREENMQTT_PROXY_PROTOCOL", Some("1")),
+        ("GREENMQTT_WS_PATH", Some("/mqtt")),
+        ("GREENMQTT_INGRESS_READ_RATE_PER_SEC", Some("64")),
+        ("GREENMQTT_INGRESS_READ_BURST", Some("64")),
+        ("GREENMQTT_INGRESS_WRITE_RATE_PER_SEC", Some("64")),
+        ("GREENMQTT_INGRESS_WRITE_BURST", Some("64")),
+    ]);
+    let broker = test_broker_with_config(BrokerConfig {
+        node_id: 1,
+        enable_tcp: false,
+        enable_tls: false,
+        enable_ws: true,
+        enable_wss: false,
+        enable_quic: false,
+        server_keep_alive_secs: None,
+        max_packet_size: None,
+        response_information: None,
+        server_reference: None,
+        audit_log_path: None,
+    });
+    let bind = next_test_bind();
+    let server = tokio::spawn(serve_ws(broker, bind));
+    sleep(Duration::from_millis(100)).await;
+
+    let mut stream = connect_tcp_with_retry(bind).await.unwrap();
+    stream
+        .write_all(b"PROXY TCP4 10.1.1.1 10.1.1.2 18830 1883\r\n")
+        .await
+        .unwrap();
+    let ws_url = format!("ws://{bind}/mqtt");
+    let (mut client, _) = client_async(ws_url, stream).await.unwrap();
+    client
+        .send(Message::Binary((connect_packet("proxy-ws")).into()))
+        .await
+        .unwrap();
+    let connack = client.next().await.unwrap().unwrap().into_data();
+    assert_eq!(connack[0] >> 4, PACKET_TYPE_CONNACK);
+
+    server.abort();
+}
+
+#[tokio::test]
 async fn mqtt_v5_enhanced_auth_challenge_flow_over_websocket() {
     let broker = test_broker_with_auth(
         BrokerConfig {

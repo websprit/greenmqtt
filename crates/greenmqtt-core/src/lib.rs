@@ -326,6 +326,29 @@ pub struct BalancerState {
     pub load_rules: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ReconfigurationPhase {
+    StagingLearners,
+    Finalizing,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RangeReconfigurationState {
+    pub range_id: RangeId,
+    #[serde(default)]
+    pub current_voters: Vec<NodeId>,
+    #[serde(default)]
+    pub current_learners: Vec<NodeId>,
+    #[serde(default)]
+    pub pending_voters: Vec<NodeId>,
+    #[serde(default)]
+    pub pending_learners: Vec<NodeId>,
+    #[serde(default)]
+    pub phase: Option<ReconfigurationPhase>,
+    #[serde(default)]
+    pub blocked_on_catch_up: bool,
+}
+
 #[async_trait]
 pub trait ReplicatedRangeRegistry: Send + Sync {
     async fn upsert_range(
@@ -394,10 +417,33 @@ pub trait BalancerStateRegistry: Send + Sync {
     async fn list_balancer_states(&self) -> anyhow::Result<BTreeMap<String, BalancerState>>;
 }
 
+#[async_trait]
+pub trait RangeReconfigurationRegistry: Send + Sync {
+    async fn upsert_reconfiguration_state(
+        &self,
+        state: RangeReconfigurationState,
+    ) -> anyhow::Result<Option<RangeReconfigurationState>>;
+
+    async fn resolve_reconfiguration_state(
+        &self,
+        range_id: &str,
+    ) -> anyhow::Result<Option<RangeReconfigurationState>>;
+
+    async fn remove_reconfiguration_state(
+        &self,
+        range_id: &str,
+    ) -> anyhow::Result<Option<RangeReconfigurationState>>;
+
+    async fn list_reconfiguration_states(
+        &self,
+    ) -> anyhow::Result<Vec<RangeReconfigurationState>>;
+}
+
 pub trait MetadataRegistry:
     ServiceEndpointRegistry
     + ReplicatedRangeRegistry
     + BalancerStateRegistry
+    + RangeReconfigurationRegistry
     + ClusterMembershipRegistry
 {
 }
@@ -406,6 +452,7 @@ impl<T> MetadataRegistry for T where
     T: ServiceEndpointRegistry
         + ReplicatedRangeRegistry
         + BalancerStateRegistry
+        + RangeReconfigurationRegistry
         + ClusterMembershipRegistry
 {
 }

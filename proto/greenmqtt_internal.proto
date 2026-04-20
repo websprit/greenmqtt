@@ -134,6 +134,32 @@ message ListSessionsReply {
   repeated SessionRecord records = 1;
 }
 
+message SessionExistRequest {
+  repeated string session_ids = 1;
+}
+
+message SessionExistRecord {
+  string session_id = 1;
+  bool exists = 2;
+}
+
+message SessionExistReply {
+  repeated SessionExistRecord entries = 1;
+}
+
+message IdentityExistRequest {
+  repeated ClientIdentity identities = 1;
+}
+
+message IdentityExistRecord {
+  ClientIdentity identity = 1;
+  bool exists = 2;
+}
+
+message IdentityExistReply {
+  repeated IdentityExistRecord entries = 1;
+}
+
 message AddRouteRequest {
   RouteRecord route = 1;
 }
@@ -571,6 +597,16 @@ message ReplicaLagRecord {
   uint64 next_index = 4;
 }
 
+message RangeReconfigurationRecord {
+  repeated uint64 current_voters = 1;
+  repeated uint64 current_learners = 2;
+  repeated uint64 pending_voters = 3;
+  repeated uint64 pending_learners = 4;
+  string phase = 5;
+  bool has_phase = 6;
+  bool blocked_on_catch_up = 7;
+}
+
 message RangeHealthRecord {
   string range_id = 1;
   string role = 2;
@@ -582,6 +618,7 @@ message RangeHealthRecord {
   uint64 latest_snapshot_index = 8;
   bool has_latest_snapshot_index = 9;
   repeated ReplicaLagRecord replica_lag = 10;
+  RangeReconfigurationRecord reconfiguration = 11;
 }
 
 message RangeHealthRequest {
@@ -668,6 +705,8 @@ service SessionDictService {
   rpc LookupSession(LookupSessionRequest) returns (LookupSessionReply);
   rpc LookupSessionById(LookupSessionByIdRequest) returns (LookupSessionReply);
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsReply);
+  rpc SessionExists(SessionExistRequest) returns (SessionExistReply);
+  rpc IdentityExists(IdentityExistRequest) returns (IdentityExistReply);
   rpc CountSessions(.google.protobuf.Empty) returns (CountReply);
   rpc StreamShardSnapshot(ShardSnapshotRequest) returns (stream ShardSnapshotChunk);
 }

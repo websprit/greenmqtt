@@ -6,7 +6,10 @@ use greenmqtt_kv_engine::KvMutation;
 use greenmqtt_storage::SessionStore;
 use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 
 #[async_trait]
 pub trait SessionDirectory: Send + Sync {
@@ -25,6 +28,168 @@ pub trait SessionDirectory: Send + Sync {
     }
     async fn list_sessions(&self, tenant_id: Option<&str>) -> anyhow::Result<Vec<SessionRecord>>;
     async fn session_count(&self) -> anyhow::Result<usize>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionRegistrationState {
+    Registered,
+    Kicked,
+    Stopped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionKillNotification {
+    pub requested: SessionRecord,
+    pub current_owner: Option<SessionRecord>,
+    pub server_reference: Option<String>,
+}
+
+#[async_trait]
+pub trait SessionKillListener: Send + Sync {
+    async fn on_kill(&self, notification: SessionKillNotification) -> anyhow::Result<()>;
+}
+
+pub trait SessionOwnerResolver: Send + Sync {
+    fn server_reference(&self, node_id: u64) -> Option<String>;
+}
+
+#[derive(Clone)]
+pub struct SessionRegistrationManager {
+    directory: Arc<dyn SessionDirectory>,
+    poll_interval: Duration,
+    owner_resolver: Option<Arc<dyn SessionOwnerResolver>>,
+}
+
+impl SessionRegistrationManager {
+    pub fn new(directory: Arc<dyn SessionDirectory>) -> Self {
+        Self {
+            directory,
+            poll_interval: Duration::from_secs(5),
+            owner_resolver: None,
+        }
+    }
+
+    pub fn with_poll_interval(mut self, poll_interval: Duration) -> Self {
+        self.poll_interval = poll_interval;
+        self
+    }
+
+    pub fn with_owner_resolver(mut self, owner_resolver: Arc<dyn SessionOwnerResolver>) -> Self {
+        self.owner_resolver = Some(owner_resolver);
+        self
+    }
+
+    pub async fn register(
+        &self,
+        record: SessionRecord,
+        kill_listener: Arc<dyn SessionKillListener>,
+    ) -> anyhow::Result<SessionRegistrationHandle> {
+        self.directory.register(record.clone()).await?;
+        let state = Arc::new(RwLock::new(SessionRegistrationState::Registered));
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+        let directory = self.directory.clone();
+        let owner_resolver = self.owner_resolver.clone();
+        let watched_record = record.clone();
+        let task_state = state.clone();
+        let poll_interval = self.poll_interval;
+        let task = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(poll_interval);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let current = directory.lookup_identity(&watched_record.identity).await?;
+                        let still_owned = current.as_ref().is_some_and(|current| {
+                            current.session_id == watched_record.session_id
+                                && current.node_id == watched_record.node_id
+                        });
+                        if still_owned {
+                            continue;
+                        }
+                        *task_state.write().expect("session registration poisoned") =
+                            SessionRegistrationState::Kicked;
+                        let server_reference = current.as_ref().and_then(|current| {
+                            owner_resolver
+                                .as_ref()
+                                .and_then(|resolver| resolver.server_reference(current.node_id))
+                        });
+                        kill_listener
+                            .on_kill(SessionKillNotification {
+                                requested: watched_record.clone(),
+                                current_owner: current,
+                                server_reference,
+                            })
+                            .await?;
+                        break;
+                    }
+                    changed = stop_rx.changed() => {
+                        if changed.is_err() || *stop_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        });
+
+        Ok(SessionRegistrationHandle {
+            record,
+            directory: self.directory.clone(),
+            state,
+            stop_tx,
+            task: Mutex::new(Some(task)),
+        })
+    }
+}
+
+pub struct SessionRegistrationHandle {
+    record: SessionRecord,
+    directory: Arc<dyn SessionDirectory>,
+    state: Arc<RwLock<SessionRegistrationState>>,
+    stop_tx: watch::Sender<bool>,
+    task: Mutex<Option<JoinHandle<anyhow::Result<()>>>>,
+}
+
+impl SessionRegistrationHandle {
+    pub fn record(&self) -> &SessionRecord {
+        &self.record
+    }
+
+    pub fn state(&self) -> SessionRegistrationState {
+        *self.state.read().expect("session registration poisoned")
+    }
+
+    pub async fn stop(&self) -> anyhow::Result<()> {
+        let _ = self.stop_tx.send(true);
+        if self.state() == SessionRegistrationState::Registered {
+            let current = self.directory.lookup_identity(&self.record.identity).await?;
+            if current.as_ref().is_some_and(|current| {
+                current.session_id == self.record.session_id
+                    && current.node_id == self.record.node_id
+            }) {
+                let _ = self.directory.unregister(&self.record.session_id).await?;
+            }
+            *self.state.write().expect("session registration poisoned") =
+                SessionRegistrationState::Stopped;
+        }
+
+        if let Some(task) = self.task.lock().expect("session registration poisoned").take() {
+            match task.await {
+                Ok(result) => result?,
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => anyhow::bail!("session registration task failed: {error}"),
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SessionRegistrationHandle {
+    fn drop(&mut self) {
+        let _ = self.stop_tx.send(true);
+        if let Some(task) = self.task.lock().expect("session registration poisoned").take() {
+            task.abort();
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -837,7 +1002,8 @@ mod tests {
     use super::{
         session_identity_shard, session_record_shard, session_scan_shard,
         PersistentSessionDictHandle, ReplicatedSessionDictHandle, SessionDictHandle,
-        SessionDirectory, SessionDirectoryState, SessionOnlineCheckScheduler,
+        SessionDirectory, SessionDirectoryState, SessionKillListener, SessionOnlineCheckScheduler,
+        SessionOwnerResolver, SessionRegistrationManager, SessionRegistrationState,
     };
     use async_trait::async_trait;
     use bytes::Bytes;
@@ -851,8 +1017,10 @@ mod tests {
         KvEngine, KvMutation, KvRangeBootstrap, KvRangeCheckpoint, KvRangeSnapshot, MemoryKvEngine,
     };
     use greenmqtt_storage::{MemorySessionStore, SessionStore};
+    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, RwLock};
+    use std::time::Duration;
 
     #[derive(Clone)]
     struct LocalKvRangeExecutor {
@@ -950,6 +1118,36 @@ mod tests {
         async fn snapshot(&self, range_id: &str) -> anyhow::Result<KvRangeSnapshot> {
             let range = self.engine.open_range(range_id).await?;
             range.snapshot().await
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingKillListener {
+        notifications: Mutex<Vec<super::SessionKillNotification>>,
+    }
+
+    #[async_trait]
+    impl SessionKillListener for RecordingKillListener {
+        async fn on_kill(
+            &self,
+            notification: super::SessionKillNotification,
+        ) -> anyhow::Result<()> {
+            self.notifications
+                .lock()
+                .expect("kill listener poisoned")
+                .push(notification);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct StaticOwnerResolver {
+        endpoints: BTreeMap<u64, String>,
+    }
+
+    impl SessionOwnerResolver for StaticOwnerResolver {
+        fn server_reference(&self, node_id: u64) -> Option<String> {
+            self.endpoints.get(&node_id).cloned()
         }
     }
 
@@ -1320,6 +1518,176 @@ mod tests {
                 .session_id,
             "s1"
         );
+    }
+
+    #[tokio::test]
+    async fn session_registration_unregisters_on_stop() {
+        let directory: Arc<dyn SessionDirectory> = Arc::new(SessionDictHandle::default());
+        let listener = Arc::new(RecordingKillListener::default());
+        let registration = SessionRegistrationManager::new(directory.clone())
+            .with_poll_interval(Duration::from_millis(5))
+            .register(
+                SessionRecord {
+                    session_id: "s1".into(),
+                    node_id: 1,
+                    kind: SessionKind::Persistent,
+                    identity: ClientIdentity {
+                        tenant_id: "t1".into(),
+                        user_id: "u1".into(),
+                        client_id: "c1".into(),
+                    },
+                    session_expiry_interval_secs: None,
+                    expires_at_ms: None,
+                },
+                listener.clone(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(registration.state(), SessionRegistrationState::Registered);
+        registration.stop().await.unwrap();
+        assert_eq!(registration.state(), SessionRegistrationState::Stopped);
+        assert!(directory.lookup_session("s1").await.unwrap().is_none());
+        assert!(listener
+            .notifications
+            .lock()
+            .expect("kill listener poisoned")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_registration_notifies_when_replaced_by_new_owner() {
+        let directory: Arc<dyn SessionDirectory> = Arc::new(SessionDictHandle::default());
+        let listener = Arc::new(RecordingKillListener::default());
+        let registration = SessionRegistrationManager::new(directory.clone())
+            .with_poll_interval(Duration::from_millis(5))
+            .register(
+                SessionRecord {
+                    session_id: "s1".into(),
+                    node_id: 1,
+                    kind: SessionKind::Persistent,
+                    identity: ClientIdentity {
+                        tenant_id: "t1".into(),
+                        user_id: "u1".into(),
+                        client_id: "c1".into(),
+                    },
+                    session_expiry_interval_secs: None,
+                    expires_at_ms: None,
+                },
+                listener.clone(),
+            )
+            .await
+            .unwrap();
+
+        directory
+            .register(SessionRecord {
+                session_id: "s2".into(),
+                node_id: 7,
+                kind: SessionKind::Persistent,
+                identity: ClientIdentity {
+                    tenant_id: "t1".into(),
+                    user_id: "u1".into(),
+                    client_id: "c1".into(),
+                },
+                session_expiry_interval_secs: None,
+                expires_at_ms: None,
+            })
+            .await
+            .unwrap();
+
+        let notifications = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let notifications = listener
+                    .notifications
+                    .lock()
+                    .expect("kill listener poisoned")
+                    .clone();
+                if !notifications.is_empty() {
+                    break notifications;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(registration.state(), SessionRegistrationState::Kicked);
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].requested.session_id, "s1");
+        assert_eq!(
+            notifications[0]
+                .current_owner
+                .as_ref()
+                .expect("replacement owner")
+                .session_id,
+            "s2"
+        );
+        assert!(notifications[0].server_reference.is_none());
+        registration.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_registration_resolves_server_reference_for_remote_owner() {
+        let directory: Arc<dyn SessionDirectory> = Arc::new(SessionDictHandle::default());
+        let listener = Arc::new(RecordingKillListener::default());
+        let resolver = Arc::new(StaticOwnerResolver {
+            endpoints: BTreeMap::from([(7, "http://127.0.0.1:50077".to_string())]),
+        });
+        let registration = SessionRegistrationManager::new(directory.clone())
+            .with_poll_interval(Duration::from_millis(5))
+            .with_owner_resolver(resolver)
+            .register(
+                SessionRecord {
+                    session_id: "s1".into(),
+                    node_id: 1,
+                    kind: SessionKind::Persistent,
+                    identity: ClientIdentity {
+                        tenant_id: "t1".into(),
+                        user_id: "u1".into(),
+                        client_id: "c1".into(),
+                    },
+                    session_expiry_interval_secs: None,
+                    expires_at_ms: None,
+                },
+                listener.clone(),
+            )
+            .await
+            .unwrap();
+
+        directory
+            .register(SessionRecord {
+                session_id: "s2".into(),
+                node_id: 7,
+                kind: SessionKind::Persistent,
+                identity: ClientIdentity {
+                    tenant_id: "t1".into(),
+                    user_id: "u1".into(),
+                    client_id: "c1".into(),
+                },
+                session_expiry_interval_secs: None,
+                expires_at_ms: None,
+            })
+            .await
+            .unwrap();
+
+        let notifications = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let notifications = listener
+                    .notifications
+                    .lock()
+                    .expect("kill listener poisoned")
+                    .clone();
+                if !notifications.is_empty() {
+                    break notifications;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(notifications[0].server_reference.as_deref(), Some("http://127.0.0.1:50077"));
+        registration.stop().await.unwrap();
     }
 
     #[tokio::test]

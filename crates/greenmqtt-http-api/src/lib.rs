@@ -3,6 +3,7 @@ mod cluster;
 mod http_api;
 mod publish;
 mod query;
+mod range;
 mod session;
 mod shard;
 mod subscription;
@@ -24,7 +25,7 @@ pub use query::{MetricsQuery, RetainQuery};
 use serde::{Deserialize, Serialize};
 pub use session::{
     ConnectQuery, DisconnectRequest, SessionDictQuery, SessionDictReassignQuery,
-    SessionDictReassignReply, SessionIdentityQuery,
+    SessionDictReassignReply, SessionIdentityQuery, SessionInboxStateReply,
 };
 use std::sync::Arc;
 pub use subscription::{SubscribeRequest, SubscriptionListQuery, UnsubscribeRequest};
@@ -62,11 +63,27 @@ pub struct DryRunQuery {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ErrorBody {
     pub error: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_reference: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PurgeReply {
     pub removed: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct RangeListQuery {
+    pub lifecycle: Option<String>,
+    #[serde(default)]
+    pub zombie_only: bool,
+    pub range_id_prefix: Option<String>,
+    #[serde(default)]
+    pub blocked_on_catch_up: bool,
+    #[serde(default)]
+    pub pending_only: bool,
 }
 
 async fn healthz() -> &'static str {
@@ -113,6 +130,8 @@ impl IntoResponse for ApiError {
             StatusCode::BAD_REQUEST,
             Json(ErrorBody {
                 error: self.0.to_string(),
+                server_reference: None,
+                node_id: None,
             }),
         )
             .into_response()

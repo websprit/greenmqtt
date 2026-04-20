@@ -15,6 +15,8 @@ greenmqtt-http-api = { path = "../greenmqtt-http-api" }
 greenmqtt-inbox = { path = "../greenmqtt-inbox" }
 greenmqtt-kv-client = { path = "../greenmqtt-kv-client" }
 greenmqtt-kv-engine = { path = "../greenmqtt-kv-engine" }
+greenmqtt-kv-raft = { path = "../greenmqtt-kv-raft" }
+greenmqtt-kv-server = { path = "../greenmqtt-kv-server" }
 greenmqtt-retain = { path = "../greenmqtt-retain" }
 greenmqtt-rpc = { path = "../greenmqtt-rpc" }
 greenmqtt-sessiondict = { path = "../greenmqtt-sessiondict" }
@@ -27,6 +29,4 @@ sysinfo.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-greenmqtt-kv-raft = { path = "../greenmqtt-kv-raft" }
-greenmqtt-kv-server = { path = "../greenmqtt-kv-server" }
 tempfile = "3.27.0"

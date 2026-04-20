@@ -1179,7 +1179,7 @@ impl RaftNode for MemoryRaftNode {
                 }
                 RaftConfigChange::ReplaceCluster { voters, learners } => (voters, learners),
             };
-            for node_id in next_voters.iter().chain(next_learners.iter()) {
+            for node_id in &next_voters {
                 anyhow::ensure!(
                     Self::replica_caught_up_to_commit(&state, *node_id),
                     "replica {node_id} is not caught up to commit index"

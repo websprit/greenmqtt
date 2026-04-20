@@ -381,6 +381,66 @@ where
         Ok(fenced)
     }
 
+    pub async fn kill_session_admin(&self, session_id: &str) -> anyhow::Result<bool> {
+        let known = self.local_sessions.contains_key(session_id)
+            || self.sessiondict.lookup_session(session_id).await?.is_some();
+        if !known {
+            return Ok(false);
+        }
+
+        let removed = self.local_sessions.remove(session_id);
+        if let Some(state) = removed.as_ref() {
+            let pending = self.local_deliveries.pending_len(session_id);
+            self.note_local_session_removed(state, pending);
+            self.tenant_resources
+                .release_connection(&state.record.identity.tenant_id);
+            self.inbox.detach(&state.record.session_id).await?;
+            self.hooks.on_disconnect(&state.record).await?;
+        }
+
+        self.purge_session_state(session_id).await?;
+        Ok(true)
+    }
+
+    pub async fn kill_sessions_admin(
+        &self,
+        tenant_id: Option<&str>,
+        user_id: Option<&str>,
+        client_id: Option<&str>,
+    ) -> anyhow::Result<usize> {
+        let sessions = self.sessiondict.list_sessions(tenant_id).await?;
+        let session_ids: BTreeSet<_> = sessions
+            .into_iter()
+            .filter(|record| user_id.map(|value| record.identity.user_id == value).unwrap_or(true))
+            .filter(|record| {
+                client_id
+                    .map(|value| record.identity.client_id == value)
+                    .unwrap_or(true)
+            })
+            .map(|record| record.session_id)
+            .collect();
+
+        let mut removed = 0usize;
+        for session_id in session_ids {
+            if self.kill_session_admin(&session_id).await? {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    pub async fn takeover_session_admin(
+        &self,
+        session_id: &str,
+        expiry_override_secs: Option<u32>,
+    ) -> anyhow::Result<bool> {
+        let Some(session_epoch) = self.local_sessions.get_session_epoch(session_id) else {
+            return Ok(false);
+        };
+        self.fence_current_session(session_id, session_epoch, expiry_override_secs)
+            .await
+    }
+
     async fn disconnect_internal(
         &self,
         session_id: &str,

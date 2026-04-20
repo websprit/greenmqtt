@@ -1,15 +1,16 @@
 use crate::dist::{
     dist_route_shard, dist_tenant_shard, insert_tenant_route, DistBalanceAction,
-    DistBalancePolicy, DistDeliverySink, DistFanoutWorker, DistHandle, DistMaintenanceWorker,
-    DistRouter, DistTenantStats, PersistentDistHandle, ReplicatedDistHandle,
-    TenantRoutes, ThresholdDistBalancePolicy,
+    DistBalancePolicy, DistDeliveryReport, DistDeliverySink, DistFanoutRequest, DistFanoutWorker,
+    DistHandle, DistMaintenanceWorker, DistRouter, DistTenantStats, PersistentDistHandle,
+    ReplicatedDistHandle, TenantRoutes, ThresholdDistBalancePolicy,
 };
 use crate::trie::select_routes;
 use async_trait::async_trait;
 use bytes::Bytes;
 use greenmqtt_core::{
-    RangeBoundary, RangeReplica, ReplicaRole, ReplicaSyncState, ReplicatedRangeDescriptor,
-    RouteRecord, ServiceShardKey, ServiceShardLifecycle, SessionKind, TopicName,
+    PublishProperties, PublishRequest, RangeBoundary, RangeReplica, ReplicaRole,
+    ReplicaSyncState, ReplicatedRangeDescriptor, RouteRecord, ServiceShardKey,
+    ServiceShardLifecycle, SessionKind,
 };
 use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter, MemoryKvRangeRouter};
 use greenmqtt_kv_engine::{
@@ -126,14 +127,21 @@ impl DistDeliverySink for RecordingDistSink {
     async fn deliver(
         &self,
         tenant_id: &str,
-        topic: &TopicName,
+        fanout: &DistFanoutRequest,
         routes: &[RouteRecord],
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<DistDeliveryReport> {
         self.deliveries
             .lock()
             .expect("sink poisoned")
-            .push((tenant_id.to_string(), topic.clone(), routes.len()));
-        Ok(())
+            .push((
+                tenant_id.to_string(),
+                fanout.request.topic.clone(),
+                routes.len(),
+            ));
+        Ok(DistDeliveryReport {
+            online_deliveries: routes.len(),
+            offline_enqueues: 0,
+        })
     }
 }
 
@@ -643,12 +651,27 @@ async fn dist_fanout_worker_delivers_matched_routes() {
     .await
     .unwrap();
     let sink = Arc::new(RecordingDistSink::default());
-    let worker = DistFanoutWorker::new(dist.clone(), sink.clone());
-    let delivered = worker
-        .fanout("t1", &"devices/a/state".into())
+    let worker = DistFanoutWorker::new(dist.clone());
+    let outcome = worker
+        .fanout(
+            sink.as_ref(),
+            "t1",
+            &DistFanoutRequest {
+                from_session_id: "publisher".into(),
+                request: PublishRequest {
+                    topic: "devices/a/state".into(),
+                    payload: Bytes::from_static(b"payload"),
+                    qos: 1,
+                    retain: false,
+                    properties: PublishProperties::default(),
+                },
+            },
+        )
         .await
         .unwrap();
-    assert_eq!(delivered, 1);
+    assert_eq!(outcome.matched_routes, 1);
+    assert_eq!(outcome.online_deliveries, 1);
+    assert_eq!(outcome.offline_enqueues, 0);
     assert_eq!(
         sink.deliveries.lock().expect("sink poisoned").as_slice(),
         [("t1".into(), "devices/a/state".into(), 1)]

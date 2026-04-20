@@ -1,0 +1,26 @@
+replicaCount: 3
+
+image:
+  repository: greenmqtt
+  tag: local
+  pullPolicy: IfNotPresent
+
+fullnameOverride: greenmqtt
+
+persistence:
+  enabled: false
+
+service:
+  type: ClusterIP
+
+greenmqtt:
+  storageBackend: memory
+  extraEnv:
+    GREENMQTT_STATE_MODE: "replicated"
+    GREENMQTT_PEERS: "1=http://greenmqtt-0.greenmqtt-headless:50051,2=http://greenmqtt-1.greenmqtt-headless:50051,3=http://greenmqtt-2.greenmqtt-headless:50051"
+
+storeTopology:
+  enabled: true
+  replicaCount: 1
+  greenmqtt:
+    storageBackend: rocksdb

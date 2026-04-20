@@ -52,6 +52,86 @@ async fn mqtt_v5_invalid_auth_reason_code_disconnects_protocol_error_over_quic()
 }
 
 #[tokio::test]
+async fn mqtt_quic_ingress_shaping_settings_allow_connect_subscribe_publish_flow() {
+    let _env = scoped_env_vars(&[
+        ("GREENMQTT_INGRESS_READ_RATE_PER_SEC", Some("64")),
+        ("GREENMQTT_INGRESS_READ_BURST", Some("64")),
+        ("GREENMQTT_INGRESS_WRITE_RATE_PER_SEC", Some("64")),
+        ("GREENMQTT_INGRESS_WRITE_BURST", Some("64")),
+        ("GREENMQTT_HANDSHAKE_TIMEOUT_MS", Some("2000")),
+    ]);
+    let broker = test_broker();
+    let (_tempdir, cert_path, key_path, cert) = write_self_signed_tls_material();
+
+    let bind = next_test_bind();
+    let server = tokio::spawn(serve_quic(
+        broker,
+        bind,
+        cert_path.clone(),
+        key_path.clone(),
+    ));
+    sleep(Duration::from_millis(100)).await;
+
+    let mut roots = quinn::rustls::RootCertStore::empty();
+    roots.add(cert.cert.der().clone()).unwrap();
+    let mut endpoint = QuinnEndpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    endpoint.set_default_client_config(
+        QuinnClientConfig::with_root_certificates(Arc::new(roots)).unwrap(),
+    );
+
+    let subscriber_conn = connect_quic_with_retry(&endpoint, bind).await;
+    let (mut subscriber_tx, mut subscriber_rx) = subscriber_conn.open_bi().await.unwrap();
+    subscriber_tx.write_all(&connect_packet("sub")).await.unwrap();
+    assert_eq!(
+        subscriber_rx.read_u8().await.unwrap() >> 4,
+        PACKET_TYPE_CONNACK
+    );
+    let connack_len = read_remaining_length_for_test(&mut subscriber_rx).await;
+    let mut connack = vec![0u8; connack_len];
+    subscriber_rx.read_exact(&mut connack).await.unwrap();
+
+    subscriber_tx
+        .write_all(&subscribe_packet(1, "devices/+/state"))
+        .await
+        .unwrap();
+    assert_eq!(
+        subscriber_rx.read_u8().await.unwrap() >> 4,
+        PACKET_TYPE_SUBACK
+    );
+    let suback_len = read_remaining_length_for_test(&mut subscriber_rx).await;
+    let mut suback = vec![0u8; suback_len];
+    subscriber_rx.read_exact(&mut suback).await.unwrap();
+
+    let publisher_conn = connect_quic_with_retry(&endpoint, bind).await;
+    let (mut publisher_tx, mut publisher_rx) = publisher_conn.open_bi().await.unwrap();
+    publisher_tx.write_all(&connect_packet("pub")).await.unwrap();
+    assert_eq!(
+        publisher_rx.read_u8().await.unwrap() >> 4,
+        PACKET_TYPE_CONNACK
+    );
+    let publisher_connack_len = read_remaining_length_for_test(&mut publisher_rx).await;
+    let mut publisher_connack = vec![0u8; publisher_connack_len];
+    publisher_rx
+        .read_exact(&mut publisher_connack)
+        .await
+        .unwrap();
+    publisher_tx
+        .write_all(&publish_packet("devices/d1/state", b"quic-shaped"))
+        .await
+        .unwrap();
+
+    let header = subscriber_rx.read_u8().await.unwrap();
+    assert_eq!(header >> 4, PACKET_TYPE_PUBLISH);
+    let publish_len = read_remaining_length_for_test(&mut subscriber_rx).await;
+    let mut publish = vec![0u8; publish_len];
+    subscriber_rx.read_exact(&mut publish).await.unwrap();
+    assert!(publish.windows(11).any(|window| window == b"quic-shaped"));
+
+    endpoint.close(0u32.into(), b"done");
+    server.abort();
+}
+
+#[tokio::test]
 async fn mqtt_v5_invalid_auth_property_disconnects_protocol_error_over_quic() {
     let broker = test_broker();
     let (_tempdir, cert_path, key_path, cert) = write_self_signed_tls_material();

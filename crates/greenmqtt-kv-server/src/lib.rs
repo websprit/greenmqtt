@@ -1,6 +1,9 @@
 use async_trait::async_trait;
 use bytes::Bytes;
-use greenmqtt_core::{NodeId, RangeBoundary, ReplicatedRangeDescriptor, ServiceShardLifecycle};
+use greenmqtt_core::{
+    NodeId, RangeBoundary, RangeReconfigurationState, ReconfigurationPhase,
+    ReplicatedRangeDescriptor, ServiceShardLifecycle,
+};
 use greenmqtt_kv_balance::{BalanceCommand, BalanceCommandExecutor};
 use greenmqtt_kv_engine::{KvMutation, KvRangeSnapshot, KvRangeSpace};
 use greenmqtt_kv_raft::{
@@ -44,6 +47,7 @@ pub struct ReplicaLagSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RangeHealthSnapshot {
     pub range_id: String,
+    pub lifecycle: ServiceShardLifecycle,
     pub role: greenmqtt_kv_raft::RaftNodeRole,
     pub current_term: u64,
     pub leader_node_id: Option<NodeId>,
@@ -51,6 +55,7 @@ pub struct RangeHealthSnapshot {
     pub applied_index: u64,
     pub latest_snapshot_index: Option<u64>,
     pub replica_lag: Vec<ReplicaLagSnapshot>,
+    pub reconfiguration: RangeReconfigurationState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -124,10 +129,14 @@ struct PendingOutbound {
     message: RaftMessage,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PendingReconfiguration {
-    voters: Vec<NodeId>,
-    learners: Vec<NodeId>,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingReconfiguration {
+    pub target_voters: Vec<NodeId>,
+    pub target_learners: Vec<NodeId>,
+    pub current_voters: Vec<NodeId>,
+    pub current_learners: Vec<NodeId>,
+    pub phase: ReconfigurationPhase,
+    pub blocked_on_catch_up: bool,
 }
 
 impl ReplicaRuntime {
@@ -183,6 +192,79 @@ impl ReplicaRuntime {
         update(&mut range.descriptor);
         self.host.add_range(range.clone()).await?;
         Ok(range)
+    }
+
+    fn desired_replicas_caught_up(
+        status: &RaftStatusSnapshot,
+        voters: &[NodeId],
+        learners: &[NodeId],
+    ) -> bool {
+        voters
+            .iter()
+            .chain(learners.iter())
+            .all(|node_id| {
+                status
+                    .replica_progress
+                    .iter()
+                    .find(|replica| replica.node_id == *node_id)
+                    .map(|replica| replica.match_index >= status.commit_index)
+                    .unwrap_or(false)
+            })
+    }
+
+    pub async fn pending_reconfiguration(
+        &self,
+        range_id: &str,
+    ) -> anyhow::Result<Option<PendingReconfiguration>> {
+        Ok(self
+            .pending_reconfig
+            .lock()
+            .expect("replica runtime poisoned")
+            .get(range_id)
+            .cloned())
+    }
+
+    pub async fn list_pending_reconfigurations(
+        &self,
+    ) -> anyhow::Result<BTreeMap<String, PendingReconfiguration>> {
+        Ok(self
+            .pending_reconfig
+            .lock()
+            .expect("replica runtime poisoned")
+            .clone())
+    }
+
+    pub async fn reconfiguration_state(
+        &self,
+        range_id: &str,
+    ) -> anyhow::Result<Option<RangeReconfigurationState>> {
+        let Some(status) = self.host.range(range_id).await? else {
+            return Ok(None);
+        };
+        let pending = self
+            .pending_reconfig
+            .lock()
+            .expect("replica runtime poisoned")
+            .get(range_id)
+            .cloned();
+        Ok(Some(RangeReconfigurationState {
+            range_id: range_id.to_string(),
+            current_voters: status.raft.cluster_config.voters.clone(),
+            current_learners: status.raft.cluster_config.learners.clone(),
+            pending_voters: pending
+                .as_ref()
+                .map(|pending| pending.target_voters.clone())
+                .unwrap_or_default(),
+            pending_learners: pending
+                .as_ref()
+                .map(|pending| pending.target_learners.clone())
+                .unwrap_or_default(),
+            phase: pending.as_ref().map(|pending| pending.phase.clone()),
+            blocked_on_catch_up: pending
+                .as_ref()
+                .map(|pending| pending.blocked_on_catch_up)
+                .unwrap_or(false),
+        }))
     }
 
     pub async fn validate_serving_fence(
@@ -387,6 +469,14 @@ impl ReplicaRuntime {
             .lifecycle
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("range lifecycle manager unavailable"))?;
+        let left_id = format!("{range_id}-left");
+        let right_id = format!("{range_id}-right");
+        if self.host.open_range(range_id).await?.is_none()
+            && self.host.open_range(&left_id).await?.is_some()
+            && self.host.open_range(&right_id).await?.is_some()
+        {
+            return Ok((left_id, right_id));
+        }
         let source = self.validate_serving_fence(range_id, None).await?;
         anyhow::ensure!(
             source.descriptor.boundary.contains(&split_key),
@@ -396,8 +486,6 @@ impl ReplicaRuntime {
             source.descriptor.boundary.start_key.as_deref() != Some(split_key.as_slice()),
             "split key must advance lower boundary"
         );
-        let left_id = format!("{range_id}-left");
-        let right_id = format!("{range_id}-right");
         let source = self
             .rewrite_descriptor(range_id, |descriptor| {
                 descriptor.epoch += 1;
@@ -497,6 +585,13 @@ impl ReplicaRuntime {
             .lifecycle
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("range lifecycle manager unavailable"))?;
+        let merged_id = format!("merge-{left_range_id}-{right_range_id}");
+        if self.host.open_range(left_range_id).await?.is_none()
+            && self.host.open_range(right_range_id).await?.is_none()
+            && self.host.open_range(&merged_id).await?.is_some()
+        {
+            return Ok(merged_id);
+        }
         let left = self.validate_serving_fence(left_range_id, None).await?;
         let right = self.validate_serving_fence(right_range_id, None).await?;
         anyhow::ensure!(
@@ -516,7 +611,6 @@ impl ReplicaRuntime {
                 descriptor.lifecycle = ServiceShardLifecycle::Draining;
             })
             .await?;
-        let merged_id = format!("merge-{left_range_id}-{right_range_id}");
         let merged = lifecycle
             .create_range(ReplicatedRangeDescriptor::new(
                 merged_id.clone(),
@@ -579,6 +673,15 @@ impl ReplicaRuntime {
             .lifecycle
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("range lifecycle manager unavailable"))?;
+        if let Some(existing) = self.host.open_range(&descriptor.id).await? {
+            anyhow::ensure!(
+                existing.descriptor.shard == descriptor.shard
+                    && existing.descriptor.boundary == descriptor.boundary,
+                "range `{}` already exists with different descriptor",
+                descriptor.id
+            );
+            return Ok(descriptor.id);
+        }
         anyhow::ensure!(
             self.host.open_range(&descriptor.id).await?.is_none(),
             "range `{}` already exists",
@@ -591,6 +694,11 @@ impl ReplicaRuntime {
     }
 
     pub async fn drain_range(&self, range_id: &str) -> anyhow::Result<()> {
+        if let Some(range) = self.host.open_range(range_id).await? {
+            if range.descriptor.lifecycle == ServiceShardLifecycle::Draining {
+                return Ok(());
+            }
+        }
         let _ = self
             .rewrite_descriptor(range_id, |descriptor| {
                 descriptor.lifecycle = ServiceShardLifecycle::Draining;
@@ -607,7 +715,7 @@ impl ReplicaRuntime {
             .ok_or_else(|| anyhow::anyhow!("range lifecycle manager unavailable"))?;
         let removed = self.host.remove_range(range_id).await?;
         if removed.is_none() {
-            return Ok(false);
+            return Ok(true);
         }
         lifecycle.retire_range(range_id).await?;
         Ok(true)
@@ -625,8 +733,8 @@ impl ReplicaRuntime {
             .await?
             .ok_or_else(|| anyhow::anyhow!("range `{range_id}` not found"))?;
         let status = range.raft.status().await?;
-        let current_voters = status.cluster_config.voters;
-        let current_learners = status.cluster_config.learners;
+        let current_voters = status.cluster_config.voters.clone();
+        let current_learners = status.cluster_config.learners.clone();
 
         let mut desired_voters = voters;
         desired_voters.sort_unstable();
@@ -634,10 +742,7 @@ impl ReplicaRuntime {
         let mut desired_learners = learners;
         desired_learners.sort_unstable();
         desired_learners.dedup();
-        let desired_target = PendingReconfiguration {
-            voters: desired_voters.clone(),
-            learners: desired_learners.clone(),
-        };
+        let desired_target = (desired_voters.clone(), desired_learners.clone());
         let pending_target = self
             .pending_reconfig
             .lock()
@@ -646,7 +751,7 @@ impl ReplicaRuntime {
             .cloned();
         if let Some(pending) = pending_target.as_ref() {
             anyhow::ensure!(
-                pending == &desired_target,
+                (pending.target_voters.clone(), pending.target_learners.clone()) == desired_target,
                 "config change already in progress for range `{range_id}`"
             );
         }
@@ -661,7 +766,17 @@ impl ReplicaRuntime {
             self.pending_reconfig
                 .lock()
                 .expect("replica runtime poisoned")
-                .insert(range_id.to_string(), desired_target);
+                .insert(
+                    range_id.to_string(),
+                    PendingReconfiguration {
+                        target_voters: desired_voters,
+                        target_learners: desired_learners,
+                        current_voters: current_voters.clone(),
+                        current_learners: staged_learners.clone(),
+                        phase: ReconfigurationPhase::StagingLearners,
+                        blocked_on_catch_up: true,
+                    },
+                );
             return range
                 .raft
                 .change_cluster_config(RaftConfigChange::ReplaceCluster {
@@ -669,6 +784,34 @@ impl ReplicaRuntime {
                     learners: staged_learners,
                 })
                 .await;
+        }
+
+        if current_voters == desired_voters && current_learners == desired_learners {
+            self.pending_reconfig
+                .lock()
+                .expect("replica runtime poisoned")
+                .remove(range_id);
+            return Ok(());
+        }
+
+        let blocked_on_catch_up =
+            !Self::desired_replicas_caught_up(&status, &desired_voters, &desired_learners);
+        if blocked_on_catch_up {
+            self.pending_reconfig
+                .lock()
+                .expect("replica runtime poisoned")
+                .insert(
+                    range_id.to_string(),
+                    PendingReconfiguration {
+                        target_voters: desired_voters,
+                        target_learners: desired_learners,
+                        current_voters: current_voters.clone(),
+                        current_learners: current_learners.clone(),
+                        phase: ReconfigurationPhase::Finalizing,
+                        blocked_on_catch_up: true,
+                    },
+                );
+            anyhow::bail!("config change blocked on catch-up for range `{range_id}`");
         }
 
         if let Some(local_leader) = status.leader_node_id {
@@ -706,6 +849,10 @@ impl ReplicaRuntime {
             .open_range(range_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("range `{range_id}` not found"))?;
+        let status = range.raft.status().await?;
+        if status.leader_node_id == Some(target_node_id) {
+            return Ok(());
+        }
         range.raft.transfer_leadership(target_node_id).await
     }
 
@@ -719,6 +866,10 @@ impl ReplicaRuntime {
             .open_range(range_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("range `{range_id}` not found"))?;
+        let status = range.raft.status().await?;
+        if status.leader_node_id == Some(new_leader_node_id) {
+            return Ok(());
+        }
         range
             .raft
             .change_cluster_config(RaftConfigChange::ReplaceCluster {
@@ -784,73 +935,84 @@ impl ReplicaRuntime {
 
     pub async fn health_snapshot(&self) -> anyhow::Result<Vec<RangeHealthSnapshot>> {
         let statuses = self.host.list_ranges().await?;
-        Ok(statuses
-            .into_iter()
-            .map(|status| {
-                let lag = status
-                    .raft
-                    .replica_progress
-                    .iter()
-                    .map(|progress| ReplicaLagSnapshot {
-                        node_id: progress.node_id,
-                        lag: status
-                            .raft
-                            .last_log_index
-                            .saturating_sub(progress.match_index),
-                        match_index: progress.match_index,
-                        next_index: progress.next_index,
-                    })
-                    .collect();
-                let health = RangeHealthSnapshot {
-                    range_id: status.descriptor.id,
-                    role: status.raft.role,
-                    current_term: status.raft.current_term,
-                    leader_node_id: status.raft.leader_node_id,
-                    commit_index: status.raft.commit_index,
-                    applied_index: status.raft.applied_index,
-                    latest_snapshot_index: status.raft.latest_snapshot_index,
-                    replica_lag: lag,
-                };
-                let role_value = match health.role {
-                    greenmqtt_kv_raft::RaftNodeRole::Follower => 0.0,
-                    greenmqtt_kv_raft::RaftNodeRole::Candidate => 1.0,
-                    greenmqtt_kv_raft::RaftNodeRole::Leader => 2.0,
-                };
-                gauge!("kv_raft_current_term", "range_id" => health.range_id.clone())
-                    .set(health.current_term as f64);
-                gauge!("kv_raft_role", "range_id" => health.range_id.clone()).set(role_value);
-                gauge!("kv_raft_leader_id", "range_id" => health.range_id.clone())
-                    .set(health.leader_node_id.unwrap_or_default() as f64);
-                gauge!("kv_raft_commit_index", "range_id" => health.range_id.clone())
-                    .set(health.commit_index as f64);
-                gauge!("kv_raft_applied_index", "range_id" => health.range_id.clone())
-                    .set(health.applied_index as f64);
-                for replica in &health.replica_lag {
-                    gauge!(
-                        "kv_raft_replication_lag",
-                        "range_id" => health.range_id.clone(),
-                        "replica_id" => replica.node_id.to_string()
-                    )
-                    .set(replica.lag as f64);
-                }
-                health
-            })
-            .collect())
+        let mut health_entries = Vec::with_capacity(statuses.len());
+        for status in statuses {
+            let lag = status
+                .raft
+                .replica_progress
+                .iter()
+                .map(|progress| ReplicaLagSnapshot {
+                    node_id: progress.node_id,
+                    lag: status
+                        .raft
+                        .last_log_index
+                        .saturating_sub(progress.match_index),
+                    match_index: progress.match_index,
+                    next_index: progress.next_index,
+                })
+                .collect();
+            let health = RangeHealthSnapshot {
+                range_id: status.descriptor.id.clone(),
+                lifecycle: status.descriptor.lifecycle,
+                role: status.raft.role,
+                current_term: status.raft.current_term,
+                leader_node_id: status.raft.leader_node_id,
+                commit_index: status.raft.commit_index,
+                applied_index: status.raft.applied_index,
+                latest_snapshot_index: status.raft.latest_snapshot_index,
+                replica_lag: lag,
+                reconfiguration: self
+                    .reconfiguration_state(&status.descriptor.id)
+                    .await?
+                    .expect("range state should exist for listed range"),
+            };
+            let role_value = match health.role {
+                greenmqtt_kv_raft::RaftNodeRole::Follower => 0.0,
+                greenmqtt_kv_raft::RaftNodeRole::Candidate => 1.0,
+                greenmqtt_kv_raft::RaftNodeRole::Leader => 2.0,
+            };
+            gauge!("kv_raft_current_term", "range_id" => health.range_id.clone())
+                .set(health.current_term as f64);
+            gauge!("kv_raft_role", "range_id" => health.range_id.clone()).set(role_value);
+            gauge!("kv_raft_leader_id", "range_id" => health.range_id.clone())
+                .set(health.leader_node_id.unwrap_or_default() as f64);
+            gauge!("kv_raft_commit_index", "range_id" => health.range_id.clone())
+                .set(health.commit_index as f64);
+            gauge!("kv_raft_applied_index", "range_id" => health.range_id.clone())
+                .set(health.applied_index as f64);
+            for replica in &health.replica_lag {
+                gauge!(
+                    "kv_raft_replication_lag",
+                    "range_id" => health.range_id.clone(),
+                    "replica_id" => replica.node_id.to_string()
+                )
+                .set(replica.lag as f64);
+            }
+            health_entries.push(health);
+        }
+        Ok(health_entries)
     }
 
     pub async fn debug_dump(&self) -> anyhow::Result<String> {
         let health = self.health_snapshot().await?;
         let mut lines = Vec::new();
         for range in health {
-            lines.push(format!(
-                "range={} role={:?} term={} leader={:?} commit={} applied={} snapshot={:?}",
+                lines.push(format!(
+                "range={} lifecycle={:?} role={:?} term={} leader={:?} commit={} applied={} snapshot={:?} current_voters={:?} current_learners={:?} pending_voters={:?} pending_learners={:?} phase={:?} blocked_on_catch_up={}",
                 range.range_id,
+                range.lifecycle,
                 range.role,
                 range.current_term,
                 range.leader_node_id,
                 range.commit_index,
                 range.applied_index,
-                range.latest_snapshot_index
+                range.latest_snapshot_index,
+                range.reconfiguration.current_voters,
+                range.reconfiguration.current_learners,
+                range.reconfiguration.pending_voters,
+                range.reconfiguration.pending_learners,
+                range.reconfiguration.phase,
+                range.reconfiguration.blocked_on_catch_up
             ));
             for replica in range.replica_lag {
                 lines.push(format!(
@@ -1018,10 +1180,11 @@ mod tests {
     };
     use greenmqtt_kv_balance::{execute_balance_commands, BalanceCommand};
     use greenmqtt_kv_engine::{KvEngine, MemoryKvEngine};
-    use greenmqtt_kv_raft::{MemoryRaftNode, RaftMessage, RaftNode};
+    use greenmqtt_kv_raft::{AppendEntriesResponse, MemoryRaftNode, RaftMessage, RaftNode};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+    use crate::ReconfigurationPhase;
 
     #[derive(Clone)]
     struct TestRangeLifecycleManager {
@@ -1754,6 +1917,222 @@ mod tests {
         let status = raft.status().await.unwrap();
         assert_eq!(status.cluster_config.voters, vec![1, 2]);
         assert_eq!(status.cluster_config.learners, vec![3]);
+    }
+
+    #[tokio::test]
+    async fn replica_runtime_blocks_finalize_until_staged_replica_catches_up() {
+        let engine = MemoryKvEngine::default();
+        engine
+            .bootstrap(greenmqtt_kv_engine::KvRangeBootstrap {
+                range_id: "range-stage-catchup".into(),
+                boundary: RangeBoundary::full(),
+            })
+            .await
+            .unwrap();
+        let space = Arc::<dyn greenmqtt_kv_engine::KvRangeSpace>::from(
+            engine.open_range("range-stage-catchup").await.unwrap(),
+        );
+        let raft = Arc::new(MemoryRaftNode::single_node(1, "range-stage-catchup"));
+        raft.recover().await.unwrap();
+        let _ = raft.propose(Bytes::from_static(b"cmd")).await.unwrap();
+        let host = Arc::new(MemoryKvRangeHost::default());
+        host.add_range(HostedRange {
+            descriptor: ReplicatedRangeDescriptor::new(
+                "range-stage-catchup",
+                ServiceShardKey::retain("tenant-a"),
+                RangeBoundary::full(),
+                1,
+                1,
+                Some(1),
+                vec![RangeReplica::new(
+                    1,
+                    ReplicaRole::Voter,
+                    ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ),
+            raft: raft.clone(),
+            space,
+        })
+        .await
+        .unwrap();
+        let runtime = ReplicaRuntime::new(host, Arc::new(RecordingTransport::default()));
+        runtime
+            .change_replicas("range-stage-catchup", vec![1, 2], Vec::new())
+            .await
+            .unwrap();
+        let error = runtime
+            .change_replicas("range-stage-catchup", vec![1, 2], Vec::new())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("blocked on catch-up"));
+        let pending = runtime
+            .pending_reconfiguration("range-stage-catchup")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.phase, ReconfigurationPhase::Finalizing);
+        assert!(pending.blocked_on_catch_up);
+
+        let status = raft.status().await.unwrap();
+        raft.receive(
+            2,
+            RaftMessage::AppendEntriesResponse(AppendEntriesResponse {
+                term: status.current_term,
+                success: true,
+                match_index: status.commit_index,
+            }),
+        )
+        .await
+        .unwrap();
+
+        runtime
+            .change_replicas("range-stage-catchup", vec![1, 2], Vec::new())
+            .await
+            .unwrap();
+        let final_status = raft.status().await.unwrap();
+        assert_eq!(final_status.cluster_config.voters, vec![1, 2]);
+        assert!(final_status.cluster_config.learners.is_empty());
+        assert!(runtime
+            .pending_reconfiguration("range-stage-catchup")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn replica_runtime_tracks_pending_reconfiguration_phase() {
+        let engine = MemoryKvEngine::default();
+        engine
+            .bootstrap(greenmqtt_kv_engine::KvRangeBootstrap {
+                range_id: "range-stage-state".into(),
+                boundary: RangeBoundary::full(),
+            })
+            .await
+            .unwrap();
+        let space = Arc::<dyn greenmqtt_kv_engine::KvRangeSpace>::from(
+            engine.open_range("range-stage-state").await.unwrap(),
+        );
+        let raft = Arc::new(MemoryRaftNode::single_node(1, "range-stage-state"));
+        raft.recover().await.unwrap();
+        let host = Arc::new(MemoryKvRangeHost::default());
+        host.add_range(HostedRange {
+            descriptor: ReplicatedRangeDescriptor::new(
+                "range-stage-state",
+                ServiceShardKey::retain("tenant-a"),
+                RangeBoundary::full(),
+                1,
+                1,
+                Some(1),
+                vec![RangeReplica::new(
+                    1,
+                    ReplicaRole::Voter,
+                    ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ),
+            raft: raft.clone(),
+            space,
+        })
+        .await
+        .unwrap();
+        let runtime = ReplicaRuntime::new(host, Arc::new(RecordingTransport::default()));
+        runtime
+            .change_replicas("range-stage-state", vec![1, 2], Vec::new())
+            .await
+            .unwrap();
+        let pending = runtime
+            .pending_reconfiguration("range-stage-state")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.phase, ReconfigurationPhase::StagingLearners);
+        assert_eq!(pending.target_voters, vec![1, 2]);
+        assert_eq!(pending.current_voters, vec![1]);
+        assert_eq!(pending.current_learners, vec![2]);
+        assert!(pending.blocked_on_catch_up);
+    }
+
+    #[tokio::test]
+    async fn replica_runtime_survives_repeated_replica_reconfiguration_cycles() {
+        let engine = MemoryKvEngine::default();
+        engine
+            .bootstrap(greenmqtt_kv_engine::KvRangeBootstrap {
+                range_id: "range-reconfig-loop".into(),
+                boundary: RangeBoundary::full(),
+            })
+            .await
+            .unwrap();
+        let space = Arc::<dyn greenmqtt_kv_engine::KvRangeSpace>::from(
+            engine.open_range("range-reconfig-loop").await.unwrap(),
+        );
+        let raft = Arc::new(MemoryRaftNode::single_node(1, "range-reconfig-loop"));
+        raft.recover().await.unwrap();
+        let _ = raft.propose(Bytes::from_static(b"cmd")).await.unwrap();
+        let host = Arc::new(MemoryKvRangeHost::default());
+        host.add_range(HostedRange {
+            descriptor: ReplicatedRangeDescriptor::new(
+                "range-reconfig-loop",
+                ServiceShardKey::retain("tenant-a"),
+                RangeBoundary::full(),
+                1,
+                1,
+                Some(1),
+                vec![RangeReplica::new(
+                    1,
+                    ReplicaRole::Voter,
+                    ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ),
+            raft: raft.clone(),
+            space,
+        })
+        .await
+        .unwrap();
+        let runtime = ReplicaRuntime::new(host, Arc::new(RecordingTransport::default()));
+
+        for target in [2u64, 3, 2, 3] {
+            runtime
+                .change_replicas("range-reconfig-loop", vec![1, target], Vec::new())
+                .await
+                .unwrap();
+            let status = raft.status().await.unwrap();
+            raft.receive(
+                target,
+                RaftMessage::AppendEntriesResponse(AppendEntriesResponse {
+                    term: status.current_term,
+                    success: true,
+                    match_index: status.commit_index,
+                }),
+            )
+            .await
+            .unwrap();
+            runtime
+                .change_replicas("range-reconfig-loop", vec![1, target], Vec::new())
+                .await
+                .unwrap();
+            runtime
+                .change_replicas("range-reconfig-loop", vec![1], Vec::new())
+                .await
+                .unwrap();
+        }
+
+        let final_status = raft.status().await.unwrap();
+        assert_eq!(final_status.cluster_config.voters, vec![1]);
+        assert!(final_status.cluster_config.learners.is_empty());
+        assert!(runtime
+            .pending_reconfiguration("range-reconfig-loop")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

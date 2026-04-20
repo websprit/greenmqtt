@@ -2577,6 +2577,52 @@ async fn tenant_inbox_gc_runner_targets_single_tenant() {
 }
 
 #[tokio::test]
+async fn tenant_inbox_gc_runner_handles_heavy_expiry_gc_workload() {
+    let inbox: Arc<dyn InboxService> = Arc::new(InboxHandle::default());
+    for index in 0..64u16 {
+        inbox
+            .enqueue(OfflineMessage {
+                tenant_id: "t1".into(),
+                session_id: format!("expired-{index}"),
+                topic: format!("devices/{index}/state"),
+                payload: b"expired".to_vec().into(),
+                qos: 1,
+                retain: false,
+                from_session_id: "src".into(),
+                properties: PublishProperties {
+                    message_expiry_interval_secs: Some(1),
+                    stored_at_ms: Some(1_000),
+                    ..PublishProperties::default()
+                },
+            })
+            .await
+            .unwrap();
+        inbox
+            .enqueue(OfflineMessage {
+                tenant_id: "t1".into(),
+                session_id: format!("fresh-{index}"),
+                topic: format!("devices/{index}/fresh"),
+                payload: b"fresh".to_vec().into(),
+                qos: 1,
+                retain: false,
+                from_session_id: "src".into(),
+                properties: PublishProperties {
+                    message_expiry_interval_secs: Some(60),
+                    stored_at_ms: Some(1_000),
+                    ..PublishProperties::default()
+                },
+            })
+            .await
+            .unwrap();
+    }
+
+    let runner = TenantInboxGcRunner::new(inbox.clone());
+    let stats = runner.run_tenant("t1", 3_000).await.unwrap();
+    assert_eq!(stats.offline_messages, 64);
+    assert_eq!(inbox.list_tenant_offline("t1").await.unwrap().len(), 64);
+}
+
+#[tokio::test]
 async fn inbox_batch_scheduler_covers_attach_fetch_commit_insert_subscribe_and_unsubscribe() {
     let inbox: Arc<dyn InboxService> = Arc::new(InboxHandle::default());
     let scheduler = InboxBatchScheduler::new(inbox.clone());

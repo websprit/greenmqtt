@@ -11,13 +11,23 @@ use greenmqtt_core::{
     ServiceKind, ServiceShardKey, ServiceShardKind, ServiceShardLifecycle, SessionKind,
     ShardControlRegistry,
 };
-use greenmqtt_dist::{DistHandle, DistRouter, PersistentDistHandle, ReplicatedDistHandle};
+use greenmqtt_dist::{
+    DistBalanceAction, DistBalancePolicy, DistHandle, DistMaintenanceWorker, DistRouter,
+    DistTenantStats, PersistentDistHandle, ReplicatedDistHandle, ThresholdDistBalancePolicy,
+};
 use greenmqtt_http_api::HttpApi;
-use greenmqtt_inbox::{InboxHandle, InboxService, PersistentInboxHandle, ReplicatedInboxHandle};
+use greenmqtt_inbox::{
+    DelayedLwtPublish, DelayedLwtSink, InboxBalanceAction, InboxBalancePolicy,
+    InboxDelayTaskRunner, InboxDelayedTask, InboxHandle, InboxMaintenanceWorker, InboxService,
+    InboxServiceDelayHandler, InboxTenantStats, PersistentInboxHandle, ReplicatedInboxHandle,
+    TenantInboxGcRunner, ThresholdInboxBalancePolicy,
+};
 use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter, LeaderRoutedKvRangeExecutor};
 use greenmqtt_kv_engine::{
     KvEngine, KvMutation, KvRangeBootstrap, KvRangeCheckpoint, KvRangeSnapshot, RocksDbKvEngine,
 };
+use greenmqtt_kv_raft::{MemoryRaftNode, RaftNode};
+use greenmqtt_kv_server::{HostedRange, KvRangeHost, MemoryKvRangeHost, RangeLifecycleManager, ReplicaRuntime};
 use greenmqtt_plugin_api::{
     current_listener_profile, AclAction, AclDecision, AclProvider, AclRule, AuthProvider,
     BridgeEventHook, BridgeRule, ConfiguredAcl, ConfiguredAuth, ConfiguredEventHook, EventHook,
@@ -26,11 +36,14 @@ use greenmqtt_plugin_api::{
     TopicRewriteRule, WebHookConfig, WebHookEventHook, BRIDGE_CLIENT_ID_PREFIX,
 };
 use greenmqtt_retain::{
-    PersistentRetainHandle, ReplicatedRetainHandle, RetainHandle, RetainService,
+    PersistentRetainHandle, ReplicatedRetainHandle, RetainBalanceAction, RetainBalancePolicy,
+    RetainHandle, RetainMaintenanceWorker, RetainService, RetainTenantStats,
+    ThresholdRetainBalancePolicy,
 };
 use greenmqtt_rpc::{
     DistGrpcClient, InboxGrpcClient, KvRangeGrpcClient, KvRangeGrpcExecutorFactory,
-    MetadataGrpcClient, PersistentMetadataRegistry, ReplicatedMetadataRegistry,
+    MetadataGrpcClient, MetadataPlaneLayout, PersistentMetadataRegistry,
+    NoopReplicaTransport, RangeControlGrpcClient, ReplicatedMetadataRegistry,
     RetainGrpcClient, RpcRuntime, SessionDictGrpcClient, StaticPeerForwarder,
     StaticServiceEndpointRegistry,
 };
@@ -69,6 +82,15 @@ type CompareStateServices = (
     Arc<dyn RetainService>,
     Option<PathBuf>,
 );
+
+struct LocalRangeRuntimeStack {
+    sessiondict: Arc<dyn SessionDirectory>,
+    dist: Arc<dyn DistRouter>,
+    inbox: Arc<dyn InboxService>,
+    retain: Arc<dyn RetainService>,
+    range_host: Arc<dyn KvRangeHost>,
+    range_runtime: Arc<ReplicaRuntime>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ListenerSpec {
@@ -386,6 +408,54 @@ struct ShardActionEnvelope {
     current: Option<greenmqtt_core::ServiceShardAssignment>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RangeCliCommand {
+    Bootstrap {
+        descriptor: ReplicatedRangeDescriptor,
+    },
+    Split {
+        range_id: String,
+        split_key: Vec<u8>,
+    },
+    Merge {
+        left_range_id: String,
+        right_range_id: String,
+    },
+    Drain {
+        range_id: String,
+    },
+    Retire {
+        range_id: String,
+    },
+    Recover {
+        range_id: String,
+        new_leader_node_id: u64,
+    },
+    ChangeReplicas {
+        range_id: String,
+        voters: Vec<u64>,
+        learners: Vec<u64>,
+    },
+    TransferLeadership {
+        range_id: String,
+        target_node_id: u64,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RangeCliReply {
+    operation: String,
+    ok: bool,
+    status: String,
+    reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    range_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    left_range_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    right_range_id: Option<String>,
+}
+
 fn run_shard_command(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let addr = std::env::var("GREENMQTT_HTTP_BIND")
         .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
@@ -397,6 +467,385 @@ fn run_shard_command(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
         OutputMode::Text => println!("{}", render_shard_response_text(&response)?),
     }
     Ok(())
+}
+
+async fn run_range_command(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
+    let endpoint = range_control_endpoint()?;
+    let response = execute_range_command_with_endpoint(args, &endpoint).await?;
+    println!("{response}");
+    Ok(())
+}
+
+async fn execute_range_command_with_endpoint(
+    args: impl Iterator<Item = String>,
+    endpoint: &str,
+) -> anyhow::Result<String> {
+    let (command, output_mode) = range_command_request(args)?;
+    let client = RangeControlGrpcClient::connect(endpoint.to_string()).await?;
+    let reply = match command {
+        RangeCliCommand::Bootstrap { descriptor } => RangeCliReply {
+            operation: "bootstrap".into(),
+            ok: true,
+            status: "bootstrapped".into(),
+            reason: "Range bootstrapped and marked serving.".into(),
+            range_id: Some(client.bootstrap_range(descriptor).await?),
+            left_range_id: None,
+            right_range_id: None,
+        },
+        RangeCliCommand::Split { range_id, split_key } => {
+            let (left_range_id, right_range_id) = client.split_range(&range_id, split_key).await?;
+            RangeCliReply {
+                operation: "split".into(),
+                ok: true,
+                status: "split".into(),
+                reason: "Range split completed; child ranges are now available.".into(),
+                range_id: Some(range_id),
+                left_range_id: Some(left_range_id),
+                right_range_id: Some(right_range_id),
+            }
+        }
+        RangeCliCommand::Merge {
+            left_range_id,
+            right_range_id,
+        } => RangeCliReply {
+            operation: "merge".into(),
+            ok: true,
+            status: "merged".into(),
+            reason: "Sibling ranges were merged into a single serving range.".into(),
+            range_id: Some(client.merge_ranges(&left_range_id, &right_range_id).await?),
+            left_range_id: Some(left_range_id),
+            right_range_id: Some(right_range_id),
+        },
+        RangeCliCommand::Drain { range_id } => {
+            client.drain_range(&range_id).await?;
+            RangeCliReply {
+                operation: "drain".into(),
+                ok: true,
+                status: "draining".into(),
+                reason: "Range marked draining; writes should migrate away before retirement.".into(),
+                range_id: Some(range_id),
+                left_range_id: None,
+                right_range_id: None,
+            }
+        }
+        RangeCliCommand::Retire { range_id } => {
+            client.retire_range(&range_id).await?;
+            RangeCliReply {
+                operation: "retire".into(),
+                ok: true,
+                status: "retired".into(),
+                reason: "Range retired; repeated retire requests are treated as already applied.".into(),
+                range_id: Some(range_id),
+                left_range_id: None,
+                right_range_id: None,
+            }
+        }
+        RangeCliCommand::Recover {
+            range_id,
+            new_leader_node_id,
+        } => {
+            client.recover_range(&range_id, new_leader_node_id).await?;
+            RangeCliReply {
+                operation: "recover".into(),
+                ok: true,
+                status: "recovered".into(),
+                reason: "Recovery command accepted; the target leader is now authoritative or already was.".into(),
+                range_id: Some(range_id),
+                left_range_id: None,
+                right_range_id: None,
+            }
+        }
+        RangeCliCommand::ChangeReplicas {
+            range_id,
+            voters,
+            learners,
+        } => {
+            client.change_replicas(&range_id, voters, learners).await?;
+            RangeCliReply {
+                operation: "change-replicas".into(),
+                ok: true,
+                status: "reconfiguring".into(),
+                reason: "Replica change accepted; consult range health for staging or catch-up progress.".into(),
+                range_id: Some(range_id),
+                left_range_id: None,
+                right_range_id: None,
+            }
+        }
+        RangeCliCommand::TransferLeadership {
+            range_id,
+            target_node_id,
+        } => {
+            client.transfer_leadership(&range_id, target_node_id).await?;
+            RangeCliReply {
+                operation: "transfer-leadership".into(),
+                ok: true,
+                status: "leadership-updated".into(),
+                reason: "Leadership transfer accepted; if the target already led the range this was a no-op.".into(),
+                range_id: Some(range_id),
+                left_range_id: None,
+                right_range_id: None,
+            }
+        }
+    };
+    match output_mode {
+        OutputMode::Json => Ok(serde_json::to_string(&reply)?),
+        OutputMode::Text => Ok(render_range_response_text(&reply)),
+    }
+}
+
+fn range_control_endpoint() -> anyhow::Result<String> {
+    let raw = std::env::var("GREENMQTT_RANGE_CONTROL_ENDPOINT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("GREENMQTT_RPC_BIND")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_else(|| "127.0.0.1:50051".to_string());
+    Ok(if raw.starts_with("http://") || raw.starts_with("https://") {
+        raw
+    } else {
+        format!("http://{raw}")
+    })
+}
+
+fn parse_service_shard_kind(value: &str) -> anyhow::Result<ServiceShardKind> {
+    match value {
+        "sessiondict" => Ok(ServiceShardKind::SessionDict),
+        "dist" => Ok(ServiceShardKind::Dist),
+        "inbox" => Ok(ServiceShardKind::Inbox),
+        "inflight" => Ok(ServiceShardKind::Inflight),
+        "retain" => Ok(ServiceShardKind::Retain),
+        _ => anyhow::bail!("invalid range kind: {value}"),
+    }
+}
+
+fn parse_node_id_list(value: &str) -> anyhow::Result<Vec<u64>> {
+    value
+        .split(',')
+        .filter(|item| !item.trim().is_empty())
+        .map(|item| {
+            item.trim()
+                .parse::<u64>()
+                .map_err(|_| anyhow::anyhow!("invalid node id: {}", item.trim()))
+        })
+        .collect()
+}
+
+fn render_range_response_text(reply: &RangeCliReply) -> String {
+    match (
+        reply.range_id.as_deref(),
+        reply.left_range_id.as_deref(),
+        reply.right_range_id.as_deref(),
+    ) {
+        (Some(range_id), Some(left), Some(right)) => {
+            format!(
+                "ok operation={} status={} reason=\"{}\" range_id={} left_range_id={} right_range_id={}",
+                reply.operation, reply.status, reply.reason, range_id, left, right
+            )
+        }
+        (Some(range_id), _, _) => format!(
+            "ok operation={} status={} reason=\"{}\" range_id={}",
+            reply.operation, reply.status, reply.reason, range_id
+        ),
+        _ => format!(
+            "ok operation={} status={} reason=\"{}\"",
+            reply.operation, reply.status, reply.reason
+        ),
+    }
+}
+
+fn range_command_request(
+    mut args: impl Iterator<Item = String>,
+) -> anyhow::Result<(RangeCliCommand, OutputMode)> {
+    let subcommand = args
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("missing range subcommand"))?;
+    match subcommand.as_str() {
+        "bootstrap" => {
+            let mut range_id = None;
+            let mut kind = None;
+            let mut tenant_id = None;
+            let mut scope = None;
+            let mut start_key = None;
+            let mut end_key = None;
+            let mut epoch = 1u64;
+            let mut config_version = 1u64;
+            let mut leader_node_id = None;
+            let mut voters = None;
+            let mut learners = Vec::new();
+            let mut output = output_mode();
+            while let Some(flag) = args.next() {
+                match flag.as_str() {
+                    "--range-id" => range_id = Some(args.next().ok_or_else(|| anyhow::anyhow!("missing value for --range-id"))?),
+                    "--kind" => kind = Some(parse_service_shard_kind(&args.next().ok_or_else(|| anyhow::anyhow!("missing value for --kind"))?)?),
+                    "--tenant-id" => tenant_id = Some(args.next().ok_or_else(|| anyhow::anyhow!("missing value for --tenant-id"))?),
+                    "--scope" => scope = Some(args.next().ok_or_else(|| anyhow::anyhow!("missing value for --scope"))?),
+                    "--start-key" => start_key = Some(args.next().ok_or_else(|| anyhow::anyhow!("missing value for --start-key"))?.into_bytes()),
+                    "--end-key" => end_key = Some(args.next().ok_or_else(|| anyhow::anyhow!("missing value for --end-key"))?.into_bytes()),
+                    "--epoch" => epoch = args.next().ok_or_else(|| anyhow::anyhow!("missing value for --epoch"))?.parse()?,
+                    "--config-version" => config_version = args.next().ok_or_else(|| anyhow::anyhow!("missing value for --config-version"))?.parse()?,
+                    "--leader-node-id" => leader_node_id = Some(args.next().ok_or_else(|| anyhow::anyhow!("missing value for --leader-node-id"))?.parse()?),
+                    "--voters" => voters = Some(parse_node_id_list(&args.next().ok_or_else(|| anyhow::anyhow!("missing value for --voters"))?)?),
+                    "--learners" => learners = parse_node_id_list(&args.next().ok_or_else(|| anyhow::anyhow!("missing value for --learners"))?)?,
+                    "--output" => output = parse_output_mode(&args.next().ok_or_else(|| anyhow::anyhow!("missing value for --output"))?)?,
+                    _ => anyhow::bail!("unknown range bootstrap flag: {flag}"),
+                }
+            }
+            let voters = voters.ok_or_else(|| anyhow::anyhow!("bootstrap requires --voters"))?;
+            let leader = leader_node_id.or_else(|| voters.first().copied());
+            Ok((
+                RangeCliCommand::Bootstrap {
+                    descriptor: ReplicatedRangeDescriptor::new(
+                        range_id.ok_or_else(|| anyhow::anyhow!("bootstrap requires --range-id"))?,
+                        ServiceShardKey {
+                            kind: kind.ok_or_else(|| anyhow::anyhow!("bootstrap requires --kind"))?,
+                            tenant_id: tenant_id.ok_or_else(|| anyhow::anyhow!("bootstrap requires --tenant-id"))?,
+                            scope: scope.ok_or_else(|| anyhow::anyhow!("bootstrap requires --scope"))?,
+                        },
+                        RangeBoundary::new(start_key, end_key),
+                        epoch,
+                        config_version,
+                        leader,
+                        voters
+                            .iter()
+                            .copied()
+                            .map(|node_id| {
+                                RangeReplica::new(node_id, ReplicaRole::Voter, ReplicaSyncState::Replicating)
+                            })
+                            .chain(learners.iter().copied().map(|node_id| {
+                                RangeReplica::new(node_id, ReplicaRole::Learner, ReplicaSyncState::Replicating)
+                            }))
+                            .collect(),
+                        0,
+                        0,
+                        ServiceShardLifecycle::Bootstrapping,
+                    ),
+                },
+                output,
+            ))
+        }
+        "split" => {
+            let range_id = args.next().ok_or_else(|| anyhow::anyhow!("missing range_id"))?;
+            let split_key = args.next().ok_or_else(|| anyhow::anyhow!("missing split_key"))?;
+            let mut output = output_mode();
+            while let Some(flag) = args.next() {
+                match flag.as_str() {
+                    "--output" => {
+                        output = parse_output_mode(
+                            &args.next().ok_or_else(|| anyhow::anyhow!("missing value for --output"))?,
+                        )?
+                    }
+                    _ => anyhow::bail!("unknown range split flag: {flag}"),
+                }
+            }
+            Ok((RangeCliCommand::Split { range_id, split_key: split_key.into_bytes() }, output))
+        }
+        "merge" => {
+            let left_range_id = args.next().ok_or_else(|| anyhow::anyhow!("missing left_range_id"))?;
+            let right_range_id = args.next().ok_or_else(|| anyhow::anyhow!("missing right_range_id"))?;
+            let mut output = output_mode();
+            while let Some(flag) = args.next() {
+                match flag.as_str() {
+                    "--output" => {
+                        output = parse_output_mode(
+                            &args.next().ok_or_else(|| anyhow::anyhow!("missing value for --output"))?,
+                        )?
+                    }
+                    _ => anyhow::bail!("unknown range merge flag: {flag}"),
+                }
+            }
+            Ok((RangeCliCommand::Merge { left_range_id, right_range_id }, output))
+        }
+        "drain" | "retire" => {
+            let range_id = args.next().ok_or_else(|| anyhow::anyhow!("missing range_id"))?;
+            let mut output = output_mode();
+            while let Some(flag) = args.next() {
+                match flag.as_str() {
+                    "--output" => {
+                        output = parse_output_mode(
+                            &args.next().ok_or_else(|| anyhow::anyhow!("missing value for --output"))?,
+                        )?
+                    }
+                    _ => anyhow::bail!("unknown range {subcommand} flag: {flag}"),
+                }
+            }
+            let command = if subcommand == "drain" {
+                RangeCliCommand::Drain { range_id }
+            } else {
+                RangeCliCommand::Retire { range_id }
+            };
+            Ok((command, output))
+        }
+        "recover" => {
+            let range_id = args.next().ok_or_else(|| anyhow::anyhow!("missing range_id"))?;
+            let new_leader_node_id = args.next().ok_or_else(|| anyhow::anyhow!("missing new_leader_node_id"))?.parse()?;
+            let mut output = output_mode();
+            while let Some(flag) = args.next() {
+                match flag.as_str() {
+                    "--output" => {
+                        output = parse_output_mode(
+                            &args.next().ok_or_else(|| anyhow::anyhow!("missing value for --output"))?,
+                        )?
+                    }
+                    _ => anyhow::bail!("unknown range recover flag: {flag}"),
+                }
+            }
+            Ok((RangeCliCommand::Recover { range_id, new_leader_node_id }, output))
+        }
+        "change-replicas" => {
+            let range_id = args.next().ok_or_else(|| anyhow::anyhow!("missing range_id"))?;
+            let mut voters = None;
+            let mut learners = Vec::new();
+            let mut output = output_mode();
+            while let Some(flag) = args.next() {
+                match flag.as_str() {
+                    "--voters" => {
+                        voters = Some(parse_node_id_list(
+                            &args.next().ok_or_else(|| anyhow::anyhow!("missing value for --voters"))?,
+                        )?)
+                    }
+                    "--learners" => {
+                        learners = parse_node_id_list(
+                            &args.next().ok_or_else(|| anyhow::anyhow!("missing value for --learners"))?,
+                        )?
+                    }
+                    "--output" => {
+                        output = parse_output_mode(
+                            &args.next().ok_or_else(|| anyhow::anyhow!("missing value for --output"))?,
+                        )?
+                    }
+                    _ => anyhow::bail!("unknown range change-replicas flag: {flag}"),
+                }
+            }
+            Ok((
+                RangeCliCommand::ChangeReplicas {
+                    range_id,
+                    voters: voters.ok_or_else(|| anyhow::anyhow!("change-replicas requires --voters"))?,
+                    learners,
+                },
+                output,
+            ))
+        }
+        "transfer-leadership" => {
+            let range_id = args.next().ok_or_else(|| anyhow::anyhow!("missing range_id"))?;
+            let target_node_id = args.next().ok_or_else(|| anyhow::anyhow!("missing target_node_id"))?.parse()?;
+            let mut output = output_mode();
+            while let Some(flag) = args.next() {
+                match flag.as_str() {
+                    "--output" => {
+                        output = parse_output_mode(
+                            &args.next().ok_or_else(|| anyhow::anyhow!("missing value for --output"))?,
+                        )?
+                    }
+                    _ => anyhow::bail!("unknown range transfer-leadership flag: {flag}"),
+                }
+            }
+            Ok((RangeCliCommand::TransferLeadership { range_id, target_node_id }, output))
+        }
+        _ => anyhow::bail!("unknown range subcommand: {subcommand}"),
+    }
 }
 
 fn shard_command_request(
@@ -658,6 +1107,9 @@ async fn main() -> anyhow::Result<()> {
     if mode == "shard" {
         return run_shard_command(args);
     }
+    if mode == "range" {
+        return run_range_command(args).await;
+    }
 
     let node_id = std::env::var("GREENMQTT_NODE_ID")
         .ok()
@@ -673,7 +1125,8 @@ async fn main() -> anyhow::Result<()> {
     let redis_url = std::env::var("GREENMQTT_REDIS_URL")
         .unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
     let output_mode = output_mode();
-
+    let mut local_range_host: Option<Arc<dyn KvRangeHost>> = None;
+    let mut local_range_runtime: Option<Arc<ReplicaRuntime>> = None;
     let (default_sessiondict, default_dist, default_inbox, default_retain): AppStateServices =
         match state_endpoint.as_deref() {
             Some(endpoint) => (
@@ -687,6 +1140,12 @@ async fn main() -> anyhow::Result<()> {
                     redis_services(&redis_url).await?
                 } else {
                     match data_dir {
+                        Some(ref dir) if storage_backend == "rocksdb" => {
+                            let stack = range_scoped_rocksdb_stack(PathBuf::from(dir), node_id).await?;
+                            local_range_host = Some(stack.range_host.clone());
+                            local_range_runtime = Some(stack.range_runtime.clone());
+                            (stack.sessiondict, stack.dist, stack.inbox, stack.retain)
+                        }
                         Some(ref dir) => {
                             durable_services(PathBuf::from(dir), &storage_backend, node_id).await?
                         }
@@ -717,8 +1176,8 @@ async fn main() -> anyhow::Result<()> {
             retain: default_retain,
             peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
             assignment_registry: None,
-            range_host: None,
-            range_runtime: None,
+            range_host: local_range_host,
+            range_runtime: local_range_runtime,
         }
         .serve(rpc_bind)
         .await?;
@@ -977,11 +1436,23 @@ async fn main() -> anyhow::Result<()> {
                             "GREENMQTT_METADATA_BACKEND=replicated requires GREENMQTT_RANGE_ENDPOINT or GREENMQTT_STATE_ENDPOINT"
                         )
                     })?;
-                let range_id = std::env::var("GREENMQTT_METADATA_RANGE_ID")
+                let range_base = std::env::var("GREENMQTT_METADATA_RANGE_ID")
                     .unwrap_or_else(|_| "__metadata".to_string());
-                let registry = Arc::new(ReplicatedMetadataRegistry::new(
+                let layout = MetadataPlaneLayout {
+                    assignments_range_id: std::env::var(
+                        "GREENMQTT_METADATA_ASSIGNMENTS_RANGE_ID",
+                    )
+                    .unwrap_or_else(|_| format!("{range_base}.assignments")),
+                    members_range_id: std::env::var("GREENMQTT_METADATA_MEMBERS_RANGE_ID")
+                        .unwrap_or_else(|_| format!("{range_base}.members")),
+                    ranges_range_id: std::env::var("GREENMQTT_METADATA_RANGES_RANGE_ID")
+                        .unwrap_or_else(|_| format!("{range_base}.ranges")),
+                    balancers_range_id: std::env::var("GREENMQTT_METADATA_BALANCERS_RANGE_ID")
+                        .unwrap_or_else(|_| format!("{range_base}.balancers")),
+                };
+                let registry = Arc::new(ReplicatedMetadataRegistry::with_layout(
                     Arc::new(KvRangeGrpcClient::connect(range_endpoint).await?),
-                    range_id,
+                    layout,
                 ));
                 (registry.clone(), registry)
             }
@@ -1009,13 +1480,24 @@ async fn main() -> anyhow::Result<()> {
             ))
             .await?;
         let metrics_handle = PrometheusBuilder::new().install_recorder()?;
-        let http = HttpApi::with_peers_shards_and_metrics(
-            broker.clone(),
-            Arc::new(peer_forwarder.clone()),
-            shard_registry.clone(),
-            metrics_handle,
-            http_bind,
-        );
+        let http = if let Some(range_runtime) = local_range_runtime.clone() {
+            HttpApi::with_peers_shards_metrics_and_ranges(
+                broker.clone(),
+                Arc::new(peer_forwarder.clone()),
+                shard_registry.clone(),
+                range_runtime,
+                metrics_handle,
+                http_bind,
+            )
+        } else {
+            HttpApi::with_peers_shards_and_metrics(
+                broker.clone(),
+                Arc::new(peer_forwarder.clone()),
+                shard_registry.clone(),
+                metrics_handle,
+                http_bind,
+            )
+        };
         let rpc = RpcRuntime {
             sessiondict: broker.sessiondict.clone(),
             dist: broker.dist.clone(),
@@ -1023,12 +1505,30 @@ async fn main() -> anyhow::Result<()> {
             retain: broker.retain.clone(),
             peer_sink: broker.clone(),
             assignment_registry: Some(metadata_registry),
-            range_host: None,
-            range_runtime: None,
+            range_host: local_range_host.clone(),
+            range_runtime: local_range_runtime.clone(),
         };
         let mut tasks = JoinSet::new();
         tasks.spawn(async move { http.start().await });
         tasks.spawn(async move { rpc.serve(rpc_bind).await });
+        if let (Some(dist_runtime), Some(dist_maintenance)) = (
+            replicated_dist_runtime_handle(state_endpoint.as_deref()).await?,
+            configured_dist_maintenance()?,
+        ) {
+            spawn_dist_maintenance_task(&mut tasks, dist_runtime, dist_maintenance);
+        }
+        if let (Some(inbox_runtime), Some(inbox_maintenance)) = (
+            replicated_inbox_runtime_handle(state_endpoint.as_deref()).await?,
+            configured_inbox_maintenance()?,
+        ) {
+            spawn_inbox_maintenance_task(&mut tasks, inbox_runtime, inbox_maintenance);
+        }
+        if let (Some(retain_runtime), Some(retain_maintenance)) = (
+            replicated_retain_runtime_handle(state_endpoint.as_deref()).await?,
+            configured_retain_maintenance()?,
+        ) {
+            spawn_retain_maintenance_task(&mut tasks, retain_runtime, retain_maintenance);
+        }
         for listener in tcp_listeners {
             let broker = broker.clone();
             tasks.spawn(async move {
@@ -2871,15 +3371,10 @@ fn single_node_range_descriptors(node_id: u64) -> Vec<ReplicatedRangeDescriptor>
     .collect()
 }
 
-async fn range_scoped_rocksdb_services(
+async fn range_scoped_rocksdb_stack(
     data_dir: PathBuf,
     node_id: u64,
-) -> anyhow::Result<(
-    Arc<dyn SessionDirectory>,
-    Arc<dyn DistRouter>,
-    Arc<dyn InboxService>,
-    Arc<dyn RetainService>,
-)> {
+) -> anyhow::Result<LocalRangeRuntimeStack> {
     let root = range_engine_root(&data_dir);
     let has_legacy_layout = legacy_rocksdb_store_dirs(&data_dir)
         .into_iter()
@@ -2892,6 +3387,7 @@ async fn range_scoped_rocksdb_services(
 
     let engine = Arc::new(RocksDbKvEngine::open(&root)?);
     let descriptors = single_node_range_descriptors(node_id);
+    let host = Arc::new(MemoryKvRangeHost::default());
     for descriptor in &descriptors {
         engine
             .bootstrap(KvRangeBootstrap {
@@ -2899,18 +3395,44 @@ async fn range_scoped_rocksdb_services(
                 boundary: descriptor.boundary.clone(),
             })
             .await?;
+        let space = Arc::from(engine.open_range(&descriptor.id).await?);
+        let raft_impl = Arc::new(MemoryRaftNode::single_node(node_id, &descriptor.id));
+        raft_impl.recover().await?;
+        let raft: Arc<dyn RaftNode> = raft_impl;
+        host.add_range(HostedRange {
+            descriptor: descriptor.clone(),
+            raft,
+            space,
+        })
+        .await?;
     }
     let router: Arc<dyn KvRangeRouter> = Arc::new(SingleNodeServiceRangeRouter::new(descriptors));
-    let executor: Arc<dyn KvRangeExecutor> = Arc::new(LocalKvRangeExecutor { engine });
-    Ok((
-        Arc::new(ReplicatedSessionDictHandle::new(
+    let executor: Arc<dyn KvRangeExecutor> = Arc::new(LocalKvRangeExecutor {
+        engine: engine.clone(),
+    });
+    let range_runtime = Arc::new(ReplicaRuntime::with_config(
+        host.clone(),
+        Arc::new(NoopReplicaTransport),
+        Some(Arc::new(RocksRangeLifecycleManager {
+            engine: engine.clone(),
+            node_id,
+        })),
+        Duration::from_secs(1),
+        1024,
+        64,
+        64,
+    ));
+    Ok(LocalRangeRuntimeStack {
+        sessiondict: Arc::new(ReplicatedSessionDictHandle::new(
             router.clone(),
             executor.clone(),
         )),
-        Arc::new(ReplicatedDistHandle::new(router.clone(), executor.clone())),
-        Arc::new(ReplicatedInboxHandle::new(router.clone(), executor.clone())),
-        Arc::new(ReplicatedRetainHandle::new(router, executor)),
-    ))
+        dist: Arc::new(ReplicatedDistHandle::new(router.clone(), executor.clone())),
+        inbox: Arc::new(ReplicatedInboxHandle::new(router.clone(), executor.clone())),
+        retain: Arc::new(ReplicatedRetainHandle::new(router, executor)),
+        range_host: host,
+        range_runtime,
+    })
 }
 
 async fn durable_services(
@@ -2945,7 +3467,10 @@ async fn durable_services(
                 Arc::new(PersistentRetainHandle::open(retain_store)),
             ))
         }
-        "rocksdb" => range_scoped_rocksdb_services(data_dir, node_id).await,
+        "rocksdb" => {
+            let stack = range_scoped_rocksdb_stack(data_dir, node_id).await?;
+            Ok((stack.sessiondict, stack.dist, stack.inbox, stack.retain))
+        }
         other => anyhow::bail!("unsupported GREENMQTT_STORAGE_BACKEND: {other}"),
     }
 }
@@ -3027,6 +3552,289 @@ async fn configured_dist_service(
     }
 }
 
+fn parse_csv_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .filter_map(|entry| {
+            let entry = entry.trim();
+            (!entry.is_empty()).then(|| entry.to_string())
+        })
+        .collect()
+}
+
+fn env_parse_or<T: std::str::FromStr>(key: &str, default: T) -> anyhow::Result<T> {
+    match std::env::var(key) {
+        Ok(raw) if !raw.trim().is_empty() => raw
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid value for {key}: {raw}")),
+        _ => Ok(default),
+    }
+}
+
+fn current_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock went backwards")
+        .as_millis() as u64
+}
+
+fn configured_dist_maintenance() -> anyhow::Result<Option<DistMaintenanceConfig>> {
+    let tenants = std::env::var("GREENMQTT_DIST_MAINTENANCE_TENANTS")
+        .ok()
+        .map(|raw| parse_csv_list(&raw))
+        .unwrap_or_default();
+    if tenants.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(DistMaintenanceConfig {
+        tenants,
+        interval: Duration::from_secs(env_parse_or(
+            "GREENMQTT_DIST_MAINTENANCE_INTERVAL_SECS",
+            30u64,
+        )?),
+        policy: ThresholdDistBalancePolicy {
+            max_total_routes: env_parse_or("GREENMQTT_DIST_MAX_TOTAL_ROUTES", 5_000usize)?,
+            max_wildcard_routes: env_parse_or("GREENMQTT_DIST_MAX_WILDCARD_ROUTES", 1_000usize)?,
+            max_shared_routes: env_parse_or("GREENMQTT_DIST_MAX_SHARED_ROUTES", 1_000usize)?,
+            desired_voters: env_parse_or("GREENMQTT_DIST_DESIRED_VOTERS", 3usize)?,
+            desired_learners: env_parse_or("GREENMQTT_DIST_DESIRED_LEARNERS", 1usize)?,
+        },
+    }))
+}
+
+async fn replicated_dist_runtime_handle(
+    state_endpoint: Option<&str>,
+) -> anyhow::Result<Option<Arc<ReplicatedDistHandle>>> {
+    if resolved_state_mode("GREENMQTT_DIST_MODE")? != StateMode::Replicated {
+        return Ok(None);
+    }
+    let (metadata_endpoint, range_endpoint) =
+        resolved_replicated_endpoints(state_endpoint, "dist")?;
+    let (router, executor) = replicated_range_clients(&metadata_endpoint, &range_endpoint).await?;
+    Ok(Some(Arc::new(ReplicatedDistHandle::new(router, executor))))
+}
+
+async fn run_dist_maintenance_tick(
+    dist: Arc<ReplicatedDistHandle>,
+    config: &DistMaintenanceConfig,
+) -> anyhow::Result<Vec<DistBalanceAction>> {
+    let worker = DistMaintenanceWorker::new(dist.clone());
+    let mut stats = Vec::new();
+    for tenant_id in &config.tenants {
+        let _ = worker.refresh_tenant(tenant_id).await?;
+        let routes = dist.list_routes(Some(tenant_id)).await?;
+        stats.push(DistTenantStats {
+            tenant_id: tenant_id.clone(),
+            total_routes: routes.len(),
+            wildcard_routes: routes
+                .iter()
+                .filter(|route| {
+                    route.topic_filter.contains('#') || route.topic_filter.contains('+')
+                })
+                .count(),
+            shared_routes: routes
+                .iter()
+                .filter(|route| route.shared_group.is_some())
+                .count(),
+        });
+    }
+    Ok(config.policy.propose(&stats))
+}
+
+fn spawn_dist_maintenance_task(
+    tasks: &mut JoinSet<anyhow::Result<()>>,
+    dist: Arc<ReplicatedDistHandle>,
+    config: DistMaintenanceConfig,
+) {
+    tasks.spawn(async move {
+        let mut ticker = tokio::time::interval(config.interval);
+        loop {
+            ticker.tick().await;
+            let actions = run_dist_maintenance_tick(dist.clone(), &config).await?;
+            if !actions.is_empty() {
+                eprintln!(
+                    "greenmqtt dist maintenance proposed actions: {:?}",
+                    actions
+                );
+            }
+        }
+    });
+}
+
+fn configured_inbox_maintenance() -> anyhow::Result<Option<InboxMaintenanceConfig>> {
+    let tenants = std::env::var("GREENMQTT_INBOX_MAINTENANCE_TENANTS")
+        .ok()
+        .map(|raw| parse_csv_list(&raw))
+        .unwrap_or_default();
+    if tenants.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(InboxMaintenanceConfig {
+        tenants,
+        interval: Duration::from_secs(env_parse_or(
+            "GREENMQTT_INBOX_MAINTENANCE_INTERVAL_SECS",
+            30u64,
+        )?),
+        retry_delay: Duration::from_millis(env_parse_or(
+            "GREENMQTT_INBOX_MAINTENANCE_RETRY_DELAY_MS",
+            100u64,
+        )?),
+        max_retries: env_parse_or("GREENMQTT_INBOX_MAINTENANCE_MAX_RETRIES", 2usize)?,
+        policy: ThresholdInboxBalancePolicy {
+            max_subscriptions: env_parse_or(
+                "GREENMQTT_INBOX_MAX_SUBSCRIPTIONS",
+                5_000usize,
+            )?,
+            max_offline_messages: env_parse_or(
+                "GREENMQTT_INBOX_MAX_OFFLINE_MESSAGES",
+                20_000usize,
+            )?,
+            max_inflight_messages: env_parse_or(
+                "GREENMQTT_INBOX_MAX_INFLIGHT_MESSAGES",
+                10_000usize,
+            )?,
+            desired_voters: env_parse_or("GREENMQTT_INBOX_DESIRED_VOTERS", 3usize)?,
+            desired_learners: env_parse_or("GREENMQTT_INBOX_DESIRED_LEARNERS", 1usize)?,
+        },
+    }))
+}
+
+async fn replicated_inbox_runtime_handle(
+    state_endpoint: Option<&str>,
+) -> anyhow::Result<Option<Arc<ReplicatedInboxHandle>>> {
+    if resolved_state_mode("GREENMQTT_INBOX_MODE")? != StateMode::Replicated {
+        return Ok(None);
+    }
+    let (metadata_endpoint, range_endpoint) =
+        resolved_replicated_endpoints(state_endpoint, "inbox")?;
+    let (router, executor) = replicated_range_clients(&metadata_endpoint, &range_endpoint).await?;
+    Ok(Some(Arc::new(ReplicatedInboxHandle::new(router, executor))))
+}
+
+async fn run_inbox_maintenance_tick(
+    inbox: Arc<ReplicatedInboxHandle>,
+    config: &InboxMaintenanceConfig,
+) -> anyhow::Result<Vec<InboxBalanceAction>> {
+    let handler = Arc::new(InboxServiceDelayHandler::new(
+        inbox.clone(),
+        Arc::new(NoopDelayedLwtPublisher),
+    ));
+    let worker = InboxMaintenanceWorker::new(
+        TenantInboxGcRunner::new(inbox.clone()),
+        InboxDelayTaskRunner::new(handler, config.max_retries, config.retry_delay),
+    );
+    let mut stats = Vec::new();
+    for tenant_id in &config.tenants {
+        let task = worker.schedule_delayed_task(
+            InboxDelayedTask::ExpireTenant {
+                tenant_id: tenant_id.clone(),
+                now_ms: current_time_ms(),
+            },
+            Duration::ZERO,
+        );
+        task.await??;
+        stats.push(InboxTenantStats {
+            tenant_id: tenant_id.clone(),
+            subscriptions: inbox.count_tenant_subscriptions(tenant_id).await?,
+            offline_messages: inbox.count_tenant_offline(tenant_id).await?,
+            inflight_messages: inbox.count_tenant_inflight(tenant_id).await?,
+        });
+    }
+    Ok(config.policy.propose(&stats))
+}
+
+fn spawn_inbox_maintenance_task(
+    tasks: &mut JoinSet<anyhow::Result<()>>,
+    inbox: Arc<ReplicatedInboxHandle>,
+    config: InboxMaintenanceConfig,
+) {
+    tasks.spawn(async move {
+        let mut ticker = tokio::time::interval(config.interval);
+        loop {
+            ticker.tick().await;
+            let actions = run_inbox_maintenance_tick(inbox.clone(), &config).await?;
+            if !actions.is_empty() {
+                eprintln!(
+                    "greenmqtt inbox maintenance proposed actions: {:?}",
+                    actions
+                );
+            }
+        }
+    });
+}
+
+fn configured_retain_maintenance() -> anyhow::Result<Option<RetainMaintenanceConfig>> {
+    let tenants = std::env::var("GREENMQTT_RETAIN_MAINTENANCE_TENANTS")
+        .ok()
+        .map(|raw| parse_csv_list(&raw))
+        .unwrap_or_default();
+    if tenants.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(RetainMaintenanceConfig {
+        tenants,
+        interval: Duration::from_secs(env_parse_or(
+            "GREENMQTT_RETAIN_MAINTENANCE_INTERVAL_SECS",
+            30u64,
+        )?),
+        policy: ThresholdRetainBalancePolicy {
+            max_retained_messages: env_parse_or(
+                "GREENMQTT_RETAIN_MAX_MESSAGES",
+                10_000usize,
+            )?,
+            desired_voters: env_parse_or("GREENMQTT_RETAIN_DESIRED_VOTERS", 3usize)?,
+            desired_learners: env_parse_or("GREENMQTT_RETAIN_DESIRED_LEARNERS", 1usize)?,
+        },
+    }))
+}
+
+async fn replicated_retain_runtime_handle(
+    state_endpoint: Option<&str>,
+) -> anyhow::Result<Option<Arc<ReplicatedRetainHandle>>> {
+    if resolved_state_mode("GREENMQTT_RETAIN_MODE")? != StateMode::Replicated {
+        return Ok(None);
+    }
+    let (metadata_endpoint, range_endpoint) =
+        resolved_replicated_endpoints(state_endpoint, "retain")?;
+    let (router, executor) = replicated_range_clients(&metadata_endpoint, &range_endpoint).await?;
+    Ok(Some(Arc::new(ReplicatedRetainHandle::new(router, executor))))
+}
+
+async fn run_retain_maintenance_tick(
+    retain: Arc<ReplicatedRetainHandle>,
+    config: &RetainMaintenanceConfig,
+) -> anyhow::Result<Vec<RetainBalanceAction>> {
+    let worker = RetainMaintenanceWorker::new(retain.clone());
+    let mut stats = Vec::new();
+    for tenant_id in &config.tenants {
+        let _ = worker.refresh_tenant(tenant_id).await?;
+        stats.push(RetainTenantStats {
+            tenant_id: tenant_id.clone(),
+            retained_messages: retain.list_tenant_retained(tenant_id).await?.len(),
+        });
+    }
+    Ok(config.policy.propose(&stats))
+}
+
+fn spawn_retain_maintenance_task(
+    tasks: &mut JoinSet<anyhow::Result<()>>,
+    retain: Arc<ReplicatedRetainHandle>,
+    config: RetainMaintenanceConfig,
+) {
+    tasks.spawn(async move {
+        let mut ticker = tokio::time::interval(config.interval);
+        loop {
+            ticker.tick().await;
+            let actions = run_retain_maintenance_tick(retain.clone(), &config).await?;
+            if !actions.is_empty() {
+                eprintln!(
+                    "greenmqtt retain maintenance proposed actions: {:?}",
+                    actions
+                );
+            }
+        }
+    });
+}
+
 async fn configured_sessiondict_service(
     default_sessiondict: Arc<dyn SessionDirectory>,
     state_endpoint: Option<&str>,
@@ -3071,6 +3879,73 @@ fn compare_data_dir(backend: &str) -> PathBuf {
 enum StateMode {
     Legacy,
     Replicated,
+}
+
+#[derive(Debug, Clone)]
+struct DistMaintenanceConfig {
+    tenants: Vec<String>,
+    interval: Duration,
+    policy: ThresholdDistBalancePolicy,
+}
+
+#[derive(Debug, Clone)]
+struct InboxMaintenanceConfig {
+    tenants: Vec<String>,
+    interval: Duration,
+    retry_delay: Duration,
+    max_retries: usize,
+    policy: ThresholdInboxBalancePolicy,
+}
+
+#[derive(Debug, Clone)]
+struct RetainMaintenanceConfig {
+    tenants: Vec<String>,
+    interval: Duration,
+    policy: ThresholdRetainBalancePolicy,
+}
+
+#[derive(Clone, Default)]
+struct NoopDelayedLwtPublisher;
+
+#[async_trait]
+impl DelayedLwtSink for NoopDelayedLwtPublisher {
+    async fn send_lwt(&self, _publish: &DelayedLwtPublish) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct RocksRangeLifecycleManager {
+    engine: Arc<RocksDbKvEngine>,
+    node_id: u64,
+}
+
+#[async_trait]
+impl RangeLifecycleManager for RocksRangeLifecycleManager {
+    async fn create_range(
+        &self,
+        descriptor: ReplicatedRangeDescriptor,
+    ) -> anyhow::Result<HostedRange> {
+        self.engine
+            .bootstrap(KvRangeBootstrap {
+                range_id: descriptor.id.clone(),
+                boundary: descriptor.boundary.clone(),
+            })
+            .await?;
+        let space = Arc::from(self.engine.open_range(&descriptor.id).await?);
+        let raft_impl = Arc::new(MemoryRaftNode::single_node(self.node_id, &descriptor.id));
+        raft_impl.recover().await?;
+        let raft: Arc<dyn RaftNode> = raft_impl;
+        Ok(HostedRange {
+            descriptor,
+            raft,
+            space,
+        })
+    }
+
+    async fn retire_range(&self, range_id: &str) -> anyhow::Result<()> {
+        self.engine.destroy_range(range_id).await
+    }
 }
 
 fn parse_state_mode(value: &str) -> anyhow::Result<StateMode> {

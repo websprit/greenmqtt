@@ -6,28 +6,42 @@ use super::{
     durable_services, listener_specs_from_env, parse_acl_rules, parse_bench_scenario,
     parse_bench_scenarios, parse_bridge_rules, parse_compare_backends, parse_identity_matchers,
     parse_listener_specs, parse_topic_rewrite_rules, redis_services, render_shard_response_text,
-    resolved_state_mode, run_bench, run_compare_bench, run_compare_soak, run_profile_bench,
-    run_shard_command, run_soak, shard_command_request, validate_bench_report,
-    validate_soak_report, BenchConfig, BenchReport, BenchScenario, BenchThresholds, ListenerSpec,
-    OutputMode, SoakConfig, SoakReport, SoakThresholds, StateMode,
+    replicated_range_clients, resolved_state_mode, run_bench, run_compare_bench,
+    run_compare_soak, run_dist_maintenance_tick, run_inbox_maintenance_tick,
+    run_profile_bench, run_retain_maintenance_tick, run_shard_command, run_soak,
+    shard_command_request, validate_bench_report, validate_soak_report,
+    execute_range_command_with_endpoint, range_command_request, BenchConfig, BenchReport,
+    BenchScenario, BenchThresholds, DistMaintenanceConfig, InboxMaintenanceConfig, ListenerSpec,
+    OutputMode, RetainMaintenanceConfig, SoakConfig, SoakReport, SoakThresholds, StateMode,
 };
+use async_trait::async_trait;
 use greenmqtt_broker::{BrokerConfig, BrokerRuntime};
 use greenmqtt_core::{
     ClientIdentity, ClusterMembershipRegistry, ClusterNodeLifecycle, ClusterNodeMembership,
-    ConnectRequest, OfflineMessage, PublishProperties, PublishRequest, ReplicatedRangeRegistry,
-    RouteRecord, ServiceEndpoint, ServiceEndpointRegistry, ServiceKind, ServiceShardAssignment,
-    ServiceShardKey, ServiceShardLifecycle, SessionKind, SessionRecord, Subscription,
+    ConnectRequest, OfflineMessage, PublishProperties, PublishRequest, ReplicatedRangeDescriptor,
+    ReplicatedRangeRegistry, RouteRecord, ServiceEndpoint, ServiceEndpointRegistry, ServiceKind,
+    ServiceShardAssignment, ServiceShardKey, ServiceShardKind, ServiceShardLifecycle,
+    SessionKind, SessionRecord, Subscription,
 };
-use greenmqtt_dist::DistHandle;
-use greenmqtt_inbox::InboxHandle;
+use greenmqtt_dist::{
+    DistBalanceAction, DistHandle, DistRouter, ReplicatedDistHandle,
+    ThresholdDistBalancePolicy,
+};
+use greenmqtt_inbox::{
+    inbox_tenant_scan_shard, inflight_tenant_scan_shard, InboxBalanceAction, InboxHandle,
+    InboxService, ReplicatedInboxHandle, ThresholdInboxBalancePolicy,
+};
 use greenmqtt_kv_engine::{KvEngine, KvRangeBootstrap, MemoryKvEngine};
 use greenmqtt_kv_raft::{MemoryRaftNode, RaftClusterConfig, RaftNode};
-use greenmqtt_kv_server::{HostedRange, KvRangeHost, MemoryKvRangeHost};
+use greenmqtt_kv_server::{HostedRange, KvRangeHost, MemoryKvRangeHost, RangeLifecycleManager};
 use greenmqtt_plugin_api::{
     with_listener_profile, AclAction, AclDecision, AclProvider, AllowAllAcl, AllowAllAuth,
     AuthProvider, ConfiguredAcl, ConfiguredAuth, ConfiguredEventHook, EventHook, NoopEventHook,
 };
-use greenmqtt_retain::RetainHandle;
+use greenmqtt_retain::{
+    retain_tenant_shard, ReplicatedRetainHandle, RetainBalanceAction, RetainHandle,
+    RetainService, ThresholdRetainBalancePolicy,
+};
 use greenmqtt_rpc::{StaticPeerForwarder, StaticServiceEndpointRegistry};
 use greenmqtt_sessiondict::SessionDictHandle;
 use metrics_exporter_prometheus::PrometheusBuilder;
@@ -101,6 +115,43 @@ fn test_broker() -> Arc<BrokerRuntime<ConfiguredAuth, ConfiguredAcl, ConfiguredE
         Arc::new(InboxHandle::default()),
         Arc::new(RetainHandle::default()),
     ))
+}
+
+#[derive(Clone)]
+struct TestRangeLifecycleManager {
+    engine: MemoryKvEngine,
+}
+
+#[async_trait]
+impl RangeLifecycleManager for TestRangeLifecycleManager {
+    async fn create_range(
+        &self,
+        descriptor: ReplicatedRangeDescriptor,
+    ) -> anyhow::Result<HostedRange> {
+        self.engine
+            .bootstrap(KvRangeBootstrap {
+                range_id: descriptor.id.clone(),
+                boundary: descriptor.boundary.clone(),
+            })
+            .await?;
+        let space = Arc::<dyn greenmqtt_kv_engine::KvRangeSpace>::from(
+            self.engine.open_range(&descriptor.id).await?,
+        );
+        let raft = Arc::new(MemoryRaftNode::single_node(
+            descriptor.leader_node_id.unwrap_or(1),
+            &descriptor.id,
+        ));
+        raft.recover().await?;
+        Ok(HostedRange {
+            descriptor,
+            raft,
+            space,
+        })
+    }
+
+    async fn retire_range(&self, range_id: &str) -> anyhow::Result<()> {
+        self.engine.destroy_range(range_id).await
+    }
 }
 
 async fn add_hosted_range(
@@ -254,6 +305,88 @@ fn shard_cli_command_drives_http_shard_move() {
         assert_eq!(assignment.owner_node_id(), 9);
 
         server.join().unwrap();
+    });
+}
+
+#[test]
+fn range_cli_command_drives_grpc_range_control_service() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let bind = listener.local_addr().unwrap();
+        drop(listener);
+        let engine = MemoryKvEngine::default();
+        let host = Arc::new(MemoryKvRangeHost::default());
+        let runtime = Arc::new(greenmqtt_kv_server::ReplicaRuntime::with_config(
+            host.clone(),
+            Arc::new(greenmqtt_rpc::NoopReplicaTransport),
+            Some(Arc::new(TestRangeLifecycleManager {
+                engine: engine.clone(),
+            })),
+            Duration::from_secs(1),
+            64,
+            64,
+            64,
+        ));
+        let server = tokio::spawn(
+            greenmqtt_rpc::RpcRuntime {
+                sessiondict: Arc::new(SessionDictHandle::default()),
+                dist: Arc::new(DistHandle::default()),
+                inbox: Arc::new(InboxHandle::default()),
+                retain: Arc::new(RetainHandle::default()),
+                peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
+                assignment_registry: None,
+                range_host: Some(host.clone()),
+                range_runtime: Some(runtime.clone()),
+            }
+            .serve(bind),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let endpoint = format!("http://{bind}");
+        let bootstrap = execute_range_command_with_endpoint(
+            vec![
+                "bootstrap".to_string(),
+                "--range-id".to_string(),
+                "range-cli".to_string(),
+                "--kind".to_string(),
+                "retain".to_string(),
+                "--tenant-id".to_string(),
+                "t1".to_string(),
+                "--scope".to_string(),
+                "*".to_string(),
+                "--voters".to_string(),
+                "1".to_string(),
+            ]
+            .into_iter(),
+            &endpoint,
+        )
+        .await
+        .unwrap();
+        assert!(bootstrap.contains("operation=bootstrap"));
+        assert!(bootstrap.contains("status=bootstrapped"));
+        assert!(bootstrap.contains("reason=\"Range bootstrapped and marked serving.\""));
+        assert!(bootstrap.contains("range_id=range-cli"));
+
+        let drain = execute_range_command_with_endpoint(
+            vec!["drain".to_string(), "range-cli".to_string()].into_iter(),
+            &endpoint,
+        )
+        .await
+        .unwrap();
+        assert!(drain.contains("operation=drain"));
+        assert!(drain.contains("status=draining"));
+
+        let retire = execute_range_command_with_endpoint(
+            vec!["retire".to_string(), "range-cli".to_string()].into_iter(),
+            &endpoint,
+        )
+        .await
+        .unwrap();
+        assert!(retire.contains("operation=retire"));
+        assert!(retire.contains("status=retired"));
+
+        server.abort();
     });
 }
 
@@ -445,6 +578,371 @@ fn configured_services_can_run_under_global_replicated_state_mode() {
             Some(value) => std::env::set_var("GREENMQTT_STATE_MODE", value),
             None => std::env::remove_var("GREENMQTT_STATE_MODE"),
         }
+
+        server.abort();
+    });
+}
+
+#[test]
+fn dist_maintenance_tick_refreshes_routes_and_proposes_hot_tenant_actions() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let bind = "127.0.0.1:50068".parse().unwrap();
+        let registry = Arc::new(StaticServiceEndpointRegistry::default());
+        let host = Arc::new(MemoryKvRangeHost::default());
+        let engine = MemoryKvEngine::default();
+        registry
+            .upsert_member(ClusterNodeMembership::new(
+                1,
+                1,
+                ClusterNodeLifecycle::Serving,
+                vec![ServiceEndpoint::new(
+                    ServiceKind::Dist,
+                    1,
+                    "http://127.0.0.1:50068",
+                )],
+            ))
+            .await
+            .unwrap();
+        add_hosted_range(
+            &engine,
+            &host,
+            &registry,
+            "dist-maint-range",
+            greenmqtt_dist::dist_tenant_shard("hot"),
+        )
+        .await;
+
+        let server = tokio::spawn(
+            greenmqtt_rpc::RpcRuntime {
+                sessiondict: Arc::new(SessionDictHandle::default()),
+                dist: Arc::new(DistHandle::default()),
+                inbox: Arc::new(InboxHandle::default()),
+                retain: Arc::new(RetainHandle::default()),
+                peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
+                assignment_registry: Some(registry.clone()),
+                range_host: Some(host),
+                range_runtime: None,
+            }
+            .serve(bind),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let (router, executor) =
+            replicated_range_clients("http://127.0.0.1:50068", "http://127.0.0.1:50068")
+                .await
+                .unwrap();
+        let dist = Arc::new(ReplicatedDistHandle::new(router, executor));
+        for (topic_filter, session_id, shared_group) in [
+            ("devices/#", "s1", None),
+            ("devices/+/state", "s2", Some("shared")),
+            ("alerts/#", "s3", None),
+        ] {
+            dist.add_route(RouteRecord {
+                tenant_id: "hot".into(),
+                topic_filter: topic_filter.into(),
+                session_id: session_id.into(),
+                node_id: 1,
+                subscription_identifier: None,
+                no_local: false,
+                retain_as_published: false,
+                shared_group: shared_group.map(str::to_string),
+                kind: SessionKind::Persistent,
+            })
+            .await
+            .unwrap();
+        }
+
+        let actions = run_dist_maintenance_tick(
+            dist,
+            &DistMaintenanceConfig {
+                tenants: vec!["hot".into()],
+                interval: Duration::from_secs(30),
+                policy: ThresholdDistBalancePolicy {
+                    max_total_routes: 1,
+                    max_wildcard_routes: 1,
+                    max_shared_routes: 0,
+                    desired_voters: 3,
+                    desired_learners: 1,
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            actions,
+            vec![
+                DistBalanceAction::RunTenantCleanup {
+                    tenant_id: "hot".into(),
+                },
+                DistBalanceAction::SplitTenantRange {
+                    tenant_id: "hot".into(),
+                },
+                DistBalanceAction::ScaleTenantReplicas {
+                    tenant_id: "hot".into(),
+                    voters: 3,
+                    learners: 1,
+                },
+            ]
+        );
+
+        server.abort();
+    });
+}
+
+#[test]
+fn inbox_maintenance_tick_expires_tenant_state_and_proposes_hot_tenant_actions() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let bind = "127.0.0.1:50069".parse().unwrap();
+        let registry = Arc::new(StaticServiceEndpointRegistry::default());
+        let host = Arc::new(MemoryKvRangeHost::default());
+        let engine = MemoryKvEngine::default();
+        registry
+            .upsert_member(ClusterNodeMembership::new(
+                1,
+                1,
+                ClusterNodeLifecycle::Serving,
+                vec![ServiceEndpoint::new(
+                    ServiceKind::Inbox,
+                    1,
+                    "http://127.0.0.1:50069",
+                )],
+            ))
+            .await
+            .unwrap();
+        add_hosted_range(
+            &engine,
+            &host,
+            &registry,
+            "inbox-maint-range",
+            inbox_tenant_scan_shard("hot"),
+        )
+        .await;
+        add_hosted_range(
+            &engine,
+            &host,
+            &registry,
+            "inflight-maint-range",
+            inflight_tenant_scan_shard("hot"),
+        )
+        .await;
+
+        let server = tokio::spawn(
+            greenmqtt_rpc::RpcRuntime {
+                sessiondict: Arc::new(SessionDictHandle::default()),
+                dist: Arc::new(DistHandle::default()),
+                inbox: Arc::new(InboxHandle::default()),
+                retain: Arc::new(RetainHandle::default()),
+                peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
+                assignment_registry: Some(registry.clone()),
+                range_host: Some(host),
+                range_runtime: None,
+            }
+            .serve(bind),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let (router, executor) =
+            replicated_range_clients("http://127.0.0.1:50069", "http://127.0.0.1:50069")
+                .await
+                .unwrap();
+        let inbox = Arc::new(ReplicatedInboxHandle::new(router, executor));
+        inbox
+            .subscribe(Subscription {
+                session_id: "s1".into(),
+                tenant_id: "hot".into(),
+                topic_filter: "devices/#".into(),
+                qos: 1,
+                subscription_identifier: None,
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: 0,
+                shared_group: None,
+                kind: SessionKind::Persistent,
+            })
+            .await
+            .unwrap();
+        inbox
+            .subscribe(Subscription {
+                session_id: "s2".into(),
+                tenant_id: "hot".into(),
+                topic_filter: "alerts/#".into(),
+                qos: 1,
+                subscription_identifier: None,
+                no_local: false,
+                retain_as_published: false,
+                retain_handling: 0,
+                shared_group: Some("shared".into()),
+                kind: SessionKind::Persistent,
+            })
+            .await
+            .unwrap();
+        for session_id in ["s1", "s2"] {
+            inbox
+                .enqueue(OfflineMessage {
+                    tenant_id: "hot".into(),
+                    session_id: session_id.into(),
+                    topic: "devices/a/state".into(),
+                    payload: b"offline".to_vec().into(),
+                    qos: 1,
+                    retain: false,
+                    from_session_id: "src".into(),
+                    properties: PublishProperties::default(),
+                })
+                .await
+                .unwrap();
+        }
+        inbox
+            .stage_inflight(greenmqtt_core::InflightMessage {
+                tenant_id: "hot".into(),
+                session_id: "s1".into(),
+                packet_id: 7,
+                topic: "devices/a/state".into(),
+                payload: b"inflight".to_vec().into(),
+                qos: 1,
+                retain: false,
+                from_session_id: "src".into(),
+                properties: PublishProperties::default(),
+                phase: greenmqtt_core::InflightPhase::Publish,
+            })
+            .await
+            .unwrap();
+
+        let actions = run_inbox_maintenance_tick(
+            inbox,
+            &InboxMaintenanceConfig {
+                tenants: vec!["hot".into()],
+                interval: Duration::from_secs(30),
+                retry_delay: Duration::from_millis(5),
+                max_retries: 1,
+                policy: ThresholdInboxBalancePolicy {
+                    max_subscriptions: 1,
+                    max_offline_messages: 1,
+                    max_inflight_messages: 0,
+                    desired_voters: 3,
+                    desired_learners: 1,
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            actions,
+            vec![
+                InboxBalanceAction::RunTenantMaintenance {
+                    tenant_id: "hot".into(),
+                },
+                InboxBalanceAction::SplitTenantRange {
+                    tenant_id: "hot".into(),
+                },
+                InboxBalanceAction::ScaleTenantReplicas {
+                    tenant_id: "hot".into(),
+                    voters: 3,
+                    learners: 1,
+                },
+            ]
+        );
+
+        server.abort();
+    });
+}
+
+#[test]
+fn retain_maintenance_tick_refreshes_routes_and_proposes_hot_tenant_actions() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let bind = "127.0.0.1:50070".parse().unwrap();
+        let registry = Arc::new(StaticServiceEndpointRegistry::default());
+        let host = Arc::new(MemoryKvRangeHost::default());
+        let engine = MemoryKvEngine::default();
+        registry
+            .upsert_member(ClusterNodeMembership::new(
+                1,
+                1,
+                ClusterNodeLifecycle::Serving,
+                vec![ServiceEndpoint::new(
+                    ServiceKind::Retain,
+                    1,
+                    "http://127.0.0.1:50070",
+                )],
+            ))
+            .await
+            .unwrap();
+        add_hosted_range(
+            &engine,
+            &host,
+            &registry,
+            "retain-maint-range",
+            retain_tenant_shard("hot"),
+        )
+        .await;
+
+        let server = tokio::spawn(
+            greenmqtt_rpc::RpcRuntime {
+                sessiondict: Arc::new(SessionDictHandle::default()),
+                dist: Arc::new(DistHandle::default()),
+                inbox: Arc::new(InboxHandle::default()),
+                retain: Arc::new(RetainHandle::default()),
+                peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
+                assignment_registry: Some(registry.clone()),
+                range_host: Some(host),
+                range_runtime: None,
+            }
+            .serve(bind),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let (router, executor) =
+            replicated_range_clients("http://127.0.0.1:50070", "http://127.0.0.1:50070")
+                .await
+                .unwrap();
+        let retain = Arc::new(ReplicatedRetainHandle::new(router, executor));
+        for topic in ["devices/a/state", "devices/b/state"] {
+            retain
+                .retain(greenmqtt_core::RetainedMessage {
+                    tenant_id: "hot".into(),
+                    topic: topic.into(),
+                    payload: b"retained".to_vec().into(),
+                    qos: 1,
+                })
+                .await
+                .unwrap();
+        }
+
+        let actions = run_retain_maintenance_tick(
+            retain,
+            &RetainMaintenanceConfig {
+                tenants: vec!["hot".into()],
+                interval: Duration::from_secs(30),
+                policy: ThresholdRetainBalancePolicy {
+                    max_retained_messages: 1,
+                    desired_voters: 3,
+                    desired_learners: 1,
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            actions,
+            vec![
+                RetainBalanceAction::RunTenantCleanup {
+                    tenant_id: "hot".into(),
+                },
+                RetainBalanceAction::SplitTenantRange {
+                    tenant_id: "hot".into(),
+                },
+                RetainBalanceAction::ScaleTenantReplicas {
+                    tenant_id: "hot".into(),
+                    voters: 3,
+                    learners: 1,
+                },
+            ]
+        );
 
         server.abort();
     });
@@ -689,7 +1187,6 @@ fn configured_retain_service_survives_leader_failover() {
                 peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
                 assignment_registry: Some(registry.clone()),
                 range_host: None,
-            range_runtime: None,
                 range_runtime: None,
             }
             .serve(metadata_bind),
@@ -1878,6 +2375,31 @@ async fn bench_report_retained_replay_matches_expected_counts() {
 }
 
 #[tokio::test]
+async fn bench_report_scales_large_wildcard_retain_fanout_workload() {
+    let report = run_bench(
+        test_broker(),
+        1,
+        BenchConfig {
+            subscribers: 24,
+            publishers: 6,
+            messages_per_publisher: 8,
+            qos: 1,
+            scenario: BenchScenario::RetainedReplay,
+        },
+        "memory",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.scenario, BenchScenario::RetainedReplay);
+    assert_eq!(report.total_publishes, 48);
+    assert_eq!(report.expected_deliveries, 48 * 24);
+    assert_eq!(report.actual_deliveries, report.expected_deliveries);
+    assert_eq!(report.retained_messages, report.total_publishes);
+    assert_bench_phase_timings(&report);
+}
+
+#[tokio::test]
 async fn bench_report_retained_replay_runs_with_sled_durable_backend() {
     let (broker, data_dir) = durable_test_broker("sled").await;
     let report = run_bench(
@@ -2200,6 +2722,30 @@ async fn soak_report_ends_without_state_leak() {
     assert_eq!(report.final_offline_messages, 0);
     assert_eq!(report.final_inflight_messages, 0);
     assert_eq!(report.final_retained_messages, 0);
+}
+
+#[tokio::test]
+async fn soak_report_handles_large_sessiondict_tenant_workload() {
+    let report = run_soak(
+        test_broker(),
+        1,
+        SoakConfig {
+            iterations: 3,
+            subscribers: 48,
+            publishers: 8,
+            messages_per_publisher: 3,
+            qos: 1,
+        },
+        "memory",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.storage_backend, "memory");
+    assert!(report.max_global_session_records >= 48);
+    assert_eq!(report.final_global_session_records, 0);
+    assert_eq!(report.final_route_records, 0);
+    assert_eq!(report.final_subscription_records, 0);
 }
 
 #[tokio::test]
@@ -3099,6 +3645,107 @@ fn shard_command_request_supports_dry_run_and_output_override() {
         Some(r#"{"target_node_id":9,"dry_run":true}"#)
     );
     assert_eq!(output, OutputMode::Json);
+}
+
+#[test]
+fn range_command_request_builds_bootstrap_descriptor() {
+    let (command, output) = range_command_request(
+        vec![
+            "bootstrap".to_string(),
+            "--range-id".to_string(),
+            "range-a".to_string(),
+            "--kind".to_string(),
+            "retain".to_string(),
+            "--tenant-id".to_string(),
+            "t1".to_string(),
+            "--scope".to_string(),
+            "*".to_string(),
+            "--voters".to_string(),
+            "1,2".to_string(),
+            "--learners".to_string(),
+            "3".to_string(),
+        ]
+        .into_iter(),
+    )
+    .unwrap();
+    match command {
+        super::RangeCliCommand::Bootstrap { descriptor } => {
+            assert_eq!(descriptor.id, "range-a");
+            assert_eq!(descriptor.shard.kind, ServiceShardKind::Retain);
+            assert_eq!(descriptor.shard.tenant_id, "t1");
+            assert_eq!(descriptor.shard.scope, "*");
+            assert_eq!(descriptor.leader_node_id, Some(1));
+            assert_eq!(descriptor.replicas.len(), 3);
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+    assert_eq!(output, OutputMode::Text);
+}
+
+#[test]
+fn range_command_request_builds_change_replicas_request() {
+    let (command, output) = range_command_request(
+        vec![
+            "change-replicas".to_string(),
+            "range-a".to_string(),
+            "--voters".to_string(),
+            "1,2,3".to_string(),
+            "--learners".to_string(),
+            "4".to_string(),
+            "--output".to_string(),
+            "json".to_string(),
+        ]
+        .into_iter(),
+    )
+    .unwrap();
+    match command {
+        super::RangeCliCommand::ChangeReplicas {
+            range_id,
+            voters,
+            learners,
+        } => {
+            assert_eq!(range_id, "range-a");
+            assert_eq!(voters, vec![1, 2, 3]);
+            assert_eq!(learners, vec![4]);
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+    assert_eq!(output, OutputMode::Json);
+}
+
+#[test]
+fn range_command_request_builds_transfer_and_split_requests() {
+    let (transfer, _) = range_command_request(
+        vec![
+            "transfer-leadership".to_string(),
+            "range-a".to_string(),
+            "9".to_string(),
+        ]
+        .into_iter(),
+    )
+    .unwrap();
+    match transfer {
+        super::RangeCliCommand::TransferLeadership {
+            range_id,
+            target_node_id,
+        } => {
+            assert_eq!(range_id, "range-a");
+            assert_eq!(target_node_id, 9);
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
+
+    let (split, _) = range_command_request(
+        vec!["split".to_string(), "range-a".to_string(), "mid".to_string()].into_iter(),
+    )
+    .unwrap();
+    match split {
+        super::RangeCliCommand::Split { range_id, split_key } => {
+            assert_eq!(range_id, "range-a");
+            assert_eq!(split_key, b"mid".to_vec());
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
 }
 
 #[test]

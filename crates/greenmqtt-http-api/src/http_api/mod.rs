@@ -5,6 +5,7 @@ use axum::{
     Extension, Router,
 };
 use greenmqtt_broker::{BrokerRuntime, PeerRegistry};
+use greenmqtt_kv_server::ReplicaRuntime;
 use greenmqtt_core::{Lifecycle, ShardControlRegistry};
 use greenmqtt_plugin_api::{AclProvider, AuthProvider, EventHook};
 use metrics_exporter_prometheus::PrometheusHandle;
@@ -16,6 +17,7 @@ pub struct HttpApi<A, C, H> {
     broker: Arc<BrokerRuntime<A, C, H>>,
     peers: Option<Arc<dyn PeerRegistry>>,
     shards: Option<Arc<dyn ShardControlRegistry>>,
+    range_runtime: Option<Arc<ReplicaRuntime>>,
     metrics: Option<PrometheusHandle>,
     bind: SocketAddr,
 }
@@ -31,6 +33,7 @@ where
             broker,
             peers: None,
             shards: None,
+            range_runtime: None,
             metrics: None,
             bind,
         }
@@ -45,6 +48,7 @@ where
             broker,
             peers: Some(peers),
             shards: None,
+            range_runtime: None,
             metrics: None,
             bind,
         }
@@ -61,6 +65,25 @@ where
             broker,
             peers: Some(peers),
             shards: Some(shards),
+            range_runtime: None,
+            metrics: Some(metrics),
+            bind,
+        }
+    }
+
+    pub fn with_peers_shards_metrics_and_ranges(
+        broker: Arc<BrokerRuntime<A, C, H>>,
+        peers: Arc<dyn PeerRegistry>,
+        shards: Arc<dyn ShardControlRegistry>,
+        range_runtime: Arc<ReplicaRuntime>,
+        metrics: PrometheusHandle,
+        bind: SocketAddr,
+    ) -> Self {
+        Self {
+            broker,
+            peers: Some(peers),
+            shards: Some(shards),
+            range_runtime: Some(range_runtime),
             metrics: Some(metrics),
             bind,
         }
@@ -76,20 +99,21 @@ where
             broker,
             peers: Some(peers),
             shards: None,
+            range_runtime: None,
             metrics: Some(metrics),
             bind,
         }
     }
 
     pub fn router(broker: Arc<BrokerRuntime<A, C, H>>) -> Router {
-        Self::router_with_peers_shards_and_metrics(broker, None, None, None)
+        Self::router_with_peers_shards_metrics_and_ranges(broker, None, None, None, None)
     }
 
     pub fn router_with_peers(
         broker: Arc<BrokerRuntime<A, C, H>>,
         peers: Option<Arc<dyn PeerRegistry>>,
     ) -> Router {
-        Self::router_with_peers_shards_and_metrics(broker, peers, None, None)
+        Self::router_with_peers_shards_metrics_and_ranges(broker, peers, None, None, None)
     }
 
     pub fn router_with_peers_and_metrics(
@@ -97,13 +121,23 @@ where
         peers: Option<Arc<dyn PeerRegistry>>,
         metrics: Option<PrometheusHandle>,
     ) -> Router {
-        Self::router_with_peers_shards_and_metrics(broker, peers, None, metrics)
+        Self::router_with_peers_shards_metrics_and_ranges(broker, peers, None, None, metrics)
     }
 
     pub fn router_with_peers_shards_and_metrics(
         broker: Arc<BrokerRuntime<A, C, H>>,
         peers: Option<Arc<dyn PeerRegistry>>,
         shards: Option<Arc<dyn ShardControlRegistry>>,
+        metrics: Option<PrometheusHandle>,
+    ) -> Router {
+        Self::router_with_peers_shards_metrics_and_ranges(broker, peers, shards, None, metrics)
+    }
+
+    pub fn router_with_peers_shards_metrics_and_ranges(
+        broker: Arc<BrokerRuntime<A, C, H>>,
+        peers: Option<Arc<dyn PeerRegistry>>,
+        shards: Option<Arc<dyn ShardControlRegistry>>,
+        range_runtime: Option<Arc<ReplicaRuntime>>,
         metrics: Option<PrometheusHandle>,
     ) -> Router {
         Router::new()
@@ -135,6 +169,25 @@ where
                 "/v1/shards/{kind}/{tenant_id}/{scope}/failover",
                 post(super::shard::failover_shard),
             )
+            .route("/v1/ranges", get(super::range::list_ranges))
+            .route("/v1/ranges/bootstrap", post(super::range::bootstrap_range))
+            .route("/v1/ranges/merge", post(super::range::merge_ranges))
+            .route("/v1/ranges/zombies", get(super::range::list_zombie_ranges))
+            .route(
+                "/v1/ranges/{range_id}/change-replicas",
+                post(super::range::change_replicas),
+            )
+            .route(
+                "/v1/ranges/{range_id}/transfer-leadership",
+                post(super::range::transfer_leadership),
+            )
+            .route(
+                "/v1/ranges/{range_id}/recover",
+                post(super::range::recover_range),
+            )
+            .route("/v1/ranges/{range_id}/split", post(super::range::split_range))
+            .route("/v1/ranges/{range_id}/drain", post(super::range::drain_range))
+            .route("/v1/ranges/{range_id}", delete(super::range::retire_range))
             .route("/v1/audit", get(super::admin::list_admin_audit))
             .route(
                 "/v1/tenants/{tenant_id}/quota",
@@ -178,6 +231,10 @@ where
             )
             .route("/v1/sessiondict", get(super::session::list_sessiondict))
             .route(
+                "/v1/sessiondict/kill-all",
+                post(super::session::kill_all_sessiondict_records),
+            )
+            .route(
                 "/v1/sessiondict/by-identity",
                 get(super::session::lookup_session_by_identity),
             )
@@ -186,6 +243,18 @@ where
                 get(super::session::lookup_session_by_id)
                     .put(super::session::reassign_sessiondict_record)
                     .delete(super::session::delete_sessiondict_record),
+            )
+            .route(
+                "/v1/sessiondict/{session_id}/inbox-state",
+                get(super::session::get_session_inbox_state),
+            )
+            .route(
+                "/v1/sessiondict/{session_id}/kill",
+                post(super::session::kill_sessiondict_record),
+            )
+            .route(
+                "/v1/sessiondict/{session_id}/takeover",
+                post(super::session::takeover_sessiondict_record),
             )
             .route(
                 "/v1/routes/all",
@@ -208,6 +277,7 @@ where
             )
             .layer(Extension(peers))
             .layer(Extension(shards))
+            .layer(Extension(range_runtime))
             .layer(Extension(metrics))
             .with_state(broker)
     }
@@ -224,10 +294,11 @@ where
         let listener = tokio::net::TcpListener::bind(self.bind).await?;
         axum::serve(
             listener,
-            Self::router_with_peers_shards_and_metrics(
+            Self::router_with_peers_shards_metrics_and_ranges(
                 self.broker.clone(),
                 self.peers.clone(),
                 self.shards.clone(),
+                self.range_runtime.clone(),
                 self.metrics.clone(),
             ),
         )

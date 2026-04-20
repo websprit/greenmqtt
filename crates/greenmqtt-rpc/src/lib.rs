@@ -4,10 +4,11 @@ use greenmqtt_broker::{DeliverySink, PeerForwarder, PeerRegistry};
 use greenmqtt_core::{
     BalancerState, BalancerStateRegistry, ClientIdentity, ClusterMembershipRegistry,
     ClusterNodeMembership, Delivery, InflightMessage, MetadataRegistry, NodeId, OfflineMessage,
+    RangeReconfigurationRegistry, RangeReconfigurationState, ReconfigurationPhase,
     ReplicatedRangeDescriptor, ReplicatedRangeRegistry, RetainedMessage, RouteRecord,
-    ServiceEndpoint, ServiceEndpointRegistry, ServiceKind, ServiceShardAssignment, ServiceShardKey,
-    ServiceShardKind, ServiceShardLifecycle, ServiceShardRecoveryControl, ServiceShardTransition,
-    ServiceShardTransitionKind, Subscription,
+    ServiceEndpoint, ServiceEndpointRegistry, ServiceKind, ServiceShardAssignment,
+    ServiceShardKey, ServiceShardKind, ServiceShardLifecycle, ServiceShardRecoveryControl,
+    ServiceShardTransition, ServiceShardTransitionKind, Subscription,
 };
 use greenmqtt_dist::{dist_tenant_shard, DistRouter};
 use greenmqtt_inbox::{
@@ -60,11 +61,14 @@ use greenmqtt_proto::internal::{
     RangeChangeReplicasRequest, RangeDebugReply, RangeHealthListReply, RangeHealthRecord,
     RangeHealthReply, RangeHealthRequest, RangeListReply, RangeListRequest, RangeLookupRequest,
     RangeDrainRequest, RangeMergeReply, RangeMergeRequest, RangeRecordReply, RangeRecoverRequest,
-    RangeRetireRequest, RangeSplitReply, RangeSplitRequest, RangeTransferLeadershipRequest,
-    RangeUpsertRequest, RegisterSessionReply, RegisterSessionRequest, RemoveRouteRequest,
-    RemoveSessionRoutesReply, RemoveSessionRoutesRequest, ReplicaLagRecord, RetainMatchReply,
-    RetainMatchRequest, RetainWriteRequest, RouteRangeRequest, ShardSnapshotChunk,
-    ShardSnapshotRequest, UnregisterSessionRequest, ZombieRangeListReply, ZombieRangeRecord,
+    RangeReconfigurationRecord, RangeRetireRequest, RangeSplitReply, RangeSplitRequest,
+    RangeTransferLeadershipRequest, RangeUpsertRequest, RegisterSessionReply,
+    RegisterSessionRequest, RemoveRouteRequest, RemoveSessionRoutesReply,
+    RemoveSessionRoutesRequest, ReplicaLagRecord, RetainMatchReply, RetainMatchRequest,
+    RetainWriteRequest, RouteRangeRequest, SessionExistRecord,
+    SessionExistReply, SessionExistRequest, IdentityExistRecord, IdentityExistReply,
+    IdentityExistRequest, ShardSnapshotChunk, ShardSnapshotRequest, UnregisterSessionRequest,
+    ZombieRangeListReply, ZombieRangeRecord,
 };
 use greenmqtt_proto::{
     from_proto_balancer_state, from_proto_client_identity, from_proto_cluster_node_membership,
@@ -72,13 +76,14 @@ use greenmqtt_proto::{
     from_proto_kv_range_checkpoint, from_proto_kv_range_snapshot, from_proto_offline,
     from_proto_raft_transport_request, from_proto_replicated_range, from_proto_retain,
     from_proto_route, from_proto_session, from_proto_shard_kind, from_proto_subscription,
-    to_proto_balancer_state, to_proto_cluster_node_membership, to_proto_delivery,
+    to_proto_balancer_state, to_proto_client_identity, to_proto_cluster_node_membership, to_proto_delivery,
     to_proto_inflight, to_proto_kv_entry, to_proto_kv_range_checkpoint, to_proto_kv_range_snapshot,
     to_proto_offline, to_proto_raft_transport_request, to_proto_replicated_range, to_proto_retain,
     to_proto_route, to_proto_session, to_proto_shard_kind, to_proto_subscription,
 };
 use greenmqtt_retain::{retain_tenant_shard, RetainService as RetainStoreService};
 use greenmqtt_sessiondict::{session_identity_shard, SessionDirectory};
+use greenmqtt_sessiondict::SessionOnlineCheckScheduler;
 use metrics::counter;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -184,6 +189,7 @@ pub struct DynamicServiceEndpointRegistry {
     members: Arc<RwLock<BTreeMap<NodeId, ClusterNodeMembership>>>,
     ranges: Arc<RwLock<BTreeMap<String, ReplicatedRangeDescriptor>>>,
     balancer_states: Arc<RwLock<BTreeMap<String, BalancerState>>>,
+    reconfiguration_states: Arc<RwLock<BTreeMap<String, RangeReconfigurationState>>>,
 }
 
 #[derive(Clone)]
@@ -195,7 +201,7 @@ pub struct PersistentMetadataRegistry {
 #[derive(Clone)]
 pub struct ReplicatedMetadataRegistry {
     executor: Arc<dyn KvRangeExecutor>,
-    range_id: String,
+    layout: MetadataPlaneLayout,
 }
 
 #[derive(Clone)]
@@ -211,6 +217,55 @@ const ASSIGNMENT_PREFIX: &[u8] = b"assignment\0";
 const MEMBER_PREFIX: &[u8] = b"member\0";
 const RANGE_PREFIX: &[u8] = b"range\0";
 const BALANCER_PREFIX: &[u8] = b"balancer\0";
+const RECONFIG_PREFIX: &[u8] = b"reconfig\0";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataPlaneLayout {
+    pub assignments_range_id: String,
+    pub members_range_id: String,
+    pub ranges_range_id: String,
+    pub balancers_range_id: String,
+}
+
+impl MetadataPlaneLayout {
+    pub fn single(range_id: impl Into<String>) -> Self {
+        let range_id = range_id.into();
+        Self {
+            assignments_range_id: range_id.clone(),
+            members_range_id: range_id.clone(),
+            ranges_range_id: range_id.clone(),
+            balancers_range_id: range_id,
+        }
+    }
+
+    pub fn sharded(base_range_id: impl Into<String>) -> Self {
+        let base = base_range_id.into();
+        Self {
+            assignments_range_id: format!("{base}.assignments"),
+            members_range_id: format!("{base}.members"),
+            ranges_range_id: format!("{base}.ranges"),
+            balancers_range_id: format!("{base}.balancers"),
+        }
+    }
+
+    fn range_for_key(&self, key: &[u8]) -> &str {
+        if key.starts_with(ASSIGNMENT_PREFIX) {
+            &self.assignments_range_id
+        } else if key.starts_with(MEMBER_PREFIX) {
+            &self.members_range_id
+        } else if key.starts_with(RANGE_PREFIX) {
+            &self.ranges_range_id
+        } else if key.starts_with(BALANCER_PREFIX) {
+            &self.balancers_range_id
+        } else {
+            &self.assignments_range_id
+        }
+    }
+
+    fn range_for_prefix(&self, prefix: &[u8]) -> &str {
+        self.range_for_key(prefix)
+    }
+}
 
 #[derive(Clone)]
 struct StaticPeerClient {
@@ -269,12 +324,14 @@ struct RaftTransportRpc {
 
 #[derive(Clone)]
 struct RangeAdminRpc {
-    inner: Option<Arc<dyn KvRangeHost>>,
+    host: Option<Arc<dyn KvRangeHost>>,
+    runtime: Option<Arc<greenmqtt_kv_server::ReplicaRuntime>>,
 }
 
 #[derive(Clone)]
 struct RangeControlRpc {
     inner: Option<Arc<greenmqtt_kv_server::ReplicaRuntime>>,
+    registry: Option<Arc<dyn MetadataRegistry>>,
 }
 
 async fn apply_committed_entries_for_range(
@@ -315,6 +372,25 @@ fn to_proto_replica_lag(replica: &ReplicaLagSnapshot) -> ReplicaLagRecord {
     }
 }
 
+fn to_proto_reconfiguration(
+    state: &RangeReconfigurationState,
+) -> RangeReconfigurationRecord {
+    let (phase, has_phase) = match &state.phase {
+        Some(ReconfigurationPhase::StagingLearners) => ("staging_learners".to_string(), true),
+        Some(ReconfigurationPhase::Finalizing) => ("finalizing".to_string(), true),
+        None => (String::new(), false),
+    };
+    RangeReconfigurationRecord {
+        current_voters: state.current_voters.clone(),
+        current_learners: state.current_learners.clone(),
+        pending_voters: state.pending_voters.clone(),
+        pending_learners: state.pending_learners.clone(),
+        phase,
+        has_phase,
+        blocked_on_catch_up: state.blocked_on_catch_up,
+    }
+}
+
 fn to_proto_range_health(health: &RangeHealthSnapshot) -> RangeHealthRecord {
     RangeHealthRecord {
         range_id: health.range_id.clone(),
@@ -331,6 +407,7 @@ fn to_proto_range_health(health: &RangeHealthSnapshot) -> RangeHealthRecord {
             .iter()
             .map(to_proto_replica_lag)
             .collect(),
+        reconfiguration: Some(to_proto_reconfiguration(&health.reconfiguration)),
     }
 }
 
@@ -420,6 +497,10 @@ fn range_key(range_id: &str) -> Bytes {
 
 fn balancer_key(name: &str) -> Bytes {
     metadata_key(BALANCER_PREFIX, name.as_bytes())
+}
+
+fn reconfiguration_key(range_id: &str) -> Bytes {
+    metadata_key(RECONFIG_PREFIX, range_id.as_bytes())
 }
 
 fn decode_metadata_value<T: DeserializeOwned>(value: &[u8]) -> anyhow::Result<T> {
@@ -1152,22 +1233,35 @@ impl ReplicatedMetadataRegistry {
     pub fn new(executor: Arc<dyn KvRangeExecutor>, range_id: impl Into<String>) -> Self {
         Self {
             executor,
-            range_id: range_id.into(),
+            layout: MetadataPlaneLayout::single(range_id),
+        }
+    }
+
+    pub fn with_layout(executor: Arc<dyn KvRangeExecutor>, layout: MetadataPlaneLayout) -> Self {
+        Self { executor, layout }
+    }
+
+    pub fn sharded(executor: Arc<dyn KvRangeExecutor>, base_range_id: impl Into<String>) -> Self {
+        Self {
+            executor,
+            layout: MetadataPlaneLayout::sharded(base_range_id),
         }
     }
 
     async fn read_value<T: DeserializeOwned>(&self, key: Bytes) -> anyhow::Result<Option<T>> {
+        let range_id = self.layout.range_for_key(&key).to_string();
         self.executor
-            .get(&self.range_id, &key)
+            .get(&range_id, &key)
             .await?
             .map(|value| decode_metadata_value(&value))
             .transpose()
     }
 
     async fn write_value<T: Serialize>(&self, key: Bytes, value: &T) -> anyhow::Result<()> {
+        let range_id = self.layout.range_for_key(&key).to_string();
         self.executor
             .apply(
-                &self.range_id,
+                &range_id,
                 vec![KvMutation {
                     key,
                     value: Some(encode_metadata_value(value)?),
@@ -1179,18 +1273,20 @@ impl ReplicatedMetadataRegistry {
     async fn delete_value<T: DeserializeOwned>(&self, key: Bytes) -> anyhow::Result<Option<T>> {
         let previous = self.read_value::<T>(key.clone()).await?;
         if previous.is_some() {
+            let range_id = self.layout.range_for_key(&key).to_string();
             self.executor
-                .apply(&self.range_id, vec![KvMutation { key, value: None }])
+                .apply(&range_id, vec![KvMutation { key, value: None }])
                 .await?;
         }
         Ok(previous)
     }
 
     async fn scan_prefix<T: DeserializeOwned>(&self, prefix: &[u8]) -> anyhow::Result<Vec<T>> {
+        let range_id = self.layout.range_for_prefix(prefix).to_string();
         Ok(self
             .executor
             .scan(
-                &self.range_id,
+                &range_id,
                 Some(greenmqtt_core::RangeBoundary::full()),
                 usize::MAX,
             )
@@ -1202,10 +1298,11 @@ impl ReplicatedMetadataRegistry {
     }
 
     async fn scan_entries(&self, prefix: &[u8]) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
+        let range_id = self.layout.range_for_prefix(prefix).to_string();
         Ok(self
             .executor
             .scan(
-                &self.range_id,
+                &range_id,
                 Some(greenmqtt_core::RangeBoundary::full()),
                 usize::MAX,
             )
@@ -1627,6 +1724,135 @@ impl BalancerStateRegistry for ReplicatedMetadataRegistry {
             let name = std::str::from_utf8(&key[BALANCER_PREFIX.len()..])?.to_string();
             states.insert(name, decode_metadata_value(&value)?);
         }
+        Ok(states)
+    }
+}
+
+#[async_trait]
+impl RangeReconfigurationRegistry for DynamicServiceEndpointRegistry {
+    async fn upsert_reconfiguration_state(
+        &self,
+        state: RangeReconfigurationState,
+    ) -> anyhow::Result<Option<RangeReconfigurationState>> {
+        Ok(self
+            .reconfiguration_states
+            .write()
+            .expect("service registry poisoned")
+            .insert(state.range_id.clone(), state))
+    }
+
+    async fn resolve_reconfiguration_state(
+        &self,
+        range_id: &str,
+    ) -> anyhow::Result<Option<RangeReconfigurationState>> {
+        Ok(self
+            .reconfiguration_states
+            .read()
+            .expect("service registry poisoned")
+            .get(range_id)
+            .cloned())
+    }
+
+    async fn remove_reconfiguration_state(
+        &self,
+        range_id: &str,
+    ) -> anyhow::Result<Option<RangeReconfigurationState>> {
+        Ok(self
+            .reconfiguration_states
+            .write()
+            .expect("service registry poisoned")
+            .remove(range_id))
+    }
+
+    async fn list_reconfiguration_states(
+        &self,
+    ) -> anyhow::Result<Vec<RangeReconfigurationState>> {
+        let mut states: Vec<_> = self
+            .reconfiguration_states
+            .read()
+            .expect("service registry poisoned")
+            .values()
+            .cloned()
+            .collect();
+        states.sort_by(|left, right| left.range_id.cmp(&right.range_id));
+        Ok(states)
+    }
+}
+
+#[async_trait]
+impl RangeReconfigurationRegistry for PersistentMetadataRegistry {
+    async fn upsert_reconfiguration_state(
+        &self,
+        state: RangeReconfigurationState,
+    ) -> anyhow::Result<Option<RangeReconfigurationState>> {
+        let key = reconfiguration_key(&state.range_id);
+        let previous = self
+            .read_value::<RangeReconfigurationState>(key.clone())
+            .await?;
+        self.write_value(key, &state).await?;
+        Ok(previous)
+    }
+
+    async fn resolve_reconfiguration_state(
+        &self,
+        range_id: &str,
+    ) -> anyhow::Result<Option<RangeReconfigurationState>> {
+        self.read_value(reconfiguration_key(range_id)).await
+    }
+
+    async fn remove_reconfiguration_state(
+        &self,
+        range_id: &str,
+    ) -> anyhow::Result<Option<RangeReconfigurationState>> {
+        self.delete_value(reconfiguration_key(range_id)).await
+    }
+
+    async fn list_reconfiguration_states(
+        &self,
+    ) -> anyhow::Result<Vec<RangeReconfigurationState>> {
+        let mut states = self
+            .scan_prefix::<RangeReconfigurationState>(RECONFIG_PREFIX)
+            .await?;
+        states.sort_by(|left, right| left.range_id.cmp(&right.range_id));
+        Ok(states)
+    }
+}
+
+#[async_trait]
+impl RangeReconfigurationRegistry for ReplicatedMetadataRegistry {
+    async fn upsert_reconfiguration_state(
+        &self,
+        state: RangeReconfigurationState,
+    ) -> anyhow::Result<Option<RangeReconfigurationState>> {
+        let key = reconfiguration_key(&state.range_id);
+        let previous = self
+            .read_value::<RangeReconfigurationState>(key.clone())
+            .await?;
+        self.write_value(key, &state).await?;
+        Ok(previous)
+    }
+
+    async fn resolve_reconfiguration_state(
+        &self,
+        range_id: &str,
+    ) -> anyhow::Result<Option<RangeReconfigurationState>> {
+        self.read_value(reconfiguration_key(range_id)).await
+    }
+
+    async fn remove_reconfiguration_state(
+        &self,
+        range_id: &str,
+    ) -> anyhow::Result<Option<RangeReconfigurationState>> {
+        self.delete_value(reconfiguration_key(range_id)).await
+    }
+
+    async fn list_reconfiguration_states(
+        &self,
+    ) -> anyhow::Result<Vec<RangeReconfigurationState>> {
+        let mut states = self
+            .scan_prefix::<RangeReconfigurationState>(RECONFIG_PREFIX)
+            .await?;
+        states.sort_by(|left, right| left.range_id.cmp(&right.range_id));
         Ok(states)
     }
 }
@@ -3368,10 +3594,12 @@ impl RpcRuntime {
                 inner: self.range_host.clone(),
             }))
             .add_service(RangeAdminServiceServer::new(RangeAdminRpc {
-                inner: self.range_host.clone(),
+                host: self.range_host.clone(),
+                runtime: self.range_runtime.clone(),
             }))
             .add_service(RangeControlServiceServer::new(RangeControlRpc {
                 inner: self.range_runtime.clone(),
+                registry: self.assignment_registry.clone(),
             }))
             .serve(bind)
             .await?;
@@ -3455,6 +3683,59 @@ impl SessionDirectory for SessionDictGrpcClient {
         let mut client = self.inner.lock().await;
         let reply = client.count_sessions(()).await?.into_inner();
         Ok(reply.count as usize)
+    }
+}
+
+impl SessionDictGrpcClient {
+    pub async fn session_exists(
+        &self,
+        session_ids: &[String],
+    ) -> anyhow::Result<BTreeMap<String, bool>> {
+        let mut client = self.inner.lock().await;
+        let reply = client
+            .session_exists(SessionExistRequest {
+                session_ids: session_ids.to_vec(),
+            })
+            .await?
+            .into_inner();
+        Ok(reply
+            .entries
+            .into_iter()
+            .map(|entry| (entry.session_id, entry.exists))
+            .collect())
+    }
+
+    pub async fn identity_exists(
+        &self,
+        identities: &[ClientIdentity],
+    ) -> anyhow::Result<BTreeMap<(String, String, String), bool>> {
+        let mut client = self.inner.lock().await;
+        let reply = client
+            .identity_exists(IdentityExistRequest {
+                identities: identities
+                    .iter()
+                    .map(greenmqtt_proto::to_proto_client_identity)
+                    .collect(),
+            })
+            .await?
+            .into_inner();
+        Ok(reply
+            .entries
+            .into_iter()
+            .filter_map(|entry| {
+                entry.identity.map(|identity| {
+                    let identity = from_proto_client_identity(identity);
+                    (
+                        (
+                            identity.tenant_id,
+                            identity.user_id,
+                            identity.client_id,
+                        ),
+                        entry.exists,
+                    )
+                })
+            })
+            .collect())
     }
 }
 
@@ -4008,6 +4289,56 @@ impl SessionDictService for SessionDictRpc {
             .map_err(internal_status)?;
         Ok(Response::new(ListSessionsReply {
             records: records.iter().map(to_proto_session).collect(),
+        }))
+    }
+
+    async fn session_exists(
+        &self,
+        request: Request<SessionExistRequest>,
+    ) -> Result<Response<SessionExistReply>, Status> {
+        let scheduler = SessionOnlineCheckScheduler::new(self.inner.clone());
+        let checks = scheduler
+            .check_sessions(&request.into_inner().session_ids)
+            .await
+            .map_err(internal_status)?;
+        Ok(Response::new(SessionExistReply {
+            entries: checks
+                .into_iter()
+                .map(|(session_id, exists)| SessionExistRecord { session_id, exists })
+                .collect(),
+        }))
+    }
+
+    async fn identity_exists(
+        &self,
+        request: Request<IdentityExistRequest>,
+    ) -> Result<Response<IdentityExistReply>, Status> {
+        let identities = request
+            .into_inner()
+            .identities
+            .into_iter()
+            .map(from_proto_client_identity)
+            .collect::<Vec<_>>();
+        let scheduler = SessionOnlineCheckScheduler::new(self.inner.clone());
+        let checks = scheduler
+            .check_identities(&identities)
+            .await
+            .map_err(internal_status)?;
+        Ok(Response::new(IdentityExistReply {
+            entries: identities
+                .into_iter()
+                .map(|identity| {
+                    let key = (
+                        identity.tenant_id.clone(),
+                        identity.user_id.clone(),
+                        identity.client_id.clone(),
+                    );
+                    IdentityExistRecord {
+                        identity: Some(to_proto_client_identity(&identity)),
+                        exists: checks.get(&key).copied().unwrap_or(false),
+                    }
+                })
+                .collect(),
         }))
     }
 
@@ -5044,14 +5375,7 @@ impl RangeAdminService for RangeAdminRpc {
         &self,
         _request: Request<()>,
     ) -> Result<Response<RangeHealthListReply>, Status> {
-        let host = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("kv range host unavailable"))?;
-        let runtime = greenmqtt_kv_server::ReplicaRuntime::new(
-            host.clone(),
-            Arc::new(crate::NoopReplicaTransport),
-        );
+        let runtime = self.runtime()?;
         let health = runtime.health_snapshot().await.map_err(internal_status)?;
         Ok(Response::new(RangeHealthListReply {
             entries: health.iter().map(to_proto_range_health).collect(),
@@ -5062,14 +5386,7 @@ impl RangeAdminService for RangeAdminRpc {
         &self,
         request: Request<RangeHealthRequest>,
     ) -> Result<Response<RangeHealthReply>, Status> {
-        let host = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("kv range host unavailable"))?;
-        let runtime = greenmqtt_kv_server::ReplicaRuntime::new(
-            host.clone(),
-            Arc::new(crate::NoopReplicaTransport),
-        );
+        let runtime = self.runtime()?;
         let range_id = request.into_inner().range_id;
         let health = runtime
             .health_snapshot()
@@ -5084,14 +5401,7 @@ impl RangeAdminService for RangeAdminRpc {
     }
 
     async fn debug_dump(&self, _request: Request<()>) -> Result<Response<RangeDebugReply>, Status> {
-        let host = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("kv range host unavailable"))?;
-        let runtime = greenmqtt_kv_server::ReplicaRuntime::new(
-            host.clone(),
-            Arc::new(crate::NoopReplicaTransport),
-        );
+        let runtime = self.runtime()?;
         let text = runtime.debug_dump().await.map_err(internal_status)?;
         Ok(Response::new(RangeDebugReply { text }))
     }
@@ -5116,6 +5426,7 @@ impl RangeControlService for RangeControlRpc {
             .bootstrap_range(descriptor)
             .await
             .map_err(internal_status)?;
+        self.sync_reconfiguration_state(&range_id).await?;
         Ok(Response::new(RangeBootstrapReply { range_id }))
     }
 
@@ -5128,10 +5439,19 @@ impl RangeControlService for RangeControlRpc {
             .as_ref()
             .ok_or_else(|| Status::unavailable("range runtime unavailable"))?;
         let request = request.into_inner();
-        runtime
+        let result = runtime
             .change_replicas(&request.range_id, request.voters, request.learners)
-            .await
-            .map_err(internal_status)?;
+            .await;
+        if result
+            .as_ref()
+            .err()
+            .map(|error| error.to_string().contains("blocked on catch-up"))
+            .unwrap_or(false)
+            || result.is_ok()
+        {
+            self.sync_reconfiguration_state(&request.range_id).await?;
+        }
+        result.map_err(internal_status)?;
         Ok(Response::new(()))
     }
 
@@ -5148,6 +5468,7 @@ impl RangeControlService for RangeControlRpc {
             .transfer_leadership(&request.range_id, request.target_node_id)
             .await
             .map_err(internal_status)?;
+        self.sync_reconfiguration_state(&request.range_id).await?;
         Ok(Response::new(()))
     }
 
@@ -5164,6 +5485,7 @@ impl RangeControlService for RangeControlRpc {
             .recover_range(&request.range_id, request.new_leader_node_id)
             .await
             .map_err(internal_status)?;
+        self.sync_reconfiguration_state(&request.range_id).await?;
         Ok(Response::new(()))
     }
 
@@ -5180,6 +5502,9 @@ impl RangeControlService for RangeControlRpc {
             .split_range(&request.range_id, request.split_key)
             .await
             .map_err(internal_status)?;
+        self.sync_reconfiguration_state(&request.range_id).await?;
+        self.sync_reconfiguration_state(&left_range_id).await?;
+        self.sync_reconfiguration_state(&right_range_id).await?;
         Ok(Response::new(RangeSplitReply {
             left_range_id,
             right_range_id,
@@ -5199,6 +5524,9 @@ impl RangeControlService for RangeControlRpc {
             .merge_ranges(&request.left_range_id, &request.right_range_id)
             .await
             .map_err(internal_status)?;
+        self.sync_reconfiguration_state(&request.left_range_id).await?;
+        self.sync_reconfiguration_state(&request.right_range_id).await?;
+        self.sync_reconfiguration_state(&range_id).await?;
         Ok(Response::new(RangeMergeReply { range_id }))
     }
 
@@ -5210,10 +5538,12 @@ impl RangeControlService for RangeControlRpc {
             .inner
             .as_ref()
             .ok_or_else(|| Status::unavailable("range runtime unavailable"))?;
+        let range_id = request.into_inner().range_id;
         runtime
-            .drain_range(&request.into_inner().range_id)
+            .drain_range(&range_id)
             .await
             .map_err(internal_status)?;
+        self.sync_reconfiguration_state(&range_id).await?;
         Ok(Response::new(()))
     }
 
@@ -5225,10 +5555,12 @@ impl RangeControlService for RangeControlRpc {
             .inner
             .as_ref()
             .ok_or_else(|| Status::unavailable("range runtime unavailable"))?;
+        let range_id = request.into_inner().range_id;
         runtime
-            .retire_range(&request.into_inner().range_id)
+            .retire_range(&range_id)
             .await
             .map_err(internal_status)?;
+        self.sync_reconfiguration_state(&range_id).await?;
         Ok(Response::new(()))
     }
 
@@ -5267,6 +5599,9 @@ fn internal_status(error: anyhow::Error) -> Status {
     if message.contains("range lifecycle is not serving") {
         return Status::failed_precondition(format!("kv/config-changing {message}"));
     }
+    if message.contains("blocked on catch-up") {
+        return Status::failed_precondition(format!("kv/config-changing {message}"));
+    }
     if message.contains("active leader lease") {
         return Status::failed_precondition(format!("kv/config-changing {message}"));
     }
@@ -5274,6 +5609,49 @@ fn internal_status(error: anyhow::Error) -> Status {
         return Status::deadline_exceeded(format!("kv/config-changing {message}"));
     }
     Status::internal(format!("kv/internal {message}"))
+}
+
+impl RangeControlRpc {
+    async fn sync_reconfiguration_state(&self, range_id: &str) -> Result<(), Status> {
+        let Some(runtime) = self.inner.as_ref() else {
+            return Ok(());
+        };
+        let Some(registry) = self.registry.as_ref() else {
+            return Ok(());
+        };
+        if let Some(state) = runtime
+            .reconfiguration_state(range_id)
+            .await
+            .map_err(internal_status)?
+        {
+            registry
+                .upsert_reconfiguration_state(state)
+                .await
+                .map_err(internal_status)?;
+        } else {
+            let _ = registry
+                .remove_reconfiguration_state(range_id)
+                .await
+                .map_err(internal_status)?;
+        }
+        Ok(())
+    }
+}
+
+impl RangeAdminRpc {
+    fn runtime(&self) -> Result<Arc<greenmqtt_kv_server::ReplicaRuntime>, Status> {
+        if let Some(runtime) = self.runtime.as_ref() {
+            return Ok(runtime.clone());
+        }
+        let host = self
+            .host
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("kv range host unavailable"))?;
+        Ok(Arc::new(greenmqtt_kv_server::ReplicaRuntime::new(
+            host.clone(),
+            Arc::new(crate::NoopReplicaTransport),
+        )))
+    }
 }
 
 #[cfg(test)]

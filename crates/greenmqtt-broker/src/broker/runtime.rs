@@ -5,10 +5,11 @@ use super::session_mgr::{load_admin_audit, now_millis, session_expired};
 use crate::*;
 use async_trait::async_trait;
 use greenmqtt_core::{
-    dedupe_sessions, ClientIdentity, Delivery, Lifecycle, NodeId, OfflineMessage, PublishOutcome,
-    PublishProperties, PublishRequest, RouteRecord, SessionKind, SessionRecord, TenantQuota,
-    TenantUsageSnapshot,
+    ClientIdentity, Delivery, Lifecycle, NodeId, OfflineMessage, PublishOutcome,
+    PublishProperties, PublishRequest, RouteRecord, SessionKind, SessionRecord,
+    TenantQuota, TenantUsageSnapshot,
 };
+use greenmqtt_dist::{DistDeliveryReport, DistDeliverySink, DistFanoutRequest, DistFanoutWorker};
 use greenmqtt_plugin_api::{AclProvider, AuthProvider, EventHook};
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -423,12 +424,6 @@ where
         from_session_id: &str,
         request: PublishRequest,
     ) -> anyhow::Result<PublishOutcome> {
-        #[derive(Clone)]
-        struct RemoteForwardTarget {
-            kind: SessionKind,
-            delivery: Delivery,
-        }
-
         let publisher_identity = identity.clone();
 
         let request = self
@@ -464,10 +459,33 @@ where
             self.hooks.on_retain_write(&retained).await?;
         }
 
-        let routes = self
-            .dist
-            .match_topic(&publisher_identity.tenant_id, &request.topic)
+        let outcome = DistFanoutWorker::new(self.dist.clone())
+            .fanout(
+                self,
+                &publisher_identity.tenant_id,
+                &DistFanoutRequest {
+                    from_session_id: from_session_id.to_string(),
+                    request: request.clone(),
+                },
+            )
             .await?;
+        self.hooks
+            .on_publish(&publisher_identity, &request, &outcome)
+            .await?;
+        Ok(outcome)
+    }
+
+    async fn deliver_matched_routes(
+        &self,
+        routes: &[RouteRecord],
+        fanout: &DistFanoutRequest,
+    ) -> anyhow::Result<DistDeliveryReport> {
+        #[derive(Clone)]
+        struct RemoteForwardTarget {
+            kind: SessionKind,
+            delivery: Delivery,
+        }
+
         let mut session_records = HashMap::new();
         for session_id in routes
             .iter()
@@ -485,8 +503,8 @@ where
         let mut purged_sessions = std::collections::BTreeSet::new();
         let mut removed_remote_sessions = std::collections::BTreeSet::new();
 
-        for route in routes.iter() {
-            if route.no_local && route.session_id == from_session_id {
+        for route in routes {
+            if route.no_local && route.session_id == fanout.from_session_id {
                 continue;
             }
             if let Some(record) = session_records
@@ -505,7 +523,7 @@ where
                 }
                 continue;
             }
-            let mut delivery_properties = properties.clone();
+            let mut delivery_properties = fanout.request.properties.clone();
             if let Some(subscription_identifier) = route.subscription_identifier {
                 delivery_properties
                     .subscription_identifiers
@@ -514,11 +532,11 @@ where
             let delivery = Delivery {
                 tenant_id: route.tenant_id.clone(),
                 session_id: route.session_id.clone(),
-                topic: request.topic.clone(),
-                payload: request.payload.clone(),
-                qos: request.qos,
-                retain: request.retain && route.retain_as_published,
-                from_session_id: from_session_id.to_string(),
+                topic: fanout.request.topic.clone(),
+                payload: fanout.request.payload.clone(),
+                qos: fanout.request.qos,
+                retain: fanout.request.retain && route.retain_as_published,
+                from_session_id: fanout.from_session_id.clone(),
                 properties: delivery_properties.clone(),
             };
 
@@ -548,17 +566,16 @@ where
             }
 
             if matches!(route.kind, SessionKind::Persistent) {
-                let offline = OfflineMessage {
+                offline_messages.push(OfflineMessage {
                     tenant_id: route.tenant_id.clone(),
                     session_id: route.session_id.clone(),
-                    topic: request.topic.clone(),
-                    payload: request.payload.clone(),
-                    qos: request.qos,
-                    retain: request.retain && route.retain_as_published,
-                    from_session_id: from_session_id.to_string(),
+                    topic: fanout.request.topic.clone(),
+                    payload: fanout.request.payload.clone(),
+                    qos: fanout.request.qos,
+                    retain: fanout.request.retain && route.retain_as_published,
+                    from_session_id: fanout.from_session_id.clone(),
                     properties: delivery_properties,
-                };
-                offline_messages.push(offline);
+                });
             }
         }
 
@@ -617,15 +634,10 @@ where
             }
         }
 
-        let outcome = PublishOutcome {
-            matched_routes: dedupe_sessions(&routes).len(),
+        Ok(DistDeliveryReport {
             online_deliveries,
             offline_enqueues: offline_messages.len(),
-        };
-        self.hooks
-            .on_publish(&publisher_identity, &request, &outcome)
-            .await?;
-        Ok(outcome)
+        })
     }
 
     pub async fn accept_forwarded_delivery(&self, delivery: Delivery) -> anyhow::Result<bool> {
@@ -715,6 +727,23 @@ where
 {
     async fn push_delivery(&self, delivery: Delivery) -> anyhow::Result<bool> {
         self.accept_forwarded_delivery(delivery).await
+    }
+}
+
+#[async_trait]
+impl<A, C, H> DistDeliverySink for BrokerRuntime<A, C, H>
+where
+    A: AuthProvider,
+    C: AclProvider,
+    H: EventHook,
+{
+    async fn deliver(
+        &self,
+        _tenant_id: &str,
+        fanout: &DistFanoutRequest,
+        routes: &[RouteRecord],
+    ) -> anyhow::Result<DistDeliveryReport> {
+        self.deliver_matched_routes(routes, fanout).await
     }
 }
 

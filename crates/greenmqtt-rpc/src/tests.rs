@@ -1,26 +1,29 @@
 use crate::{
-    DistGrpcClient, InboxGrpcClient, KvRangeGrpcClient, MetadataGrpcClient, NoopDeliverySink,
-    PeriodicAntiEntropyReconciler, PersistentMetadataRegistry, RaftTransportGrpcClient,
-    RangeAdminGrpcClient, ReplicatedMetadataRegistry, RetainGrpcClient, RpcRuntime,
-    SessionDictGrpcClient, StaticPeerForwarder, StaticServiceEndpointRegistry,
+    DistGrpcClient, InboxGrpcClient, KvRangeGrpcClient, MetadataGrpcClient, MetadataPlaneLayout,
+    NoopDeliverySink, PeriodicAntiEntropyReconciler, PersistentMetadataRegistry,
+    RaftTransportGrpcClient, RangeAdminGrpcClient, RangeControlGrpcClient,
+    ReplicatedMetadataRegistry, RetainGrpcClient, RpcRuntime, SessionDictGrpcClient,
+    StaticPeerForwarder, StaticServiceEndpointRegistry,
 };
 use async_trait::async_trait;
+use bytes::Bytes;
 use greenmqtt_broker::{BrokerConfig, BrokerRuntime, DefaultBroker, PeerRegistry};
 use greenmqtt_core::{
     BalancerState, BalancerStateRegistry, ClientIdentity, ClusterMembershipRegistry,
     ClusterNodeLifecycle, ClusterNodeMembership, ConnectRequest, InflightMessage, OfflineMessage,
-    PublishProperties, PublishRequest, RangeBoundary, RangeReplica, ReplicaRole, ReplicaSyncState,
-    ReplicatedRangeDescriptor, ReplicatedRangeRegistry, RetainedMessage, RouteRecord,
-    ServiceEndpoint, ServiceEndpointRegistry, ServiceKind, ServiceShardAssignment, ServiceShardKey,
-    ServiceShardKind, ServiceShardLifecycle, ServiceShardRecoveryControl, ServiceShardTransition,
-    SessionKind, SessionRecord, Subscription,
+    PublishProperties, PublishRequest, RangeBoundary, RangeReconfigurationRegistry,
+    RangeReplica, ReconfigurationPhase, ReplicaRole, ReplicaSyncState, ReplicatedRangeDescriptor,
+    ReplicatedRangeRegistry, RetainedMessage, RouteRecord, ServiceEndpoint,
+    ServiceEndpointRegistry, ServiceKind, ServiceShardAssignment, ServiceShardKey,
+    ServiceShardKind, ServiceShardLifecycle, ServiceShardRecoveryControl,
+    ServiceShardTransition, SessionKind, SessionRecord, Subscription,
 };
 use greenmqtt_dist::{DistHandle, DistRouter};
 use greenmqtt_inbox::PersistentInboxHandle;
 use greenmqtt_inbox::{InboxHandle, InboxService};
 use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter, MemoryKvRangeRouter};
 use greenmqtt_kv_engine::{
-    KvEngine, KvMutation, KvRangeBootstrap, MemoryKvEngine, RocksDbKvEngine,
+    KvEngine, KvMutation, KvRangeBootstrap, KvRangeSpace, MemoryKvEngine, RocksDbKvEngine,
 };
 use greenmqtt_kv_raft::{
     AppendEntriesRequest, AppendEntriesResponse, MemoryRaftNode, MemoryRaftStateStore, RaftMessage,
@@ -357,6 +360,59 @@ async fn grpc_round_trip_for_internal_services() {
 }
 
 #[tokio::test]
+async fn grpc_round_trip_for_session_online_check_surface() {
+    let bind = "127.0.0.1:50111".parse().unwrap();
+    let server = tokio::spawn(state_runtime().serve(bind));
+    sleep(Duration::from_millis(50)).await;
+
+    let client = SessionDictGrpcClient::connect("http://127.0.0.1:50111")
+        .await
+        .unwrap();
+    client
+        .register(SessionRecord {
+            session_id: "s-check".into(),
+            node_id: 1,
+            kind: SessionKind::Persistent,
+            identity: ClientIdentity {
+                tenant_id: "t1".into(),
+                user_id: "u1".into(),
+                client_id: "c1".into(),
+            },
+            session_expiry_interval_secs: None,
+            expires_at_ms: None,
+        })
+        .await
+        .unwrap();
+
+    let sessions = client
+        .session_exists(&["s-check".into(), "missing".into()])
+        .await
+        .unwrap();
+    assert_eq!(sessions["s-check"], true);
+    assert_eq!(sessions["missing"], false);
+
+    let identities = client
+        .identity_exists(&[
+            ClientIdentity {
+                tenant_id: "t1".into(),
+                user_id: "u1".into(),
+                client_id: "c1".into(),
+            },
+            ClientIdentity {
+                tenant_id: "t1".into(),
+                user_id: "u9".into(),
+                client_id: "c9".into(),
+            },
+        ])
+        .await
+        .unwrap();
+    assert_eq!(identities[&("t1".into(), "u1".into(), "c1".into())], true);
+    assert_eq!(identities[&("t1".into(), "u9".into(), "c9".into())], false);
+
+    server.abort();
+}
+
+#[tokio::test]
 async fn grpc_round_trip_for_metadata_service() {
     let bind = "127.0.0.1:50062".parse().unwrap();
     let registry = Arc::new(StaticServiceEndpointRegistry::default());
@@ -552,6 +608,173 @@ async fn replicated_metadata_registry_round_trips_over_kv_range_service() {
         .await
         .unwrap()
         .is_some());
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn replicated_metadata_registry_shards_records_across_metadata_ranges() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let bind = listener.local_addr().unwrap();
+    drop(listener);
+    let engine = MemoryKvEngine::default();
+    let layout = MetadataPlaneLayout::sharded("__metadata");
+    let host = Arc::new(MemoryKvRangeHost::default());
+
+    for range_id in [
+        layout.assignments_range_id.clone(),
+        layout.members_range_id.clone(),
+        layout.ranges_range_id.clone(),
+        layout.balancers_range_id.clone(),
+    ] {
+        engine
+            .bootstrap(KvRangeBootstrap {
+                range_id: range_id.clone(),
+                boundary: RangeBoundary::full(),
+            })
+            .await
+            .unwrap();
+        let range = engine.open_range(&range_id).await.unwrap();
+        let raft_impl = Arc::new(MemoryRaftNode::single_node(1, &range_id));
+        raft_impl.recover().await.unwrap();
+        host.add_range(HostedRange {
+            descriptor: ReplicatedRangeDescriptor::new(
+                &range_id,
+                ServiceShardKey::retain("meta"),
+                RangeBoundary::full(),
+                1,
+                1,
+                Some(1),
+                vec![RangeReplica::new(
+                    1,
+                    ReplicaRole::Voter,
+                    ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ),
+            raft: raft_impl,
+            space: Arc::from(range),
+        })
+        .await
+        .unwrap();
+    }
+
+    let server = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: None,
+            range_host: Some(host),
+            range_runtime: None,
+        }
+        .serve(bind),
+    );
+    sleep(Duration::from_millis(100)).await;
+
+    let executor = Arc::new(KvRangeGrpcClient::connect(format!("http://{bind}")).await.unwrap());
+    let registry = ReplicatedMetadataRegistry::with_layout(executor, layout.clone());
+    registry
+        .upsert_member(ClusterNodeMembership::new(
+            9,
+            1,
+            ClusterNodeLifecycle::Serving,
+            vec![ServiceEndpoint::new(ServiceKind::Retain, 9, format!("http://{bind}"))],
+        ))
+        .await
+        .unwrap();
+    registry
+        .upsert_assignment(ServiceShardAssignment::new(
+            ServiceShardKey::retain("t1"),
+            ServiceEndpoint::new(ServiceKind::Retain, 9, format!("http://{bind}")),
+            1,
+            10,
+            ServiceShardLifecycle::Serving,
+        ))
+        .await
+        .unwrap();
+    registry
+        .upsert_range(ReplicatedRangeDescriptor::new(
+            "meta-range-1",
+            ServiceShardKey::retain("t1"),
+            RangeBoundary::full(),
+            1,
+            1,
+            Some(9),
+            vec![RangeReplica::new(
+                9,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ))
+        .await
+        .unwrap();
+    registry
+        .upsert_balancer_state(
+            "dist",
+            BalancerState {
+                disabled: false,
+                load_rules: BTreeMap::from([("mode".into(), "hot".into())]),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        engine
+            .open_range(&layout.assignments_range_id)
+            .await
+            .unwrap()
+            .reader()
+            .scan(&RangeBoundary::full(), usize::MAX)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        engine
+            .open_range(&layout.members_range_id)
+            .await
+            .unwrap()
+            .reader()
+            .scan(&RangeBoundary::full(), usize::MAX)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        engine
+            .open_range(&layout.ranges_range_id)
+            .await
+            .unwrap()
+            .reader()
+            .scan(&RangeBoundary::full(), usize::MAX)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        engine
+            .open_range(&layout.balancers_range_id)
+            .await
+            .unwrap()
+            .reader()
+            .scan(&RangeBoundary::full(), usize::MAX)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 
     server.abort();
 }
@@ -1411,10 +1634,20 @@ async fn range_admin_service_reports_health_and_debug_dump() {
     let listed = client.list_range_health().await.unwrap();
     assert_eq!(listed.entries.len(), 1);
     assert_eq!(listed.entries[0].range_id, "range-admin");
+    let listed_reconfig = listed.entries[0].reconfiguration.as_ref().unwrap();
+    assert_eq!(listed_reconfig.current_voters, vec![1]);
+    assert!(listed_reconfig.pending_voters.is_empty());
+    assert!(!listed_reconfig.blocked_on_catch_up);
     let fetched = client.get_range_health("range-admin").await.unwrap();
-    assert_eq!(fetched.health.unwrap().range_id, "range-admin");
+    let fetched = fetched.health.unwrap();
+    assert_eq!(fetched.range_id, "range-admin");
+    assert_eq!(
+        fetched.reconfiguration.unwrap().current_voters,
+        vec![1]
+    );
     let dump = client.debug_dump().await.unwrap();
     assert!(dump.contains("range=range-admin"));
+    assert!(dump.contains("current_voters=[1]"));
 
     server.abort();
 }
@@ -1502,6 +1735,432 @@ async fn grpc_round_trip_for_range_control_service() {
     client.retire_range(&merged).await.unwrap();
 
     server.abort();
+}
+
+#[tokio::test]
+async fn range_control_service_is_idempotent_for_repeated_operator_commands() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let bind = listener.local_addr().unwrap();
+    drop(listener);
+    let engine = MemoryKvEngine::default();
+    let host = Arc::new(MemoryKvRangeHost::default());
+    let runtime = Arc::new(ReplicaRuntime::with_config(
+        host.clone(),
+        Arc::new(crate::NoopReplicaTransport),
+        Some(Arc::new(TestRangeLifecycleManager {
+            engine: engine.clone(),
+        })),
+        Duration::from_secs(1),
+        64,
+        64,
+        64,
+    ));
+    let server = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: None,
+            range_host: Some(host.clone()),
+            range_runtime: Some(runtime.clone()),
+        }
+        .serve(bind),
+    );
+    sleep(Duration::from_millis(100)).await;
+
+    let client = crate::RangeControlGrpcClient::connect(format!("http://{bind}"))
+        .await
+        .unwrap();
+    let descriptor = ReplicatedRangeDescriptor::new(
+        "range-idem",
+        ServiceShardKey::retain("t1"),
+        RangeBoundary::full(),
+        1,
+        1,
+        Some(1),
+        vec![RangeReplica::new(
+            1,
+            ReplicaRole::Voter,
+            ReplicaSyncState::Replicating,
+        )],
+        0,
+        0,
+        ServiceShardLifecycle::Bootstrapping,
+    );
+    let range_id = client.bootstrap_range(descriptor.clone()).await.unwrap();
+    assert_eq!(range_id, "range-idem");
+    let second = client.bootstrap_range(descriptor).await.unwrap();
+    assert_eq!(second, "range-idem");
+
+    client.transfer_leadership("range-idem", 1).await.unwrap();
+    client.transfer_leadership("range-idem", 1).await.unwrap();
+    client.recover_range("range-idem", 1).await.unwrap();
+    client.recover_range("range-idem", 1).await.unwrap();
+
+    let (left, right) = client.split_range("range-idem", b"m".to_vec()).await.unwrap();
+    let (left_again, right_again) = client.split_range("range-idem", b"m".to_vec()).await.unwrap();
+    assert_eq!((left_again, right_again), (left.clone(), right.clone()));
+
+    let merged = client.merge_ranges(&left, &right).await.unwrap();
+    let merged_again = client.merge_ranges(&left, &right).await.unwrap();
+    assert_eq!(merged_again, merged);
+
+    client.drain_range(&merged).await.unwrap();
+    client.drain_range(&merged).await.unwrap();
+    client.retire_range(&merged).await.unwrap();
+    client.retire_range(&merged).await.unwrap();
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn range_control_service_persists_reconfiguration_state_into_metadata_registry() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let bind = listener.local_addr().unwrap();
+    drop(listener);
+    let engine = MemoryKvEngine::default();
+    let host = Arc::new(MemoryKvRangeHost::default());
+    let runtime = Arc::new(ReplicaRuntime::with_config(
+        host.clone(),
+        Arc::new(crate::NoopReplicaTransport),
+        Some(Arc::new(TestRangeLifecycleManager {
+            engine: engine.clone(),
+        })),
+        Duration::from_secs(1),
+        1024,
+        64,
+        64,
+    ));
+    let registry = Arc::new(StaticServiceEndpointRegistry::default());
+    engine
+        .bootstrap(KvRangeBootstrap {
+            range_id: "range-reconfig".into(),
+            boundary: RangeBoundary::full(),
+        })
+        .await
+        .unwrap();
+    let range = engine.open_range("range-reconfig").await.unwrap();
+    let raft_impl = Arc::new(MemoryRaftNode::single_node(1, "range-reconfig"));
+    raft_impl.recover().await.unwrap();
+    let _ = raft_impl.propose(Bytes::from_static(b"cmd")).await.unwrap();
+    let raft: Arc<dyn RaftNode> = raft_impl.clone();
+    host.add_range(HostedRange {
+        descriptor: ReplicatedRangeDescriptor::new(
+            "range-reconfig",
+            ServiceShardKey::retain("t1"),
+            RangeBoundary::full(),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ),
+        raft,
+        space: Arc::from(range),
+    })
+    .await
+    .unwrap();
+    let server = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: Some(registry.clone()),
+            range_host: Some(host),
+            range_runtime: Some(runtime.clone()),
+        }
+        .serve(bind),
+    );
+    sleep(Duration::from_millis(50)).await;
+
+    let client = RangeControlGrpcClient::connect(format!("http://{bind}"))
+        .await
+        .unwrap();
+    client
+        .change_replicas("range-reconfig", vec![1, 2], Vec::new())
+        .await
+        .unwrap();
+    let error = client
+        .change_replicas("range-reconfig", vec![1, 2], Vec::new())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("config-changing"));
+    let state = registry
+        .resolve_reconfiguration_state("range-reconfig")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.current_voters, vec![1]);
+    assert_eq!(state.pending_voters, vec![1, 2]);
+    assert_eq!(state.phase, Some(ReconfigurationPhase::Finalizing));
+    assert!(state.blocked_on_catch_up);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn multi_node_replicated_metadata_range_control_and_zombie_detection_work_together() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let metadata_bind = listener.local_addr().unwrap();
+    drop(listener);
+    let layout = MetadataPlaneLayout::sharded("__metadata");
+    let metadata_engine = MemoryKvEngine::default();
+    let metadata_host = Arc::new(MemoryKvRangeHost::default());
+    for range_id in [
+        layout.assignments_range_id.clone(),
+        layout.members_range_id.clone(),
+        layout.ranges_range_id.clone(),
+        layout.balancers_range_id.clone(),
+    ] {
+        metadata_engine
+            .bootstrap(KvRangeBootstrap {
+                range_id: range_id.clone(),
+                boundary: RangeBoundary::full(),
+            })
+            .await
+            .unwrap();
+        let range = metadata_engine.open_range(&range_id).await.unwrap();
+        let raft_impl = Arc::new(MemoryRaftNode::single_node(1, &range_id));
+        raft_impl.recover().await.unwrap();
+        metadata_host
+            .add_range(HostedRange {
+                descriptor: ReplicatedRangeDescriptor::new(
+                    &range_id,
+                    ServiceShardKey::retain("meta"),
+                    RangeBoundary::full(),
+                    1,
+                    1,
+                    Some(1),
+                    vec![RangeReplica::new(
+                        1,
+                        ReplicaRole::Voter,
+                        ReplicaSyncState::Replicating,
+                    )],
+                    0,
+                    0,
+                    ServiceShardLifecycle::Serving,
+                ),
+                raft: raft_impl,
+                space: Arc::from(range),
+            })
+            .await
+            .unwrap();
+    }
+    let metadata_server = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: None,
+            range_host: Some(metadata_host),
+            range_runtime: None,
+        }
+        .serve(metadata_bind),
+    );
+    sleep(Duration::from_millis(50)).await;
+
+    let metadata_registry = Arc::new(ReplicatedMetadataRegistry::with_layout(
+        Arc::new(KvRangeGrpcClient::connect(format!("http://{metadata_bind}")).await.unwrap()),
+        layout.clone(),
+    ));
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let node1_bind = listener.local_addr().unwrap();
+    drop(listener);
+    let node1_engine = MemoryKvEngine::default();
+    let node1_host = Arc::new(MemoryKvRangeHost::default());
+    let node1_runtime = Arc::new(ReplicaRuntime::with_config(
+        node1_host.clone(),
+        Arc::new(crate::NoopReplicaTransport),
+        Some(Arc::new(TestRangeLifecycleManager {
+            engine: node1_engine.clone(),
+        })),
+        Duration::from_secs(1),
+        1024,
+        64,
+        64,
+    ));
+    node1_runtime
+        .bootstrap_range(ReplicatedRangeDescriptor::new(
+            "range-node1",
+            ServiceShardKey::retain("t1"),
+            RangeBoundary::full(),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Bootstrapping,
+        ))
+        .await
+        .unwrap();
+    metadata_registry
+        .upsert_member(ClusterNodeMembership::new(
+            1,
+            1,
+            ClusterNodeLifecycle::Serving,
+            vec![ServiceEndpoint::new(
+                ServiceKind::Retain,
+                1,
+                format!("http://{node1_bind}"),
+            )],
+        ))
+        .await
+        .unwrap();
+    metadata_registry
+        .upsert_range(ReplicatedRangeDescriptor::new(
+            "range-node1",
+            ServiceShardKey::retain("t1"),
+            RangeBoundary::full(),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ))
+        .await
+        .unwrap();
+    let node1_server = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: Some(metadata_registry.clone()),
+            range_host: Some(node1_host),
+            range_runtime: Some(node1_runtime.clone()),
+        }
+        .serve(node1_bind),
+    );
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let node2_bind = listener.local_addr().unwrap();
+    drop(listener);
+    let node2_engine = MemoryKvEngine::default();
+    node2_engine
+        .bootstrap(KvRangeBootstrap {
+            range_id: "range-zombie-node2".into(),
+            boundary: RangeBoundary::full(),
+        })
+        .await
+        .unwrap();
+    let zombie_space = Arc::<dyn KvRangeSpace>::from(
+        node2_engine.open_range("range-zombie-node2").await.unwrap(),
+    );
+    let zombie_raft = Arc::new(MemoryRaftNode::new(
+        2,
+        "range-zombie-node2",
+        greenmqtt_kv_raft::RaftClusterConfig {
+            voters: vec![2, 3],
+            learners: Vec::new(),
+        },
+    ));
+    zombie_raft.recover().await.unwrap();
+    let node2_host = Arc::new(MemoryKvRangeHost::default());
+    node2_host
+        .add_range(HostedRange {
+            descriptor: ReplicatedRangeDescriptor::new(
+                "range-zombie-node2",
+                ServiceShardKey::retain("t2"),
+                RangeBoundary::full(),
+                1,
+                1,
+                None,
+                vec![RangeReplica::new(
+                    2,
+                    ReplicaRole::Voter,
+                    ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Recovering,
+            ),
+            raft: zombie_raft,
+            space: zombie_space,
+        })
+        .await
+        .unwrap();
+    metadata_registry
+        .upsert_member(ClusterNodeMembership::new(
+            2,
+            1,
+            ClusterNodeLifecycle::Serving,
+            vec![ServiceEndpoint::new(
+                ServiceKind::Retain,
+                2,
+                format!("http://{node2_bind}"),
+            )],
+        ))
+        .await
+        .unwrap();
+    let node2_server = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: Some(metadata_registry.clone()),
+            range_host: Some(node2_host),
+            range_runtime: None,
+        }
+        .serve(node2_bind),
+    );
+    sleep(Duration::from_millis(100)).await;
+
+    let range_control = RangeControlGrpcClient::connect(format!("http://{node1_bind}"))
+        .await
+        .unwrap();
+    range_control
+        .change_replicas("range-node1", vec![1, 2], Vec::new())
+        .await
+        .unwrap();
+    let reconfig = metadata_registry
+        .resolve_reconfiguration_state("range-node1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reconfig.current_voters, vec![1]);
+    assert_eq!(reconfig.pending_voters, vec![1, 2]);
+    assert!(reconfig.blocked_on_catch_up || reconfig.phase.is_some());
+
+    let range_admin = RangeAdminGrpcClient::connect(format!("http://{node2_bind}"))
+        .await
+        .unwrap();
+    let zombies = range_admin.list_range_health().await.unwrap();
+    assert!(zombies
+        .entries
+        .iter()
+        .any(|entry| entry.range_id == "range-zombie-node2" && !entry.has_leader_node_id));
+
+    metadata_server.abort();
+    node1_server.abort();
+    node2_server.abort();
 }
 
 #[tokio::test]

@@ -4,7 +4,7 @@ pub(crate) mod persistent;
 use crate::trie::tenant_routes_from_vec;
 use async_trait::async_trait;
 use bytes::Bytes;
-use greenmqtt_core::{RouteRecord, TopicName};
+use greenmqtt_core::{dedupe_sessions, PublishOutcome, PublishRequest, RouteRecord, TopicName};
 use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter};
 pub use handle::{dist_route_shard, dist_tenant_shard, DistHandle};
 pub(crate) use handle::{
@@ -424,27 +424,47 @@ pub trait DistDeliverySink: Send + Sync {
     async fn deliver(
         &self,
         tenant_id: &str,
-        topic: &TopicName,
+        fanout: &DistFanoutRequest,
         routes: &[RouteRecord],
-    ) -> anyhow::Result<()>;
+    ) -> anyhow::Result<DistDeliveryReport>;
 }
 
 #[derive(Clone)]
 pub struct DistFanoutWorker {
     router: Arc<dyn DistRouter>,
-    sink: Arc<dyn DistDeliverySink>,
 }
 
 impl DistFanoutWorker {
-    pub fn new(router: Arc<dyn DistRouter>, sink: Arc<dyn DistDeliverySink>) -> Self {
-        Self { router, sink }
+    pub fn new(router: Arc<dyn DistRouter>) -> Self {
+        Self { router }
     }
 
-    pub async fn fanout(&self, tenant_id: &str, topic: &TopicName) -> anyhow::Result<usize> {
-        let routes = self.router.match_topic(tenant_id, topic).await?;
-        self.sink.deliver(tenant_id, topic, &routes).await?;
-        Ok(routes.len())
+    pub async fn fanout(
+        &self,
+        sink: &dyn DistDeliverySink,
+        tenant_id: &str,
+        fanout: &DistFanoutRequest,
+    ) -> anyhow::Result<PublishOutcome> {
+        let routes = self.router.match_topic(tenant_id, &fanout.request.topic).await?;
+        let report = sink.deliver(tenant_id, fanout, &routes).await?;
+        Ok(PublishOutcome {
+            matched_routes: dedupe_sessions(&routes).len(),
+            online_deliveries: report.online_deliveries,
+            offline_enqueues: report.offline_enqueues,
+        })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DistFanoutRequest {
+    pub from_session_id: String,
+    pub request: PublishRequest,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DistDeliveryReport {
+    pub online_deliveries: usize,
+    pub offline_enqueues: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
