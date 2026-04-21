@@ -967,6 +967,128 @@ fn dist_maintenance_tick_refreshes_routes_and_proposes_hot_tenant_actions() {
 }
 
 #[test]
+fn dist_maintenance_tick_can_scan_all_tenants_with_wildcard_selector() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let bind = "127.0.0.1:50081".parse().unwrap();
+        let registry = Arc::new(StaticServiceEndpointRegistry::default());
+        let host = Arc::new(MemoryKvRangeHost::default());
+        let engine = MemoryKvEngine::default();
+        registry
+            .upsert_member(ClusterNodeMembership::new(
+                1,
+                1,
+                ClusterNodeLifecycle::Serving,
+                vec![ServiceEndpoint::new(
+                    ServiceKind::Dist,
+                    1,
+                    "http://127.0.0.1:50081",
+                )],
+            ))
+            .await
+            .unwrap();
+        add_hosted_range(
+            &engine,
+            &host,
+            &registry,
+            "dist-maint-range-hot",
+            greenmqtt_dist::dist_tenant_shard("hot"),
+        )
+        .await;
+        add_hosted_range(
+            &engine,
+            &host,
+            &registry,
+            "dist-maint-range-cool",
+            greenmqtt_dist::dist_tenant_shard("cool"),
+        )
+        .await;
+
+        let server = tokio::spawn(
+            greenmqtt_rpc::RpcRuntime {
+                sessiondict: Arc::new(SessionDictHandle::default()),
+                dist: Arc::new(DistHandle::default()),
+                inbox: Arc::new(InboxHandle::default()),
+                retain: Arc::new(RetainHandle::default()),
+                peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
+                assignment_registry: Some(registry.clone()),
+                range_host: Some(host),
+                range_runtime: None,
+                inbox_lwt_sink: None,
+            }
+            .serve(bind),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let client = Arc::new(
+            RemoteRangeClientBuilder::new()
+                .metadata_endpoint("http://127.0.0.1:50081")
+                .range_endpoint("http://127.0.0.1:50081")
+                .build_data()
+                .await
+                .unwrap(),
+        );
+        let dist = Arc::new(ReplicatedDistHandle::new(client));
+        for (tenant_id, topic_filter, session_id, shared_group) in [
+            ("hot", "devices/#", "s1", None),
+            ("hot", "devices/+/state", "s2", Some("shared")),
+            ("hot", "alerts/#", "s3", None),
+            ("cool", "devices/a", "c1", None),
+        ] {
+            dist.add_route(RouteRecord {
+                tenant_id: tenant_id.into(),
+                topic_filter: topic_filter.into(),
+                session_id: session_id.into(),
+                node_id: 1,
+                subscription_identifier: None,
+                no_local: false,
+                retain_as_published: false,
+                shared_group: shared_group.map(str::to_string),
+                kind: SessionKind::Persistent,
+            })
+            .await
+            .unwrap();
+        }
+
+        let actions = run_dist_maintenance_tick(
+            dist,
+            &DistMaintenanceConfig {
+                tenants: vec!["*".into()],
+                interval: Duration::from_secs(30),
+                policy: ThresholdDistBalancePolicy {
+                    max_total_routes: 1,
+                    max_wildcard_routes: 1,
+                    max_shared_routes: 0,
+                    desired_voters: 3,
+                    desired_learners: 1,
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            actions,
+            vec![
+                DistBalanceAction::RunTenantCleanup {
+                    tenant_id: "hot".into(),
+                },
+                DistBalanceAction::SplitTenantRange {
+                    tenant_id: "hot".into(),
+                },
+                DistBalanceAction::ScaleTenantReplicas {
+                    tenant_id: "hot".into(),
+                    voters: 3,
+                    learners: 1,
+                },
+            ]
+        );
+
+        server.abort();
+    });
+}
+
+#[test]
 fn inbox_maintenance_tick_expires_tenant_state_and_proposes_hot_tenant_actions() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
@@ -4274,6 +4396,7 @@ fn configured_control_plane_runtime_skips_non_controller_node() {
                         7,
                         registry.clone(),
                         "http://127.0.0.1:50051".to_string(),
+                        "http://127.0.0.1:50051".to_string(),
                     )
                     .await
                 });
@@ -4303,6 +4426,7 @@ fn configured_control_plane_runtime_rejects_invalid_desired_ranges_json() {
                             configured_control_plane_runtime(
                                 7,
                                 registry.clone(),
+                                "http://127.0.0.1:50051".to_string(),
                                 "http://127.0.0.1:50051".to_string(),
                             )
                             .await

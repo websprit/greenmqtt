@@ -66,7 +66,7 @@ use greenmqtt_storage::{
 };
 use metrics_exporter_prometheus::PrometheusBuilder;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -4823,8 +4823,22 @@ async fn run_dist_maintenance_tick(
     config: &DistMaintenanceConfig,
 ) -> anyhow::Result<Vec<DistBalanceAction>> {
     let worker = DistMaintenanceWorker::new(dist.clone());
+    let tenants = if config.targets_all_tenants() {
+        dist.list_routes(None)
+            .await?
+            .into_iter()
+            .map(|route| route.tenant_id)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+    } else {
+        config.tenants.clone()
+    };
+    if tenants.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut stats = Vec::new();
-    for tenant_id in &config.tenants {
+    for tenant_id in &tenants {
         let _ = worker.refresh_tenant(tenant_id).await?;
         let routes = dist.list_routes(Some(tenant_id)).await?;
         stats.push(DistTenantStats {
@@ -5108,6 +5122,14 @@ struct DistMaintenanceConfig {
     tenants: Vec<String>,
     interval: Duration,
     policy: ThresholdDistBalancePolicy,
+}
+
+impl DistMaintenanceConfig {
+    fn targets_all_tenants(&self) -> bool {
+        self.tenants
+            .iter()
+            .any(|tenant| tenant == "*" || tenant.eq_ignore_ascii_case("all"))
+    }
 }
 
 #[derive(Debug, Clone)]

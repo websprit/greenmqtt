@@ -1,0 +1,75 @@
+#
+# Recommended local-k8s profile with conservative automatic Dist split enabled.
+#
+# This file is intentionally separate from `greenmqtt-3node-control-plane-values.yaml`.
+# The base control-plane file stays safe and quiet by default; this profile turns on
+# automatic Dist maintenance with thresholds that are meant for steady-state testing,
+# not for "split as fast as possible" validation.
+#
+# Tenant selection
+# - GREENMQTT_DIST_MAINTENANCE_TENANTS="*" means "scan all observed tenants".
+# - Replace `*` with a comma-separated allow-list if you only want a subset.
+#
+# Conservative threshold suggestions by memory per state node
+# - <= 8 GiB:  total=25000, wildcard=5000,  shared=2000
+# - 16 GiB:    total=50000, wildcard=10000, shared=5000
+# - >= 32 GiB: total=100000, wildcard=20000, shared=10000
+#
+# Replica suggestions by state node count
+# - 1 state node:  voters=1, learners=0
+# - 3-4 nodes:     voters=3, learners=0
+# - >= 5 nodes:    voters=3, learners=1
+#
+# Current defaults below target the checked-in local topology:
+# - 3 broker pods
+# - 1 state pod
+# - modest local-dev memory budgets
+#
+replicaCount: 3
+
+image:
+  repository: greenmqtt
+  tag: local
+  pullPolicy: IfNotPresent
+
+fullnameOverride: greenmqtt
+
+persistence:
+  enabled: false
+
+service:
+  type: ClusterIP
+
+greenmqtt:
+  storageBackend: memory
+  extraEnv:
+    GREENMQTT_STATE_MODE: "replicated"
+    GREENMQTT_METADATA_BACKEND: "replicated"
+    GREENMQTT_METADATA_ENDPOINT: "http://greenmqtt-state:50051"
+    GREENMQTT_RANGE_ENDPOINT: "http://greenmqtt-state:50051"
+    GREENMQTT_PEERS: ""
+
+    GREENMQTT_CONTROL_PLANE_ENABLED: "true"
+    GREENMQTT_CONTROL_PLANE_CONTROLLER_NODE_ID: "1"
+    GREENMQTT_CONTROL_PLANE_VOTERS_PER_RANGE: "1"
+    GREENMQTT_CONTROL_PLANE_LEARNERS_PER_RANGE: "0"
+    GREENMQTT_CONTROL_PLANE_BOOTSTRAP_INTERVAL_SECS: "30"
+    GREENMQTT_CONTROL_PLANE_REPLICA_INTERVAL_SECS: "30"
+    GREENMQTT_CONTROL_PLANE_LEADER_INTERVAL_SECS: "30"
+    GREENMQTT_CONTROL_PLANE_CLEANUP_INTERVAL_SECS: "30"
+    GREENMQTT_CONTROL_PLANE_RECOVERY_INTERVAL_SECS: "30"
+    GREENMQTT_CONTROL_PLANE_COMMAND_INTERVAL_SECS: "15"
+
+    GREENMQTT_DIST_MAINTENANCE_TENANTS: "*"
+    GREENMQTT_DIST_MAINTENANCE_INTERVAL_SECS: "30"
+    GREENMQTT_DIST_MAX_TOTAL_ROUTES: "25000"
+    GREENMQTT_DIST_MAX_WILDCARD_ROUTES: "5000"
+    GREENMQTT_DIST_MAX_SHARED_ROUTES: "2000"
+    GREENMQTT_DIST_DESIRED_VOTERS: "1"
+    GREENMQTT_DIST_DESIRED_LEARNERS: "0"
+
+storeTopology:
+  enabled: true
+  replicaCount: 1
+  greenmqtt:
+    storageBackend: rocksdb
