@@ -4,7 +4,9 @@ use greenmqtt_core::{
     InflightMessage, InflightPhase, OfflineMessage, PublishProperties, PublishRequest,
     RangeBoundary, ServiceShardKey, ServiceShardKind, SessionId, Subscription,
 };
-use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter};
+use greenmqtt_kv_client::{
+    KvRangeExecutor, KvRangeRouter, RangeDataClient, RoutedRangeDataClient,
+};
 use greenmqtt_kv_engine::KvMutation;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -844,29 +846,34 @@ fn publish_properties_expired_at(properties: &PublishProperties, now_ms: u64) ->
 
 #[derive(Clone)]
 pub struct ReplicatedInboxHandle {
-    router: Arc<dyn KvRangeRouter>,
-    executor: Arc<dyn KvRangeExecutor>,
+    client: Arc<dyn RangeDataClient>,
     next_seq: Arc<AtomicU64>,
     active_sessions: Arc<RwLock<HashMap<String, bool>>>,
     delayed_lwts: Arc<RwLock<HashMap<String, RegisteredDelayedLwt>>>,
 }
 
 impl ReplicatedInboxHandle {
-    pub fn new(router: Arc<dyn KvRangeRouter>, executor: Arc<dyn KvRangeExecutor>) -> Self {
+    pub fn new(client: Arc<dyn RangeDataClient>) -> Self {
         Self {
-            router,
-            executor,
+            client,
             next_seq: Arc::new(AtomicU64::new(0)),
             active_sessions: Arc::new(RwLock::new(HashMap::new())),
             delayed_lwts: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
+    pub fn from_router_executor(
+        router: Arc<dyn KvRangeRouter>,
+        executor: Arc<dyn KvRangeExecutor>,
+    ) -> Self {
+        Self::new(Arc::new(RoutedRangeDataClient::new(router, executor)))
+    }
+
     async fn remove_offline_messages(&self, messages: &[OfflineMessage]) -> anyhow::Result<usize> {
         let mut removed = 0usize;
         for message in messages {
             let range_id = self.inbox_range_id_for_tenant(&message.tenant_id).await?;
-            let entries = self.executor.scan(&range_id, None, usize::MAX).await?;
+            let entries = self.client.scan(&range_id, None, usize::MAX).await?;
             let mut removals = Vec::new();
             for (key, value) in entries {
                 if !key.starts_with(OFFLINE_KEY_PREFIX) {
@@ -884,7 +891,7 @@ impl ReplicatedInboxHandle {
             }
             if !removals.is_empty() {
                 removed += removals.len();
-                self.executor.apply(&range_id, removals).await?;
+                self.client.apply(&range_id, removals).await?;
             }
         }
         Ok(removed)
@@ -907,14 +914,14 @@ impl ReplicatedInboxHandle {
             removed += 1;
         }
         for (range_id, removals) in grouped {
-            self.executor.apply(&range_id, removals).await?;
+            self.client.apply(&range_id, removals).await?;
         }
         Ok(removed)
     }
 
     async fn inbox_range_id_for_tenant(&self, tenant_id: &str) -> anyhow::Result<String> {
         let shard = inbox_tenant_scan_shard(tenant_id);
-        self.router
+        self.client
             .route_shard(&shard)
             .await?
             .into_iter()
@@ -925,7 +932,7 @@ impl ReplicatedInboxHandle {
 
     async fn inflight_range_id_for_tenant(&self, tenant_id: &str) -> anyhow::Result<String> {
         let shard = inflight_tenant_scan_shard(tenant_id);
-        self.router
+        self.client
             .route_shard(&shard)
             .await?
             .into_iter()
@@ -936,11 +943,11 @@ impl ReplicatedInboxHandle {
 
     async fn scan_inbox_kind(&self, kind: ServiceShardKind) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
         let mut entries = Vec::new();
-        for descriptor in self.router.list().await? {
+        for descriptor in self.client.list_ranges().await? {
             if descriptor.shard.kind != kind {
                 continue;
             }
-            entries.extend(self.executor.scan(&descriptor.id, None, usize::MAX).await?);
+            entries.extend(self.client.scan(&descriptor.id, None, usize::MAX).await?);
         }
         Ok(entries)
     }
@@ -952,12 +959,12 @@ impl ReplicatedInboxHandle {
     ) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
         let mut entries = Vec::new();
         let boundary = prefix_boundary(prefix);
-        for descriptor in self.router.list().await? {
+        for descriptor in self.client.list_ranges().await? {
             if descriptor.shard.kind != kind {
                 continue;
             }
             entries.extend(
-                self.executor
+                self.client
                     .scan(&descriptor.id, Some(boundary.clone()), usize::MAX)
                     .await?,
             );
@@ -970,11 +977,11 @@ impl ReplicatedInboxHandle {
         kind: ServiceShardKind,
         key: &[u8],
     ) -> anyhow::Result<Option<Bytes>> {
-        for descriptor in self.router.list().await? {
+        for descriptor in self.client.list_ranges().await? {
             if descriptor.shard.kind != kind {
                 continue;
             }
-            if let Some(value) = self.executor.get(&descriptor.id, key).await? {
+            if let Some(value) = self.client.get(&descriptor.id, key).await? {
                 return Ok(Some(value));
             }
         }
@@ -1250,7 +1257,7 @@ impl InboxService for ReplicatedInboxHandle {
             let range_id = self
                 .inbox_range_id_for_tenant(&subscription.tenant_id)
                 .await?;
-            self.executor
+            self.client
                 .apply(
                     &range_id,
                     vec![KvMutation {
@@ -1267,7 +1274,7 @@ impl InboxService for ReplicatedInboxHandle {
 
         for message in offline {
             let range_id = self.inbox_range_id_for_tenant(&message.tenant_id).await?;
-            let entries = self.executor.scan(&range_id, None, usize::MAX).await?;
+            let entries = self.client.scan(&range_id, None, usize::MAX).await?;
             let mut removals = Vec::new();
             for (key, value) in entries {
                 if !key.starts_with(OFFLINE_KEY_PREFIX) {
@@ -1282,7 +1289,7 @@ impl InboxService for ReplicatedInboxHandle {
                 }
             }
             if !removals.is_empty() {
-                self.executor.apply(&range_id, removals).await?;
+                self.client.apply(&range_id, removals).await?;
             }
         }
 
@@ -1290,7 +1297,7 @@ impl InboxService for ReplicatedInboxHandle {
             let range_id = self
                 .inflight_range_id_for_tenant(&message.tenant_id)
                 .await?;
-            self.executor
+            self.client
                 .apply(
                     &range_id,
                     vec![KvMutation {
@@ -1307,7 +1314,7 @@ impl InboxService for ReplicatedInboxHandle {
         let range_id = self
             .inbox_range_id_for_tenant(&subscription.tenant_id)
             .await?;
-        self.executor
+        self.client
             .apply(
                 &range_id,
                 vec![KvMutation {
@@ -1346,7 +1353,7 @@ impl InboxService for ReplicatedInboxHandle {
         let range_id = self
             .inbox_range_id_for_tenant(&subscription.tenant_id)
             .await?;
-        self.executor
+        self.client
             .apply(
                 &range_id,
                 vec![KvMutation {
@@ -1375,7 +1382,7 @@ impl InboxService for ReplicatedInboxHandle {
     async fn enqueue(&self, message: OfflineMessage) -> anyhow::Result<()> {
         let range_id = self.inbox_range_id_for_tenant(&message.tenant_id).await?;
         let seq = self.next_offline_seq().await?;
-        self.executor
+        self.client
             .apply(
                 &range_id,
                 vec![KvMutation {
@@ -1461,7 +1468,7 @@ impl InboxService for ReplicatedInboxHandle {
         for message in &messages {
             let range_id = self.inbox_range_id_for_tenant(&message.tenant_id).await?;
             let entries = self
-                .executor
+                .client
                 .scan(
                     &range_id,
                     Some(prefix_boundary(&offline_session_prefix(session_id))),
@@ -1482,7 +1489,7 @@ impl InboxService for ReplicatedInboxHandle {
                 }
             }
             if !removals.is_empty() {
-                self.executor.apply(&range_id, removals).await?;
+                self.client.apply(&range_id, removals).await?;
             }
         }
         Ok(messages)
@@ -1492,7 +1499,7 @@ impl InboxService for ReplicatedInboxHandle {
         let range_id = self
             .inflight_range_id_for_tenant(&message.tenant_id)
             .await?;
-        self.executor
+        self.client
             .apply(
                 &range_id,
                 vec![KvMutation {
@@ -1515,7 +1522,7 @@ impl InboxService for ReplicatedInboxHandle {
         let range_id = self
             .inflight_range_id_for_tenant(&message.tenant_id)
             .await?;
-        self.executor
+        self.client
             .apply(
                 &range_id,
                 vec![KvMutation {

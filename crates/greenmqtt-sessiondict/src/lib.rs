@@ -1,7 +1,9 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use greenmqtt_core::{ClientIdentity, Lifecycle, ServiceShardKey, ServiceShardKind, SessionRecord};
-use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter};
+use greenmqtt_kv_client::{
+    KvRangeExecutor, KvRangeRouter, RangeDataClient, RoutedRangeDataClient,
+};
 use greenmqtt_kv_engine::KvMutation;
 use greenmqtt_storage::SessionStore;
 use std::collections::BTreeMap;
@@ -328,8 +330,7 @@ pub struct PersistentSessionDictHandle {
 
 #[derive(Clone)]
 pub struct ReplicatedSessionDictHandle {
-    router: Arc<dyn KvRangeRouter>,
-    executor: Arc<dyn KvRangeExecutor>,
+    client: Arc<dyn RangeDataClient>,
     identity_cache: Arc<RwLock<HashMap<(String, String, String), SessionRecord>>>,
     session_cache: Arc<RwLock<HashMap<String, SessionRecord>>>,
     session_range_cache: Arc<RwLock<HashMap<String, String>>>,
@@ -450,21 +451,27 @@ impl PersistentSessionDictHandle {
 }
 
 impl ReplicatedSessionDictHandle {
-    pub fn new(router: Arc<dyn KvRangeRouter>, executor: Arc<dyn KvRangeExecutor>) -> Self {
+    pub fn new(client: Arc<dyn RangeDataClient>) -> Self {
         Self {
-            router,
-            executor,
+            client,
             identity_cache: Arc::new(RwLock::new(HashMap::new())),
             session_cache: Arc::new(RwLock::new(HashMap::new())),
             session_range_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
+    pub fn from_router_executor(
+        router: Arc<dyn KvRangeRouter>,
+        executor: Arc<dyn KvRangeExecutor>,
+    ) -> Self {
+        Self::new(Arc::new(RoutedRangeDataClient::new(router, executor)))
+    }
+
     async fn tenant_routes(
         &self,
         tenant_id: &str,
     ) -> anyhow::Result<Vec<greenmqtt_kv_client::RangeRoute>> {
-        self.router
+        self.client
             .route_shard(&session_scan_shard(tenant_id))
             .await
     }
@@ -478,7 +485,7 @@ impl ReplicatedSessionDictHandle {
         let mut grouped: HashMap<String, Vec<KvMutation>> = HashMap::new();
         for mutation in mutations {
             let route = self
-                .router
+                .client
                 .route_key(&shard, &mutation.key)
                 .await?
                 .ok_or_else(|| {
@@ -490,7 +497,7 @@ impl ReplicatedSessionDictHandle {
                 .push(mutation);
         }
         for (range_id, mutations) in grouped {
-            self.executor.apply(&range_id, mutations).await?;
+            self.client.apply(&range_id, mutations).await?;
         }
         Ok(())
     }
@@ -535,7 +542,7 @@ impl ReplicatedSessionDictHandle {
         let mut records = Vec::new();
         for route in self.tenant_routes(tenant_id).await? {
             for (key, value) in self
-                .executor
+                .client
                 .scan(&route.descriptor.id, None, usize::MAX)
                 .await?
             {
@@ -553,11 +560,11 @@ impl ReplicatedSessionDictHandle {
 
     async fn scan_all_session_records(&self) -> anyhow::Result<Vec<SessionRecord>> {
         let mut records = Vec::new();
-        for descriptor in self.router.list().await? {
+        for descriptor in self.client.list_ranges().await? {
             if descriptor.shard.kind != ServiceShardKind::SessionDict {
                 continue;
             }
-            for (key, value) in self.executor.scan(&descriptor.id, None, usize::MAX).await? {
+            for (key, value) in self.client.scan(&descriptor.id, None, usize::MAX).await? {
                 if key.starts_with(SESSION_KEY_PREFIX) {
                     records.push(decode_session_record(&value)?);
                 }
@@ -884,7 +891,7 @@ impl SessionDirectory for ReplicatedSessionDictHandle {
             self.evict_record(previous);
         }
         let range_id = self
-            .router
+            .client
             .route_key(
                 &session_scan_shard(&record.identity.tenant_id),
                 &encoded_session_key(&record.session_id),
@@ -932,14 +939,14 @@ impl SessionDirectory for ReplicatedSessionDictHandle {
         }
         let shard = session_scan_shard(&identity.tenant_id);
         let Some(route) = self
-            .router
+            .client
             .route_key(&shard, &encoded_identity_key(identity))
             .await?
         else {
             return Ok(None);
         };
         let record = self
-            .executor
+            .client
             .get(&route.descriptor.id, &encoded_identity_key(identity))
             .await?
             .map(|value| decode_session_record(&value))
@@ -968,7 +975,7 @@ impl SessionDirectory for ReplicatedSessionDictHandle {
             .get(session_id)
             .cloned();
         if let Some(range_id) = cached_range_id {
-            if let Some(value) = self.executor.get(&range_id, &target_key).await? {
+            if let Some(value) = self.client.get(&range_id, &target_key).await? {
                 let record = decode_session_record(&value)?;
                 self.cache_record(record.clone(), Some(range_id));
                 return Ok(Some(record));
@@ -978,11 +985,11 @@ impl SessionDirectory for ReplicatedSessionDictHandle {
                 .expect("sessiondict cache poisoned")
                 .remove(session_id);
         }
-        for descriptor in self.router.list().await? {
+        for descriptor in self.client.list_ranges().await? {
             if descriptor.shard.kind != ServiceShardKind::SessionDict {
                 continue;
             }
-            if let Some(value) = self.executor.get(&descriptor.id, &target_key).await? {
+            if let Some(value) = self.client.get(&descriptor.id, &target_key).await? {
                 let record = decode_session_record(&value)?;
                 self.cache_record(record.clone(), Some(descriptor.id.clone()));
                 return Ok(Some(record));
@@ -1249,7 +1256,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let service = ReplicatedSessionDictHandle::new(
+        let service = ReplicatedSessionDictHandle::from_router_executor(
             router,
             Arc::new(LocalKvRangeExecutor {
                 engine: engine.clone(),
@@ -1323,7 +1330,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let service = ReplicatedSessionDictHandle::new(
+        let service = ReplicatedSessionDictHandle::from_router_executor(
             router,
             Arc::new(LocalKvRangeExecutor {
                 engine: engine.clone(),
@@ -2018,7 +2025,8 @@ mod tests {
             engine: engine.clone(),
             ..RecordingKvRangeExecutor::default()
         });
-        let service = ReplicatedSessionDictHandle::new(router.clone(), executor.clone());
+        let service =
+            ReplicatedSessionDictHandle::from_router_executor(router.clone(), executor.clone());
         let record = SessionRecord {
             session_id: "s1".into(),
             node_id: 1,
@@ -2034,7 +2042,7 @@ mod tests {
         service.register(record).await.unwrap();
         executor.get_calls.store(0, Ordering::SeqCst);
         executor.scan_calls.store(0, Ordering::SeqCst);
-        let cold = ReplicatedSessionDictHandle::new(router, executor.clone());
+        let cold = ReplicatedSessionDictHandle::from_router_executor(router, executor.clone());
 
         let loaded = cold.lookup_session("s1").await.unwrap().unwrap();
         assert_eq!(loaded.session_id, "s1");
@@ -2076,7 +2084,7 @@ mod tests {
             engine: engine.clone(),
             ..RecordingKvRangeExecutor::default()
         });
-        let service = ReplicatedSessionDictHandle::new(router, executor.clone());
+        let service = ReplicatedSessionDictHandle::from_router_executor(router, executor.clone());
         service
             .register(SessionRecord {
                 session_id: "s1".into(),

@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use greenmqtt_core::RangeBoundary;
 use greenmqtt_core::{dedupe_sessions, PublishOutcome, PublishRequest, RouteRecord, TopicName};
-use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter};
+use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter, RangeDataClient, RoutedRangeDataClient};
 pub use handle::{dist_route_shard, dist_tenant_shard, DistHandle};
 pub(crate) use handle::{
     exact_topic_loaded, insert_tenant_route, remove_tenant_route, retain_tenant_routes,
@@ -22,25 +22,30 @@ use tokio::task::JoinHandle;
 
 #[derive(Clone)]
 pub struct ReplicatedDistHandle {
-    router: Arc<dyn KvRangeRouter>,
-    executor: Arc<dyn KvRangeExecutor>,
+    client: Arc<dyn RangeDataClient>,
     tenant_wildcard_cache: Arc<RwLock<HashMap<String, TenantRoutes>>>,
 }
 
 impl ReplicatedDistHandle {
-    pub fn new(router: Arc<dyn KvRangeRouter>, executor: Arc<dyn KvRangeExecutor>) -> Self {
+    pub fn new(client: Arc<dyn RangeDataClient>) -> Self {
         Self {
-            router,
-            executor,
+            client,
             tenant_wildcard_cache: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    pub fn from_router_executor(
+        router: Arc<dyn KvRangeRouter>,
+        executor: Arc<dyn KvRangeExecutor>,
+    ) -> Self {
+        Self::new(Arc::new(RoutedRangeDataClient::new(router, executor)))
     }
 
     async fn tenant_ranges(
         &self,
         tenant_id: &str,
     ) -> anyhow::Result<Vec<greenmqtt_kv_client::RangeRoute>> {
-        self.router.route_shard(&dist_tenant_shard(tenant_id)).await
+        self.client.route_shard(&dist_tenant_shard(tenant_id)).await
     }
 
     async fn scan_tenant_prefix(
@@ -52,7 +57,7 @@ impl ReplicatedDistHandle {
         let mut routes = Vec::new();
         for descriptor in self.tenant_ranges(tenant_id).await? {
             for (_, value) in self
-                .executor
+                .client
                 .scan(
                     &descriptor.descriptor.id,
                     Some(boundary.clone()),
@@ -585,14 +590,14 @@ impl DistRouter for ReplicatedDistHandle {
     async fn add_route(&self, route: RouteRecord) -> anyhow::Result<()> {
         let shard = dist_tenant_shard(&route.tenant_id);
         let range = self
-            .router
+            .client
             .route_key(&shard, route.topic_filter.as_bytes())
             .await?
             .ok_or_else(|| {
                 anyhow::anyhow!("no dist range available for tenant {}", route.tenant_id)
             })?;
         self.invalidate_tenant_cache(&route.tenant_id);
-        self.executor
+        self.client
             .apply(
                 &range.descriptor.id,
                 route_mutations(&route, Some(encode_route_record(&route)?))?,
@@ -603,14 +608,14 @@ impl DistRouter for ReplicatedDistHandle {
     async fn remove_route(&self, route: &RouteRecord) -> anyhow::Result<()> {
         let shard = dist_tenant_shard(&route.tenant_id);
         let range = self
-            .router
+            .client
             .route_key(&shard, route.topic_filter.as_bytes())
             .await?
             .ok_or_else(|| {
                 anyhow::anyhow!("no dist range available for tenant {}", route.tenant_id)
             })?;
         self.invalidate_tenant_cache(&route.tenant_id);
-        self.executor
+        self.client
             .apply(&range.descriptor.id, route_mutations(route, None)?)
             .await
     }
@@ -648,13 +653,13 @@ impl DistRouter for ReplicatedDistHandle {
     async fn list_routes(&self, tenant_id: Option<&str>) -> anyhow::Result<Vec<RouteRecord>> {
         let descriptors = match tenant_id {
             Some(tenant_id) => {
-                self.router
+                self.client
                     .route_shard(&dist_tenant_shard(tenant_id))
                     .await?
             }
             None => self
-                .router
-                .list()
+                .client
+                .list_ranges()
                 .await?
                 .into_iter()
                 .filter(|descriptor| {
@@ -666,7 +671,7 @@ impl DistRouter for ReplicatedDistHandle {
         let mut routes = Vec::new();
         for descriptor in descriptors {
             for (_, value) in self
-                .executor
+                .client
                 .scan(&descriptor.descriptor.id, None, usize::MAX)
                 .await?
             {

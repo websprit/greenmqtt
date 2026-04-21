@@ -2121,7 +2121,7 @@ async fn replicated_inbox_handles_subscriptions_offline_and_inflight_over_kv_ran
         .await
         .unwrap();
 
-    let inbox = ReplicatedInboxHandle::new(
+    let inbox = ReplicatedInboxHandle::from_router_executor(
         router,
         Arc::new(LocalKvRangeExecutor {
             engine: engine.clone(),
@@ -2216,7 +2216,7 @@ async fn replicated_inbox_resumes_offline_sequence_after_restart() {
     let executor = Arc::new(LocalKvRangeExecutor {
         engine: engine.clone(),
     });
-    let inbox = ReplicatedInboxHandle::new(router.clone(), executor.clone());
+    let inbox = ReplicatedInboxHandle::from_router_executor(router.clone(), executor.clone());
     inbox
         .enqueue(OfflineMessage {
             tenant_id: "t1".into(),
@@ -2232,7 +2232,7 @@ async fn replicated_inbox_resumes_offline_sequence_after_restart() {
         .unwrap();
     drop(inbox);
 
-    let reopened = ReplicatedInboxHandle::new(router, executor);
+    let reopened = ReplicatedInboxHandle::from_router_executor(router, executor);
     reopened
         .enqueue(OfflineMessage {
             tenant_id: "t1".into(),
@@ -2291,7 +2291,7 @@ async fn replicated_inbox_replaying_same_offline_mutation_is_idempotent() {
     let executor = Arc::new(LocalKvRangeExecutor {
         engine: engine.clone(),
     });
-    let inbox = ReplicatedInboxHandle::new(router, executor.clone());
+    let inbox = ReplicatedInboxHandle::from_router_executor(router, executor.clone());
     inbox
         .enqueue(OfflineMessage {
             tenant_id: "t1".into(),
@@ -2961,7 +2961,7 @@ async fn replicated_inbox_uses_prefix_scans_and_exact_gets_for_session_paths() {
         engine: engine.clone(),
         ..RecordingKvRangeExecutor::default()
     });
-    let inbox = ReplicatedInboxHandle::new(router, executor.clone());
+    let inbox = ReplicatedInboxHandle::from_router_executor(router, executor.clone());
 
     inbox
         .subscribe(Subscription {
@@ -3131,7 +3131,7 @@ async fn replicated_qos2_release_transition_is_idempotent() {
     let executor = Arc::new(LocalKvRangeExecutor {
         engine: engine.clone(),
     });
-    let inbox = ReplicatedInboxHandle::new(router, executor);
+    let inbox = ReplicatedInboxHandle::from_router_executor(router, executor);
 
     inbox
         .stage_inflight(InflightMessage {

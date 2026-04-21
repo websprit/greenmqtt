@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use greenmqtt_core::{CompiledTopicFilter, Lifecycle, RetainedMessage, ServiceShardKey};
-use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter};
+use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter, RangeDataClient, RoutedRangeDataClient};
 use greenmqtt_kv_engine::KvMutation;
 use greenmqtt_storage::RetainStore;
 use std::collections::{HashMap, HashSet};
@@ -105,10 +105,32 @@ pub struct PersistentRetainHandle {
 
 #[derive(Clone)]
 pub struct ReplicatedRetainHandle {
-    router: Arc<dyn KvRangeRouter>,
-    executor: Arc<dyn KvRangeExecutor>,
+    store: Arc<dyn RetainRangeStore>,
     tenant_cache: Arc<RwLock<HashMap<String, Vec<RetainedMessage>>>>,
     filter_cache: Arc<RwLock<HashMap<(String, String), Vec<RetainedMessage>>>>,
+}
+
+#[async_trait]
+pub trait RetainRangeStore: Send + Sync {
+    async fn write_retain(&self, message: RetainedMessage) -> anyhow::Result<()>;
+    async fn list_tenant_retained(&self, tenant_id: &str) -> anyhow::Result<Vec<RetainedMessage>>;
+    async fn lookup_topic(
+        &self,
+        tenant_id: &str,
+        topic: &str,
+    ) -> anyhow::Result<Option<RetainedMessage>>;
+    async fn retained_count(&self) -> anyhow::Result<usize>;
+}
+
+#[derive(Clone)]
+pub struct PrimitiveRetainRangeStore {
+    client: Arc<dyn RangeDataClient>,
+}
+
+impl PrimitiveRetainRangeStore {
+    pub fn new(client: Arc<dyn RangeDataClient>) -> Self {
+        Self { client }
+    }
 }
 
 pub fn retain_tenant_shard(tenant_id: &str) -> ServiceShardKey {
@@ -215,13 +237,23 @@ impl PersistentRetainHandle {
 }
 
 impl ReplicatedRetainHandle {
-    pub fn new(router: Arc<dyn KvRangeRouter>, executor: Arc<dyn KvRangeExecutor>) -> Self {
+    pub fn new(client: Arc<dyn RangeDataClient>) -> Self {
+        Self::from_range_store(Arc::new(PrimitiveRetainRangeStore::new(client)))
+    }
+
+    pub fn from_range_store(store: Arc<dyn RetainRangeStore>) -> Self {
         Self {
-            router,
-            executor,
+            store,
             tenant_cache: Arc::new(RwLock::new(HashMap::new())),
             filter_cache: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    pub fn from_router_executor(
+        router: Arc<dyn KvRangeRouter>,
+        executor: Arc<dyn KvRangeExecutor>,
+    ) -> Self {
+        Self::new(Arc::new(RoutedRangeDataClient::new(router, executor)))
     }
 
     fn invalidate_tenant_cache(&self, tenant_id: &str) {
@@ -245,6 +277,74 @@ impl ReplicatedRetainHandle {
     pub async fn warm_tenant_cache(&self, tenant_id: &str) -> anyhow::Result<usize> {
         self.invalidate_tenant_cache(tenant_id);
         Ok(self.list_tenant_retained(tenant_id).await?.len())
+    }
+}
+
+#[async_trait]
+impl RetainRangeStore for PrimitiveRetainRangeStore {
+    async fn write_retain(&self, message: RetainedMessage) -> anyhow::Result<()> {
+        let shard = retain_tenant_shard(&message.tenant_id);
+        let route = self
+            .client
+            .route_key(&shard, message.topic.as_bytes())
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no retain range available for tenant {}", message.tenant_id))?;
+        self.client
+            .apply(
+                &route.descriptor.id,
+                vec![KvMutation {
+                    key: retained_message_key(&message.topic),
+                    value: if message.payload.is_empty() {
+                        None
+                    } else {
+                        Some(encode_retained_message(&message)?)
+                    },
+                }],
+            )
+            .await
+    }
+
+    async fn list_tenant_retained(&self, tenant_id: &str) -> anyhow::Result<Vec<RetainedMessage>> {
+        let shard = retain_tenant_shard(tenant_id);
+        let routes = self.client.route_shard(&shard).await?;
+        let mut retained = Vec::new();
+        for route in routes {
+            for (_, value) in self
+                .client
+                .scan(&route.descriptor.id, None, usize::MAX)
+                .await?
+            {
+                retained.push(decode_retained_message(&value)?);
+            }
+        }
+        retained.sort_by(|left, right| left.topic.cmp(&right.topic));
+        Ok(retained)
+    }
+
+    async fn lookup_topic(
+        &self,
+        tenant_id: &str,
+        topic: &str,
+    ) -> anyhow::Result<Option<RetainedMessage>> {
+        let shard = retain_tenant_shard(tenant_id);
+        let Some(route) = self.client.route_key(&shard, topic.as_bytes()).await? else {
+            return Ok(None);
+        };
+        self.client
+            .get(&route.descriptor.id, topic.as_bytes())
+            .await?
+            .map(|value| decode_retained_message(&value))
+            .transpose()
+    }
+
+    async fn retained_count(&self) -> anyhow::Result<usize> {
+        let mut total = 0usize;
+        for descriptor in self.client.list_ranges().await? {
+            if descriptor.shard.kind == greenmqtt_core::ServiceShardKind::Retain {
+                total += self.client.scan(&descriptor.id, None, usize::MAX).await?.len();
+            }
+        }
+        Ok(total)
     }
 }
 
@@ -520,28 +620,8 @@ impl RetainService for PersistentRetainHandle {
 #[async_trait]
 impl RetainService for ReplicatedRetainHandle {
     async fn retain(&self, message: RetainedMessage) -> anyhow::Result<()> {
-        let shard = retain_tenant_shard(&message.tenant_id);
-        let route = self
-            .router
-            .route_key(&shard, message.topic.as_bytes())
-            .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!("no retain range available for tenant {}", message.tenant_id)
-            })?;
         self.invalidate_tenant_cache(&message.tenant_id);
-        self.executor
-            .apply(
-                &route.descriptor.id,
-                vec![KvMutation {
-                    key: retained_message_key(&message.topic),
-                    value: if message.payload.is_empty() {
-                        None
-                    } else {
-                        Some(encode_retained_message(&message)?)
-                    },
-                }],
-            )
-            .await?;
+        self.store.write_retain(message).await?;
         Ok(())
     }
 
@@ -555,19 +635,7 @@ impl RetainService for ReplicatedRetainHandle {
         {
             return Ok(cached);
         }
-        let shard = retain_tenant_shard(tenant_id);
-        let routes = self.router.route_shard(&shard).await?;
-        let mut retained = Vec::new();
-        for route in routes {
-            for (_, value) in self
-                .executor
-                .scan(&route.descriptor.id, None, usize::MAX)
-                .await?
-            {
-                retained.push(decode_retained_message(&value)?);
-            }
-        }
-        retained.sort_by(|left, right| left.topic.cmp(&right.topic));
+        let retained = self.store.list_tenant_retained(tenant_id).await?;
         self.tenant_cache
             .write()
             .expect("retain cache poisoned")
@@ -580,15 +648,7 @@ impl RetainService for ReplicatedRetainHandle {
         tenant_id: &str,
         topic: &str,
     ) -> anyhow::Result<Option<RetainedMessage>> {
-        let shard = retain_tenant_shard(tenant_id);
-        let Some(route) = self.router.route_key(&shard, topic.as_bytes()).await? else {
-            return Ok(None);
-        };
-        self.executor
-            .get(&route.descriptor.id, topic.as_bytes())
-            .await?
-            .map(|value| decode_retained_message(&value))
-            .transpose()
+        self.store.lookup_topic(tenant_id, topic).await
     }
 
     async fn match_topic(
@@ -630,17 +690,7 @@ impl RetainService for ReplicatedRetainHandle {
     }
 
     async fn retained_count(&self) -> anyhow::Result<usize> {
-        let mut total = 0usize;
-        for descriptor in self.router.list().await? {
-            if descriptor.shard.kind == greenmqtt_core::ServiceShardKind::Retain {
-                total += self
-                    .executor
-                    .scan(&descriptor.id, None, usize::MAX)
-                    .await?
-                    .len();
-            }
-        }
-        Ok(total)
+        self.store.retained_count().await
     }
 
     async fn preview_tenant_gc(&self, tenant_id: &str) -> anyhow::Result<RetainMaintenanceResult> {
@@ -1456,7 +1506,7 @@ mod tests {
             .await
             .unwrap();
 
-        let retain = ReplicatedRetainHandle::new(
+        let retain = ReplicatedRetainHandle::from_router_executor(
             router,
             Arc::new(LocalKvRangeExecutor {
                 engine: engine.clone(),
@@ -1524,7 +1574,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let retain = ReplicatedRetainHandle::new(
+        let retain = ReplicatedRetainHandle::from_router_executor(
             router,
             Arc::new(LocalKvRangeExecutor {
                 engine: engine.clone(),
@@ -1593,7 +1643,7 @@ mod tests {
             router.upsert(descriptor).await.unwrap();
         }
 
-        let retain = ReplicatedRetainHandle::new(
+        let retain = ReplicatedRetainHandle::from_router_executor(
             router.clone(),
             Arc::new(LocalKvRangeExecutor {
                 engine: engine.clone(),
@@ -1746,7 +1796,7 @@ mod tests {
             .await
             .unwrap();
 
-        let retain = ReplicatedRetainHandle::new(
+        let retain = ReplicatedRetainHandle::from_router_executor(
             router.clone(),
             Arc::new(LocalKvRangeExecutor {
                 engine: engine.clone(),
@@ -1837,7 +1887,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let retain = ReplicatedRetainHandle::new(
+        let retain = ReplicatedRetainHandle::from_router_executor(
             router,
             Arc::new(LocalKvRangeExecutor {
                 engine: engine.clone(),
@@ -1925,7 +1975,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let retain = Arc::new(ReplicatedRetainHandle::new(
+        let retain = Arc::new(ReplicatedRetainHandle::from_router_executor(
             router,
             Arc::new(LocalKvRangeExecutor {
                 engine: engine.clone(),

@@ -780,6 +780,7 @@ dependencies = [
  "greenmqtt-kv-raft",
  "greenmqtt-kv-server",
  "greenmqtt-plugin-api",
+ "greenmqtt-range-client",
  "greenmqtt-retain",
  "greenmqtt-rpc",
  "greenmqtt-sessiondict",
@@ -845,6 +846,7 @@ dependencies = [
  "greenmqtt-kv-raft",
  "greenmqtt-kv-server",
  "greenmqtt-plugin-api",
+ "greenmqtt-range-client",
  "greenmqtt-retain",
  "greenmqtt-rpc",
  "greenmqtt-sessiondict",
@@ -896,6 +898,7 @@ dependencies = [
  "greenmqtt-kv-engine",
  "serde",
  "tokio",
+ "tonic",
 ]
 
 [[package]]
@@ -973,6 +976,19 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+]
+
+[[package]]
+name = "greenmqtt-range-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "greenmqtt-core",
+ "greenmqtt-kv-client",
+ "greenmqtt-kv-engine",
+ "greenmqtt-rpc",
 ]
 
 [[package]]

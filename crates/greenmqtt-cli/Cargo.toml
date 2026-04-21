@@ -18,6 +18,7 @@ greenmqtt-kv-client = { path = "../greenmqtt-kv-client" }
 greenmqtt-kv-engine = { path = "../greenmqtt-kv-engine" }
 greenmqtt-kv-raft = { path = "../greenmqtt-kv-raft" }
 greenmqtt-kv-server = { path = "../greenmqtt-kv-server" }
+greenmqtt-range-client = { path = "../greenmqtt-range-client" }
 greenmqtt-retain = { path = "../greenmqtt-retain" }
 greenmqtt-rpc = { path = "../greenmqtt-rpc" }
 greenmqtt-sessiondict = { path = "../greenmqtt-sessiondict" }

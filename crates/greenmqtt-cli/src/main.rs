@@ -25,7 +25,9 @@ use greenmqtt_kv_balance::{
     BalanceCommand, BalanceCommandExecutor, BalanceCoordinator, ControlPlaneRuntime,
     ControlPlaneRuntimeConfig, MetadataBalanceController,
 };
-use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter, LeaderRoutedKvRangeExecutor};
+use greenmqtt_kv_client::{
+    KvRangeExecutor, KvRangeRouter, LeaderRoutedKvRangeExecutor, RangeDataClient,
+};
 use greenmqtt_kv_engine::{
     KvEngine, KvMutation, KvRangeBootstrap, KvRangeCheckpoint, KvRangeSnapshot, RocksDbKvEngine,
 };
@@ -33,6 +35,7 @@ use greenmqtt_kv_raft::{MemoryRaftNode, RaftNode};
 use greenmqtt_kv_server::{
     HostedRange, KvRangeHost, MemoryKvRangeHost, RangeLifecycleManager, ReplicaRuntime,
 };
+use greenmqtt_range_client::RemoteRangeClientBuilder;
 use greenmqtt_plugin_api::{
     current_listener_profile, AclAction, AclDecision, AclProvider, AclRule, AuthProvider,
     BridgeEventHook, BridgeRule, ConfiguredAcl, ConfiguredAuth, ConfiguredEventHook, EventHook,
@@ -47,7 +50,7 @@ use greenmqtt_retain::{
 };
 use greenmqtt_rpc::{
     DistGrpcClient, InboxGrpcClient, KvRangeGrpcClient, KvRangeGrpcExecutorFactory,
-    MetadataGrpcClient, MetadataPlaneLayout, PersistentMetadataRegistry, RaftTransportGrpcClient,
+    MetadataPlaneLayout, PersistentMetadataRegistry, RaftTransportGrpcClient,
     RangeControlGrpcClient, ReplicatedMetadataRegistry, RetainGrpcClient,
     RoutedRangeControlGrpcClient, RpcRuntime, RpcTrafficGovernor, RpcTrafficGovernorConfig,
     SessionDictGrpcClient, StaticPeerForwarder, StaticServiceEndpointRegistry,
@@ -4353,13 +4356,19 @@ async fn range_scoped_rocksdb_stack(
         64,
     ));
     Ok(LocalRangeRuntimeStack {
-        sessiondict: Arc::new(ReplicatedSessionDictHandle::new(
+        sessiondict: Arc::new(ReplicatedSessionDictHandle::from_router_executor(
             router.clone(),
             executor.clone(),
         )),
-        dist: Arc::new(ReplicatedDistHandle::new(router.clone(), executor.clone())),
-        inbox: Arc::new(ReplicatedInboxHandle::new(router.clone(), executor.clone())),
-        retain: Arc::new(ReplicatedRetainHandle::new(router, executor)),
+        dist: Arc::new(ReplicatedDistHandle::from_router_executor(
+            router.clone(),
+            executor.clone(),
+        )),
+        inbox: Arc::new(ReplicatedInboxHandle::from_router_executor(
+            router.clone(),
+            executor.clone(),
+        )),
+        retain: Arc::new(ReplicatedRetainHandle::from_router_executor(router, executor)),
         range_host: host,
         range_runtime,
     })
@@ -4432,22 +4441,17 @@ async fn redis_services(
     ))
 }
 
-async fn replicated_range_clients(
+async fn replicated_range_data_client(
     metadata_endpoint: &str,
     range_endpoint: &str,
-) -> anyhow::Result<(Arc<dyn KvRangeRouter>, Arc<dyn KvRangeExecutor>)> {
-    let metadata = MetadataGrpcClient::connect(metadata_endpoint.to_string()).await?;
-    let router: Arc<dyn KvRangeRouter> = Arc::new(metadata.clone());
-    let membership: Arc<dyn ClusterMembershipRegistry> = Arc::new(metadata);
-    let fallback: Arc<dyn KvRangeExecutor> =
-        Arc::new(KvRangeGrpcClient::connect(range_endpoint.to_string()).await?);
-    let executor: Arc<dyn KvRangeExecutor> = Arc::new(LeaderRoutedKvRangeExecutor::new(
-        router.clone(),
-        membership,
-        fallback,
-        Arc::new(KvRangeGrpcExecutorFactory),
-    ));
-    Ok((router, executor))
+) -> anyhow::Result<Arc<dyn RangeDataClient>> {
+    Ok(Arc::new(
+        RemoteRangeClientBuilder::new()
+            .metadata_endpoint(metadata_endpoint)
+            .range_endpoint(range_endpoint)
+            .build_data()
+            .await?,
+    ))
 }
 
 async fn configured_retain_service(
@@ -4459,9 +4463,8 @@ async fn configured_retain_service(
         StateMode::Replicated => {
             let (metadata_endpoint, range_endpoint) =
                 resolved_replicated_endpoints(state_endpoint, "retain")?;
-            let (router, executor) =
-                replicated_range_clients(&metadata_endpoint, &range_endpoint).await?;
-            Ok(Arc::new(ReplicatedRetainHandle::new(router, executor)))
+            let client = replicated_range_data_client(&metadata_endpoint, &range_endpoint).await?;
+            Ok(Arc::new(ReplicatedRetainHandle::new(client)))
         }
     }
 }
@@ -4475,9 +4478,8 @@ async fn configured_dist_service(
         StateMode::Replicated => {
             let (metadata_endpoint, range_endpoint) =
                 resolved_replicated_endpoints(state_endpoint, "dist")?;
-            let (router, executor) =
-                replicated_range_clients(&metadata_endpoint, &range_endpoint).await?;
-            Ok(Arc::new(ReplicatedDistHandle::new(router, executor)))
+            let client = replicated_range_data_client(&metadata_endpoint, &range_endpoint).await?;
+            Ok(Arc::new(ReplicatedDistHandle::new(client)))
         }
     }
 }
@@ -4636,8 +4638,8 @@ async fn replicated_dist_runtime_handle(
     }
     let (metadata_endpoint, range_endpoint) =
         resolved_replicated_endpoints(state_endpoint, "dist")?;
-    let (router, executor) = replicated_range_clients(&metadata_endpoint, &range_endpoint).await?;
-    Ok(Some(Arc::new(ReplicatedDistHandle::new(router, executor))))
+    let client = replicated_range_data_client(&metadata_endpoint, &range_endpoint).await?;
+    Ok(Some(Arc::new(ReplicatedDistHandle::new(client))))
 }
 
 async fn run_dist_maintenance_tick(
@@ -4722,8 +4724,8 @@ async fn replicated_inbox_runtime_handle(
     }
     let (metadata_endpoint, range_endpoint) =
         resolved_replicated_endpoints(state_endpoint, "inbox")?;
-    let (router, executor) = replicated_range_clients(&metadata_endpoint, &range_endpoint).await?;
-    Ok(Some(Arc::new(ReplicatedInboxHandle::new(router, executor))))
+    let client = replicated_range_data_client(&metadata_endpoint, &range_endpoint).await?;
+    Ok(Some(Arc::new(ReplicatedInboxHandle::new(client))))
 }
 
 async fn run_inbox_maintenance_tick(
@@ -4793,10 +4795,8 @@ async fn replicated_retain_runtime_handle(
     }
     let (metadata_endpoint, range_endpoint) =
         resolved_replicated_endpoints(state_endpoint, "retain")?;
-    let (router, executor) = replicated_range_clients(&metadata_endpoint, &range_endpoint).await?;
-    Ok(Some(Arc::new(ReplicatedRetainHandle::new(
-        router, executor,
-    ))))
+    let client = replicated_range_data_client(&metadata_endpoint, &range_endpoint).await?;
+    Ok(Some(Arc::new(ReplicatedRetainHandle::new(client))))
 }
 
 async fn run_retain_maintenance_tick(
@@ -4843,9 +4843,8 @@ async fn configured_sessiondict_service(
         StateMode::Replicated => {
             let (metadata_endpoint, range_endpoint) =
                 resolved_replicated_endpoints(state_endpoint, "sessiondict")?;
-            let (router, executor) =
-                replicated_range_clients(&metadata_endpoint, &range_endpoint).await?;
-            Ok(Arc::new(ReplicatedSessionDictHandle::new(router, executor)))
+            let client = replicated_range_data_client(&metadata_endpoint, &range_endpoint).await?;
+            Ok(Arc::new(ReplicatedSessionDictHandle::new(client)))
         }
     }
 }
@@ -4859,9 +4858,8 @@ async fn configured_inbox_service(
         StateMode::Replicated => {
             let (metadata_endpoint, range_endpoint) =
                 resolved_replicated_endpoints(state_endpoint, "inbox")?;
-            let (router, executor) =
-                replicated_range_clients(&metadata_endpoint, &range_endpoint).await?;
-            Ok(Arc::new(ReplicatedInboxHandle::new(router, executor)))
+            let client = replicated_range_data_client(&metadata_endpoint, &range_endpoint).await?;
+            Ok(Arc::new(ReplicatedInboxHandle::new(client)))
         }
     }
 }

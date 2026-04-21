@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/greenmqtt-core",
+    "crates/greenmqtt-range-client",
     "crates/greenmqtt-kv-raft",
     "crates/greenmqtt-kv-engine",
     "crates/greenmqtt-kv-client",

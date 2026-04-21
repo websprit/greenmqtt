@@ -10,7 +10,8 @@ use greenmqtt_core::{
 };
 use greenmqtt_kv_server::{RangeHealthSnapshot, ReplicaRuntime, ZombieRangeSnapshot};
 use greenmqtt_plugin_api::{AclProvider, AuthProvider, EventHook};
-use greenmqtt_rpc::{RangeAdminGrpcClient, RangeControlGrpcClient};
+use greenmqtt_range_client::{DirectRangeControlClient, RangeControlClient};
+use greenmqtt_rpc::RangeAdminGrpcClient;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -87,7 +88,7 @@ pub struct RangeMergeBody {
 struct RemoteRangeControlTarget {
     node_id: NodeId,
     endpoint: String,
-    client: RangeControlGrpcClient,
+    client: Arc<dyn RangeControlClient>,
 }
 
 static MANUAL_COMMAND_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -199,9 +200,11 @@ where
     Ok(Some(RemoteRangeControlTarget {
         node_id: target_node_id,
         endpoint: endpoint.clone(),
-        client: RangeControlGrpcClient::connect(endpoint)
-            .await
-            .map_err(ApiError::from)?,
+        client: Arc::new(
+            DirectRangeControlClient::connect(endpoint)
+                .await
+                .map_err(ApiError::from)?,
+        ),
     }))
 }
 
@@ -235,9 +238,11 @@ where
     Ok(Some(RemoteRangeControlTarget {
         node_id: target_node_id,
         endpoint: endpoint.clone(),
-        client: RangeControlGrpcClient::connect(endpoint)
-            .await
-            .map_err(ApiError::from)?,
+        client: Arc::new(
+            DirectRangeControlClient::connect(endpoint)
+                .await
+                .map_err(ApiError::from)?,
+        ),
     }))
 }
 
@@ -877,12 +882,16 @@ where
     )
     .await?
     {
-        let (left, right) = remote
+        let result = remote
             .client
             .split_range(&range_id, request.split_key)
             .await
             .map_err(ApiError::from)?;
-        (left, right, Some((remote.node_id, remote.endpoint)))
+        (
+            result.left_range_id,
+            result.right_range_id,
+            Some((remote.node_id, remote.endpoint)),
+        )
     } else {
         let runtime = require_range_runtime(range_runtime)?;
         let (left, right) = runtime
