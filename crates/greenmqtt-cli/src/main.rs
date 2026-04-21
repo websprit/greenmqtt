@@ -47,7 +47,7 @@ use greenmqtt_retain::{
 };
 use greenmqtt_rpc::{
     DistGrpcClient, InboxGrpcClient, KvRangeGrpcClient, KvRangeGrpcExecutorFactory,
-    MetadataGrpcClient, MetadataPlaneLayout, NoopReplicaTransport, PersistentMetadataRegistry,
+    MetadataGrpcClient, MetadataPlaneLayout, PersistentMetadataRegistry, RaftTransportGrpcClient,
     RangeControlGrpcClient, ReplicatedMetadataRegistry, RetainGrpcClient,
     RoutedRangeControlGrpcClient, RpcRuntime, RpcTrafficGovernor, RpcTrafficGovernorConfig,
     SessionDictGrpcClient, StaticPeerForwarder, StaticServiceEndpointRegistry,
@@ -1846,6 +1846,9 @@ async fn main() -> anyhow::Result<()> {
         println!("greenmqtt state grpc listening on {rpc_bind}");
         let assignment_registry =
             local_state_serve_metadata_registry(local_range_host.clone(), &storage_backend);
+        let _replica_runtime_handle = local_range_runtime
+            .clone()
+            .map(|runtime| runtime.spawn(Duration::from_millis(50)));
         RpcRuntime {
             sessiondict: default_sessiondict,
             dist: default_dist,
@@ -3905,33 +3908,96 @@ impl KvRangeExecutor for HostedKvRangeExecutor {
     }
 }
 
-#[derive(Clone, Default)]
-struct SingleNodeServiceRangeRouter {
+#[derive(Clone)]
+struct HostedStoreRangeRouter {
+    host: Arc<dyn KvRangeHost>,
     descriptors: Arc<RwLock<BTreeMap<String, ReplicatedRangeDescriptor>>>,
 }
 
-impl SingleNodeServiceRangeRouter {
-    fn new(descriptors: impl IntoIterator<Item = ReplicatedRangeDescriptor>) -> Self {
-        let router = Self::default();
+impl HostedStoreRangeRouter {
+    fn new(
+        host: Arc<dyn KvRangeHost>,
+        descriptors: impl IntoIterator<Item = ReplicatedRangeDescriptor>,
+    ) -> Self {
+        let router = Self {
+            host,
+            descriptors: Arc::new(RwLock::new(BTreeMap::new())),
+        };
         {
             let mut guard = router
                 .descriptors
                 .write()
-                .expect("single-node router poisoned");
+                .expect("hosted store router poisoned");
             for descriptor in descriptors {
                 guard.insert(descriptor.id.clone(), descriptor);
             }
         }
         router
     }
+
+    fn refresh_descriptor_from_status(
+        &self,
+        status: greenmqtt_kv_server::HostedRangeStatus,
+    ) -> ReplicatedRangeDescriptor {
+        let mut descriptor = status.descriptor;
+        descriptor.leader_node_id = status.raft.leader_node_id;
+        let mut replicas = status.raft.cluster_config.replicas();
+        for replica in &mut replicas {
+            replica.sync_state = status
+                .raft
+                .replica_progress
+                .iter()
+                .find(|progress| progress.node_id == replica.node_id)
+                .map(|progress| {
+                    if progress.match_index >= status.raft.commit_index {
+                        ReplicaSyncState::Replicating
+                    } else {
+                        ReplicaSyncState::Probing
+                    }
+                })
+                .unwrap_or(ReplicaSyncState::Offline);
+        }
+        descriptor.replicas = replicas;
+        descriptor.commit_index = status.raft.commit_index;
+        descriptor.applied_index = status.raft.applied_index;
+        descriptor
+    }
+
+    async fn current_descriptors(&self) -> anyhow::Result<Vec<ReplicatedRangeDescriptor>> {
+        let statuses = self.host.list_ranges().await?;
+        if statuses.is_empty() {
+            return Ok(self
+                .descriptors
+                .read()
+                .expect("hosted store router poisoned")
+                .values()
+                .cloned()
+                .collect());
+        }
+        Ok(statuses
+            .into_iter()
+            .map(|status| self.refresh_descriptor_from_status(status))
+            .collect())
+    }
+
+    fn shard_matches(descriptor: &ReplicatedRangeDescriptor, shard: &ServiceShardKey) -> bool {
+        descriptor.shard.kind == shard.kind
+            && (descriptor.shard.tenant_id == shard.tenant_id || descriptor.shard.tenant_id == "*")
+            && (descriptor.shard.scope == shard.scope || descriptor.shard.scope == "*")
+    }
+
+    fn shard_specificity(descriptor: &ReplicatedRangeDescriptor, shard: &ServiceShardKey) -> usize {
+        usize::from(descriptor.shard.tenant_id == shard.tenant_id) * 2
+            + usize::from(descriptor.shard.scope == shard.scope)
+    }
 }
 
 #[async_trait]
-impl KvRangeRouter for SingleNodeServiceRangeRouter {
+impl KvRangeRouter for HostedStoreRangeRouter {
     async fn upsert(&self, descriptor: ReplicatedRangeDescriptor) -> anyhow::Result<()> {
         self.descriptors
             .write()
-            .expect("single-node router poisoned")
+            .expect("hosted store router poisoned")
             .insert(descriptor.id.clone(), descriptor);
         Ok(())
     }
@@ -3940,18 +4006,12 @@ impl KvRangeRouter for SingleNodeServiceRangeRouter {
         Ok(self
             .descriptors
             .write()
-            .expect("single-node router poisoned")
+            .expect("hosted store router poisoned")
             .remove(range_id))
     }
 
     async fn list(&self) -> anyhow::Result<Vec<ReplicatedRangeDescriptor>> {
-        Ok(self
-            .descriptors
-            .read()
-            .expect("single-node router poisoned")
-            .values()
-            .cloned()
-            .collect())
+        self.current_descriptors().await
     }
 
     async fn by_id(
@@ -3959,11 +4019,10 @@ impl KvRangeRouter for SingleNodeServiceRangeRouter {
         range_id: &str,
     ) -> anyhow::Result<Option<greenmqtt_kv_client::RangeRoute>> {
         Ok(self
-            .descriptors
-            .read()
-            .expect("single-node router poisoned")
-            .get(range_id)
-            .cloned()
+            .current_descriptors()
+            .await?
+            .into_iter()
+            .find(|descriptor| descriptor.id == range_id)
             .map(greenmqtt_kv_client::RangeRoute::from_descriptor))
     }
 
@@ -3973,12 +4032,13 @@ impl KvRangeRouter for SingleNodeServiceRangeRouter {
         key: &[u8],
     ) -> anyhow::Result<Option<greenmqtt_kv_client::RangeRoute>> {
         Ok(self
-            .descriptors
-            .read()
-            .expect("single-node router poisoned")
-            .values()
-            .find(|descriptor| descriptor.shard.kind == shard.kind && descriptor.contains_key(key))
-            .cloned()
+            .current_descriptors()
+            .await?
+            .into_iter()
+            .filter(|descriptor| {
+                Self::shard_matches(descriptor, shard) && descriptor.contains_key(key)
+            })
+            .max_by_key(|descriptor| Self::shard_specificity(descriptor, shard))
             .map(greenmqtt_kv_client::RangeRoute::from_descriptor))
     }
 
@@ -3986,13 +4046,17 @@ impl KvRangeRouter for SingleNodeServiceRangeRouter {
         &self,
         shard: &ServiceShardKey,
     ) -> anyhow::Result<Vec<greenmqtt_kv_client::RangeRoute>> {
-        Ok(self
-            .descriptors
-            .read()
-            .expect("single-node router poisoned")
-            .values()
-            .filter(|descriptor| descriptor.shard.kind == shard.kind)
-            .cloned()
+        let mut descriptors = self
+            .current_descriptors()
+            .await?
+            .into_iter()
+            .filter(|descriptor| Self::shard_matches(descriptor, shard))
+            .collect::<Vec<_>>();
+        descriptors.sort_by_key(|descriptor| {
+            std::cmp::Reverse(Self::shard_specificity(descriptor, shard))
+        });
+        Ok(descriptors
+            .into_iter()
             .map(greenmqtt_kv_client::RangeRoute::from_descriptor)
             .collect())
     }
@@ -4013,7 +4077,37 @@ fn legacy_rocksdb_store_dirs(data_dir: &std::path::Path) -> [PathBuf; 6] {
     ]
 }
 
-fn single_node_range_descriptors(node_id: u64) -> Vec<ReplicatedRangeDescriptor> {
+fn parse_store_raft_peers(node_id: u64) -> anyhow::Result<BTreeMap<u64, String>> {
+    let mut peers = BTreeMap::new();
+    let Some(raw) = std::env::var("GREENMQTT_STORE_RAFT_PEERS")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        peers.insert(node_id, String::new());
+        return Ok(peers);
+    };
+    for item in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
+        let (node_id, endpoint) = item
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("invalid GREENMQTT_STORE_RAFT_PEERS entry: {item}"))?;
+        peers.insert(node_id.parse()?, endpoint.trim().to_string());
+    }
+    peers.entry(node_id).or_insert_with(String::new);
+    Ok(peers)
+}
+
+fn store_range_descriptors(voter_ids: &[u64]) -> Vec<ReplicatedRangeDescriptor> {
+    let leader_node_id = voter_ids.first().copied();
+    let replicas = voter_ids
+        .iter()
+        .map(|node_id| {
+            RangeReplica::new(*node_id, ReplicaRole::Voter, ReplicaSyncState::Replicating)
+        })
+        .collect::<Vec<_>>();
     [
         (
             "__sessiondict",
@@ -4064,18 +4158,90 @@ fn single_node_range_descriptors(node_id: u64) -> Vec<ReplicatedRangeDescriptor>
             RangeBoundary::full(),
             1,
             1,
-            Some(node_id),
-            vec![RangeReplica::new(
-                node_id,
-                ReplicaRole::Voter,
-                ReplicaSyncState::Replicating,
-            )],
+            leader_node_id,
+            replicas.clone(),
             0,
             0,
             ServiceShardLifecycle::Serving,
         )
     })
     .collect()
+}
+
+#[derive(Clone, Default)]
+struct StaticStoreReplicaTransport {
+    endpoints: Arc<RwLock<BTreeMap<u64, String>>>,
+    clients: Arc<tokio::sync::Mutex<HashMap<u64, RaftTransportGrpcClient>>>,
+}
+
+impl StaticStoreReplicaTransport {
+    fn new(endpoints: BTreeMap<u64, String>) -> Self {
+        Self {
+            endpoints: Arc::new(RwLock::new(endpoints)),
+            clients: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    async fn client_for(&self, target_node_id: u64) -> anyhow::Result<RaftTransportGrpcClient> {
+        if let Some(client) = self.clients.lock().await.get(&target_node_id).cloned() {
+            return Ok(client);
+        }
+        let endpoint = self
+            .endpoints
+            .read()
+            .expect("store transport endpoints poisoned")
+            .get(&target_node_id)
+            .cloned()
+            .filter(|endpoint| !endpoint.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("no store raft endpoint configured for node {target_node_id}")
+            })?;
+        let client = RaftTransportGrpcClient::connect(endpoint).await?;
+        self.clients
+            .lock()
+            .await
+            .insert(target_node_id, client.clone());
+        Ok(client)
+    }
+}
+
+#[async_trait]
+impl greenmqtt_kv_server::ReplicaTransport for StaticStoreReplicaTransport {
+    async fn send(
+        &self,
+        from_node_id: u64,
+        target_node_id: u64,
+        range_id: &str,
+        message: &greenmqtt_kv_raft::RaftMessage,
+    ) -> anyhow::Result<()> {
+        let client = self.client_for(target_node_id).await?;
+        client.send(range_id, from_node_id, message).await
+    }
+}
+
+async fn store_membership_registry(
+    peer_endpoints: &BTreeMap<u64, String>,
+) -> anyhow::Result<Arc<StaticServiceEndpointRegistry>> {
+    let registry = Arc::new(StaticServiceEndpointRegistry::default());
+    for (node_id, endpoint) in peer_endpoints {
+        if endpoint.is_empty() {
+            continue;
+        }
+        registry
+            .upsert_member(ClusterNodeMembership::new(
+                *node_id,
+                1,
+                ClusterNodeLifecycle::Serving,
+                vec![
+                    ServiceEndpoint::new(ServiceKind::SessionDict, *node_id, endpoint.clone()),
+                    ServiceEndpoint::new(ServiceKind::Dist, *node_id, endpoint.clone()),
+                    ServiceEndpoint::new(ServiceKind::Inbox, *node_id, endpoint.clone()),
+                    ServiceEndpoint::new(ServiceKind::Retain, *node_id, endpoint.clone()),
+                ],
+            ))
+            .await?;
+    }
+    Ok(registry)
 }
 
 fn metadata_plane_layout_from_env() -> MetadataPlaneLayout {
@@ -4123,7 +4289,10 @@ async fn range_scoped_rocksdb_stack(
     );
 
     let engine = Arc::new(RocksDbKvEngine::open(&root)?);
-    let descriptors = single_node_range_descriptors(node_id);
+    let peer_endpoints = parse_store_raft_peers(node_id)?;
+    let mut voter_ids = peer_endpoints.keys().copied().collect::<Vec<_>>();
+    voter_ids.sort_unstable();
+    let descriptors = store_range_descriptors(&voter_ids);
     let host = Arc::new(MemoryKvRangeHost::default());
     for descriptor in &descriptors {
         engine
@@ -4133,8 +4302,18 @@ async fn range_scoped_rocksdb_stack(
             })
             .await?;
         let space = Arc::from(engine.open_range(&descriptor.id).await?);
-        let raft_impl = Arc::new(MemoryRaftNode::single_node(node_id, &descriptor.id));
+        let raft_impl = Arc::new(MemoryRaftNode::new(
+            node_id,
+            &descriptor.id,
+            greenmqtt_kv_raft::RaftClusterConfig {
+                voters: voter_ids.clone(),
+                learners: Vec::new(),
+            },
+        ));
         raft_impl.recover().await?;
+        if let Some(leader_node_id) = descriptor.leader_node_id {
+            raft_impl.transfer_leadership(leader_node_id).await?;
+        }
         let raft: Arc<dyn RaftNode> = raft_impl;
         host.add_range(HostedRange {
             descriptor: descriptor.clone(),
@@ -4143,11 +4322,27 @@ async fn range_scoped_rocksdb_stack(
         })
         .await?;
     }
-    let router: Arc<dyn KvRangeRouter> = Arc::new(SingleNodeServiceRangeRouter::new(descriptors));
-    let executor: Arc<dyn KvRangeExecutor> = Arc::new(HostedKvRangeExecutor { host: host.clone() });
+    let router: Arc<dyn KvRangeRouter> =
+        Arc::new(HostedStoreRangeRouter::new(host.clone(), descriptors));
+    let executor: Arc<dyn KvRangeExecutor> = if voter_ids.len() > 1 {
+        let membership = store_membership_registry(&peer_endpoints).await?;
+        Arc::new(LeaderRoutedKvRangeExecutor::new(
+            router.clone(),
+            membership,
+            Arc::new(HostedKvRangeExecutor { host: host.clone() }),
+            Arc::new(KvRangeGrpcExecutorFactory),
+        ))
+    } else {
+        Arc::new(HostedKvRangeExecutor { host: host.clone() })
+    };
+    let transport: Arc<dyn greenmqtt_kv_server::ReplicaTransport> = if voter_ids.len() > 1 {
+        Arc::new(StaticStoreReplicaTransport::new(peer_endpoints))
+    } else {
+        Arc::new(greenmqtt_rpc::NoopReplicaTransport)
+    };
     let range_runtime = Arc::new(ReplicaRuntime::with_config(
         host.clone(),
-        Arc::new(NoopReplicaTransport),
+        transport,
         Some(Arc::new(RocksRangeLifecycleManager {
             engine: engine.clone(),
             node_id,
@@ -4799,8 +4994,28 @@ impl RangeLifecycleManager for RocksRangeLifecycleManager {
             })
             .await?;
         let space = Arc::from(self.engine.open_range(&descriptor.id).await?);
-        let raft_impl = Arc::new(MemoryRaftNode::single_node(self.node_id, &descriptor.id));
+        let raft_impl = Arc::new(MemoryRaftNode::new(
+            self.node_id,
+            &descriptor.id,
+            greenmqtt_kv_raft::RaftClusterConfig {
+                voters: descriptor
+                    .replicas
+                    .iter()
+                    .filter(|replica| replica.role == ReplicaRole::Voter)
+                    .map(|replica| replica.node_id)
+                    .collect(),
+                learners: descriptor
+                    .replicas
+                    .iter()
+                    .filter(|replica| replica.role == ReplicaRole::Learner)
+                    .map(|replica| replica.node_id)
+                    .collect(),
+            },
+        ));
         raft_impl.recover().await?;
+        if let Some(leader_node_id) = descriptor.leader_node_id {
+            raft_impl.transfer_leadership(leader_node_id).await?;
+        }
         let raft: Arc<dyn RaftNode> = raft_impl;
         Ok(HostedRange {
             descriptor,

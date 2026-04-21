@@ -210,25 +210,22 @@ impl LeaderRoutedKvRangeExecutor {
         Ok(Some(self.executor_for_endpoint(&endpoint).await?))
     }
 
-    async fn leader_executor(
-        &self,
-        route: &RangeRoute,
-    ) -> anyhow::Result<Arc<dyn KvRangeExecutor>> {
-        if let Some(node_id) = route.leader_node_id {
-            if let Some(executor) = self.routed_executor_for_node(route, node_id).await? {
-                return Ok(executor);
+    fn candidate_nodes(route: &RangeRoute) -> Vec<NodeId> {
+        let mut candidates = Vec::new();
+        if let Some(leader_node_id) = route.leader_node_id {
+            candidates.push(leader_node_id);
+        }
+        for node_id in &route.query_ready_nodes {
+            if !candidates.contains(node_id) {
+                candidates.push(*node_id);
             }
         }
-        Ok(self.fallback.clone())
-    }
-
-    async fn query_executor(&self, route: &RangeRoute) -> anyhow::Result<Arc<dyn KvRangeExecutor>> {
-        if let Some(node_id) = self.query_sequencer.select(route).or(route.leader_node_id) {
-            if let Some(executor) = self.routed_executor_for_node(route, node_id).await? {
-                return Ok(executor);
+        for replica in &route.descriptor.replicas {
+            if !candidates.contains(&replica.node_id) {
+                candidates.push(replica.node_id);
             }
         }
-        Ok(self.fallback.clone())
+        candidates
     }
 
     fn classify_error(error: &anyhow::Error) -> KvRangeErrorKind {
@@ -268,35 +265,59 @@ impl LeaderRoutedKvRangeExecutor {
     {
         let mut current = route;
         for attempt in 0..3 {
-            let executor = self.query_executor(&current).await?;
-            match op(executor).await {
-                Ok(value) => return Ok(value),
-                Err(error) => match Self::classify_error(&error) {
-                    KvRangeErrorKind::NotLeader(Some(node_id)) => {
-                        if let Some(executor) =
-                            self.routed_executor_for_node(&current, node_id).await?
-                        {
+            let preferred = self.query_sequencer.select(&current);
+            let mut candidates = Self::candidate_nodes(&current);
+            if let Some(preferred) = preferred {
+                candidates.retain(|node_id| *node_id != preferred);
+                candidates.insert(0, preferred);
+            }
+            let mut last_error = None;
+            for node_id in candidates {
+                let executor = if let Some(executor) =
+                    self.routed_executor_for_node(&current, node_id).await?
+                {
+                    executor
+                } else if Some(node_id) == current.leader_node_id {
+                    self.fallback.clone()
+                } else {
+                    continue;
+                };
+                match op(executor).await {
+                    Ok(value) => return Ok(value),
+                    Err(error) => match Self::classify_error(&error) {
+                        KvRangeErrorKind::NotLeader(Some(node_id)) => {
                             current.leader_node_id = Some(node_id);
-                            return op(executor).await;
+                            last_error = Some(error);
+                            break;
                         }
-                    }
-                    KvRangeErrorKind::EpochMismatch | KvRangeErrorKind::RangeNotFound => {
-                        current = self.route_by_id(range_id).await?;
-                    }
-                    KvRangeErrorKind::ConfigChanging | KvRangeErrorKind::SnapshotInProgress => {
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                        current = self.route_by_id(range_id).await?;
-                    }
-                    KvRangeErrorKind::Other | KvRangeErrorKind::RetryExhausted => {
-                        return Err(error);
-                    }
-                    KvRangeErrorKind::NotLeader(None) => {
-                        current = self.route_by_id(range_id).await?;
-                    }
-                },
+                        KvRangeErrorKind::EpochMismatch | KvRangeErrorKind::RangeNotFound => {
+                            current = self.route_by_id(range_id).await?;
+                            last_error = Some(error);
+                            break;
+                        }
+                        KvRangeErrorKind::ConfigChanging | KvRangeErrorKind::SnapshotInProgress => {
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                            current = self.route_by_id(range_id).await?;
+                            last_error = Some(error);
+                            break;
+                        }
+                        KvRangeErrorKind::NotLeader(None) | KvRangeErrorKind::Other => {
+                            last_error = Some(error);
+                        }
+                        KvRangeErrorKind::RetryExhausted => {
+                            return Err(error);
+                        }
+                    },
+                }
             }
             if attempt == 2 {
+                if let Some(error) = last_error {
+                    return Err(error);
+                }
                 anyhow::bail!("kv/retry-exhausted range={range_id}");
+            }
+            if last_error.is_none() {
+                current = self.route_by_id(range_id).await?;
             }
         }
         anyhow::bail!("kv/retry-exhausted range={range_id}")
@@ -314,30 +335,53 @@ impl LeaderRoutedKvRangeExecutor {
     {
         let mut current = route;
         for attempt in 0..3 {
-            let executor = self.leader_executor(&current).await?;
-            match op(executor).await {
-                Ok(value) => return Ok(value),
-                Err(error) => match Self::classify_error(&error) {
-                    KvRangeErrorKind::NotLeader(Some(node_id)) => {
-                        current.leader_node_id = Some(node_id);
-                    }
-                    KvRangeErrorKind::EpochMismatch | KvRangeErrorKind::RangeNotFound => {
-                        current = self.route_by_id(range_id).await?;
-                    }
-                    KvRangeErrorKind::ConfigChanging | KvRangeErrorKind::SnapshotInProgress => {
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                        current = self.route_by_id(range_id).await?;
-                    }
-                    KvRangeErrorKind::Other | KvRangeErrorKind::RetryExhausted => {
-                        return Err(error);
-                    }
-                    KvRangeErrorKind::NotLeader(None) => {
-                        current = self.route_by_id(range_id).await?;
-                    }
-                },
+            let mut last_error = None;
+            for node_id in Self::candidate_nodes(&current) {
+                let executor = if let Some(executor) =
+                    self.routed_executor_for_node(&current, node_id).await?
+                {
+                    executor
+                } else if Some(node_id) == current.leader_node_id {
+                    self.fallback.clone()
+                } else {
+                    continue;
+                };
+                match op(executor).await {
+                    Ok(value) => return Ok(value),
+                    Err(error) => match Self::classify_error(&error) {
+                        KvRangeErrorKind::NotLeader(Some(node_id)) => {
+                            current.leader_node_id = Some(node_id);
+                            last_error = Some(error);
+                            break;
+                        }
+                        KvRangeErrorKind::EpochMismatch | KvRangeErrorKind::RangeNotFound => {
+                            current = self.route_by_id(range_id).await?;
+                            last_error = Some(error);
+                            break;
+                        }
+                        KvRangeErrorKind::ConfigChanging | KvRangeErrorKind::SnapshotInProgress => {
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                            current = self.route_by_id(range_id).await?;
+                            last_error = Some(error);
+                            break;
+                        }
+                        KvRangeErrorKind::NotLeader(None) | KvRangeErrorKind::Other => {
+                            last_error = Some(error);
+                        }
+                        KvRangeErrorKind::RetryExhausted => {
+                            return Err(error);
+                        }
+                    },
+                }
             }
             if attempt == 2 {
+                if let Some(error) = last_error {
+                    return Err(error);
+                }
                 anyhow::bail!("kv/retry-exhausted range={range_id}");
+            }
+            if last_error.is_none() {
+                current = self.route_by_id(range_id).await?;
             }
         }
         anyhow::bail!("kv/retry-exhausted range={range_id}")
@@ -1006,6 +1050,94 @@ mod tests {
         let executor = LeaderRoutedKvRangeExecutor::new(router, membership, fallback, factory);
         let value = executor.get("range-1", b"k").await.unwrap().unwrap();
         assert_eq!(value, Bytes::from_static(b"v"));
+    }
+
+    struct TransportErrorExecutor;
+
+    #[async_trait]
+    impl KvRangeExecutor for TransportErrorExecutor {
+        async fn get(&self, _range_id: &str, _key: &[u8]) -> anyhow::Result<Option<Bytes>> {
+            anyhow::bail!("transport error")
+        }
+        async fn scan(
+            &self,
+            _range_id: &str,
+            _boundary: Option<greenmqtt_core::RangeBoundary>,
+            _limit: usize,
+        ) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
+            unreachable!()
+        }
+        async fn apply(&self, _range_id: &str, _mutations: Vec<KvMutation>) -> anyhow::Result<()> {
+            anyhow::bail!("transport error")
+        }
+        async fn checkpoint(
+            &self,
+            _range_id: &str,
+            _checkpoint_id: &str,
+        ) -> anyhow::Result<KvRangeCheckpoint> {
+            unreachable!()
+        }
+        async fn snapshot(&self, _range_id: &str) -> anyhow::Result<KvRangeSnapshot> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn leader_routed_executor_falls_back_to_other_replicas_when_leader_transport_fails() {
+        let router = Arc::new(MemoryKvRangeRouter::default());
+        let membership = Arc::new(TestMembershipRegistry::default());
+        let fallback: Arc<dyn KvRangeExecutor> = Arc::new(TestExecutor::default());
+        let leader_impl: Arc<dyn KvRangeExecutor> = Arc::new(TransportErrorExecutor);
+        let replica_impl = Arc::new(TestExecutor::default());
+        let factory = Arc::new(TestExecutorFactory::default());
+        factory.register("node7", leader_impl);
+        factory.register("node8", replica_impl.clone());
+        for (node_id, endpoint) in [(7, "node7"), (8, "node8")] {
+            membership
+                .upsert_member(ClusterNodeMembership::new(
+                    node_id,
+                    1,
+                    ClusterNodeLifecycle::Serving,
+                    vec![ServiceEndpoint::new(ServiceKind::Retain, node_id, endpoint)],
+                ))
+                .await
+                .unwrap();
+        }
+        router
+            .upsert(ReplicatedRangeDescriptor::new(
+                "range-1",
+                ServiceShardKey::retain("tenant-a"),
+                RangeBoundary::new(Some(b"a".to_vec()), Some(b"z".to_vec())),
+                1,
+                1,
+                Some(7),
+                vec![
+                    RangeReplica::new(7, ReplicaRole::Voter, ReplicaSyncState::Replicating),
+                    RangeReplica::new(8, ReplicaRole::Voter, ReplicaSyncState::Replicating),
+                ],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            ))
+            .await
+            .unwrap();
+
+        let executor = LeaderRoutedKvRangeExecutor::new(router, membership, fallback, factory);
+        executor
+            .apply(
+                "range-1",
+                vec![KvMutation {
+                    key: Bytes::from_static(b"beta"),
+                    value: Some(Bytes::from_static(b"two")),
+                }],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            replica_impl.get("range-1", b"beta").await.unwrap().unwrap(),
+            Bytes::from_static(b"two")
+        );
     }
 
     struct EpochMismatchExecutor {

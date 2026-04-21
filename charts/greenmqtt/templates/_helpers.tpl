@@ -137,6 +137,17 @@ Rendered store environment variables.
   value: {{ .Values.storeTopology.greenmqtt.storageBackend | quote }}
 - name: GREENMQTT_DATA_DIR
   value: {{ .Values.storeTopology.greenmqtt.dataDir | quote }}
+{{- if gt (.Values.storeTopology.replicaCount | int) 1 }}
+{{- $root := . -}}
+{{- $peerEndpoints := list -}}
+{{- range $ordinal := until (.Values.storeTopology.replicaCount | int) }}
+{{- $nodeID := add ($root.Values.storeTopology.nodeIdBase | int) $ordinal -}}
+{{- $endpoint := printf "%d=http://%s-%d.%s:%v" $nodeID (include "greenmqtt.storeFullname" $root) $ordinal (include "greenmqtt.storeHeadlessServiceName" $root) ($root.Values.storeTopology.service.rpc.port | int) -}}
+{{- $peerEndpoints = append $peerEndpoints $endpoint -}}
+{{- end }}
+- name: GREENMQTT_STORE_RAFT_PEERS
+  value: {{ join "," $peerEndpoints | quote }}
+{{- end }}
 {{- range $name, $value := .Values.storeTopology.greenmqtt.extraEnv }}
 - name: {{ $name }}
   value: {{ $value | quote }}

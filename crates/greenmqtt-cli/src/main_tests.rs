@@ -2141,6 +2141,48 @@ fn range_scoped_rocksdb_stack_routes_sessiondict_for_arbitrary_tenant() {
 }
 
 #[test]
+fn range_scoped_rocksdb_stack_uses_all_store_voters_when_peers_configured() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let data_dir = std::env::temp_dir().join(format!("greenmqtt-range-stack-peers-{unique}"));
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let previous = std::env::var("GREENMQTT_STORE_RAFT_PEERS").ok();
+        std::env::set_var(
+            "GREENMQTT_STORE_RAFT_PEERS",
+            "1001=http://greenmqtt-state-0.greenmqtt-state-headless:50051,1002=http://greenmqtt-state-1.greenmqtt-state-headless:50051,1003=http://greenmqtt-state-2.greenmqtt-state-headless:50051",
+        );
+
+        let stack = super::range_scoped_rocksdb_stack(data_dir.clone(), 1002)
+            .await
+            .unwrap();
+        let status = stack.range_host.range("__sessiondict").await.unwrap().unwrap();
+        assert_eq!(
+            status
+                .descriptor
+                .replicas
+                .iter()
+                .map(|replica| replica.node_id)
+                .collect::<Vec<_>>(),
+            vec![1001, 1002, 1003]
+        );
+        assert_eq!(status.raft.cluster_config.voters, vec![1001, 1002, 1003]);
+        assert_eq!(status.raft.leader_node_id, Some(1001));
+
+        match previous {
+            Some(value) => std::env::set_var("GREENMQTT_STORE_RAFT_PEERS", value),
+            None => std::env::remove_var("GREENMQTT_STORE_RAFT_PEERS"),
+        }
+
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    });
+}
+
+#[test]
 fn shard_cli_command_reads_http_shard_audit() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
