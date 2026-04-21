@@ -536,7 +536,11 @@ fn run_control_command(args: impl Iterator<Item = String>) -> anyhow::Result<()>
             let command_id = args
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("missing command_id"))?;
-            ("GET".to_string(), format!("/v1/control-commands/{command_id}"), None)
+            (
+                "GET".to_string(),
+                format!("/v1/control-commands/{command_id}"),
+                None,
+            )
         }
         "retry" => {
             let command_id = args
@@ -576,7 +580,10 @@ fn run_control_command(args: impl Iterator<Item = String>) -> anyhow::Result<()>
         }
         other => anyhow::bail!("unknown control-command subcommand: {other}"),
     };
-    println!("{}", http_request_body(addr, &method, &path, body.as_deref())?);
+    println!(
+        "{}",
+        http_request_body(addr, &method, &path, body.as_deref())?
+    );
     Ok(())
 }
 
@@ -599,9 +606,7 @@ async fn execute_range_command_with_endpoint(
         let response = http_request_body(addr, "GET", &format!("/v1/ranges/{range_id}"), None)?;
         return match output_mode {
             OutputMode::Json => Ok(response),
-            OutputMode::Text => {
-                Ok(render_range_lookup_text(&response)?)
-            }
+            OutputMode::Text => Ok(render_range_lookup_text(&response)?),
         };
     }
     let client = RangeControlGrpcClient::connect(endpoint.to_string()).await?;
@@ -640,7 +645,11 @@ async fn execute_range_command_with_endpoint(
                 ok: true,
                 status: "split".into(),
                 reason: "Range split completed; child ranges are now available.".into(),
-                mode: if resolved.forwarded { "forwarded".into() } else { "local".into() },
+                mode: if resolved.forwarded {
+                    "forwarded".into()
+                } else {
+                    "local".into()
+                },
                 forwarded: resolved.forwarded,
                 target_node_id: resolved.target_node_id,
                 target_endpoint: resolved.target_endpoint,
@@ -682,7 +691,11 @@ async fn execute_range_command_with_endpoint(
                 status: "draining".into(),
                 reason: "Range marked draining; writes should migrate away before retirement."
                     .into(),
-                mode: if resolved.forwarded { "forwarded".into() } else { "local".into() },
+                mode: if resolved.forwarded {
+                    "forwarded".into()
+                } else {
+                    "local".into()
+                },
                 forwarded: resolved.forwarded,
                 target_node_id: resolved.target_node_id,
                 target_endpoint: resolved.target_endpoint,
@@ -706,7 +719,11 @@ async fn execute_range_command_with_endpoint(
                 status: "retired".into(),
                 reason: "Range retired; repeated retire requests are treated as already applied."
                     .into(),
-                mode: if resolved.forwarded { "forwarded".into() } else { "local".into() },
+                mode: if resolved.forwarded {
+                    "forwarded".into()
+                } else {
+                    "local".into()
+                },
                 forwarded: resolved.forwarded,
                 target_node_id: resolved.target_node_id,
                 target_endpoint: resolved.target_endpoint,
@@ -970,7 +987,9 @@ fn render_range_lookup_text(body: &str) -> anyhow::Result<String> {
         .or_else(|| value.get("descriptor").and_then(|value| value.get("id")))
         .and_then(|value| value.as_str())
         .unwrap_or("");
-    Ok(format!("ok operation=inspect source={source} range_id={range}"))
+    Ok(format!(
+        "ok operation=inspect source={source} range_id={range}"
+    ))
 }
 
 fn range_command_request(
@@ -1822,16 +1841,18 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or_else(|_| "127.0.0.1:50051".to_string())
             .parse()?;
         let rpc_governor = Arc::new(RpcTrafficGovernor::new(
-            RpcTrafficGovernorConfig::from_env()?,
+            RpcTrafficGovernorConfig::from_env()?
         ));
         println!("greenmqtt state grpc listening on {rpc_bind}");
+        let assignment_registry =
+            local_state_serve_metadata_registry(local_range_host.clone(), &storage_backend);
         RpcRuntime {
             sessiondict: default_sessiondict,
             dist: default_dist,
             inbox: default_inbox,
             retain: default_retain,
             peer_sink: Arc::new(greenmqtt_rpc::NoopDeliverySink),
-            assignment_registry: None,
+            assignment_registry,
             range_host: local_range_host,
             range_runtime: local_range_runtime,
             inbox_lwt_sink: None,
@@ -2094,18 +2115,7 @@ async fn main() -> anyhow::Result<()> {
                             "GREENMQTT_METADATA_BACKEND=replicated requires GREENMQTT_RANGE_ENDPOINT or GREENMQTT_STATE_ENDPOINT"
                         )
                     })?;
-                let range_base = std::env::var("GREENMQTT_METADATA_RANGE_ID")
-                    .unwrap_or_else(|_| "__metadata".to_string());
-                let layout = MetadataPlaneLayout {
-                    assignments_range_id: std::env::var("GREENMQTT_METADATA_ASSIGNMENTS_RANGE_ID")
-                        .unwrap_or_else(|_| format!("{range_base}.assignments")),
-                    members_range_id: std::env::var("GREENMQTT_METADATA_MEMBERS_RANGE_ID")
-                        .unwrap_or_else(|_| format!("{range_base}.members")),
-                    ranges_range_id: std::env::var("GREENMQTT_METADATA_RANGES_RANGE_ID")
-                        .unwrap_or_else(|_| format!("{range_base}.ranges")),
-                    balancers_range_id: std::env::var("GREENMQTT_METADATA_BALANCERS_RANGE_ID")
-                        .unwrap_or_else(|_| format!("{range_base}.balancers")),
-                };
+                let layout = metadata_plane_layout_from_env();
                 let registry = Arc::new(ReplicatedMetadataRegistry::with_layout(
                     Arc::new(KvRangeGrpcClient::connect(range_endpoint).await?),
                     layout,
@@ -2137,7 +2147,7 @@ async fn main() -> anyhow::Result<()> {
             .await?;
         let metrics_handle = PrometheusBuilder::new().install_recorder()?;
         let rpc_governor = Arc::new(RpcTrafficGovernor::new(
-            RpcTrafficGovernorConfig::from_env()?,
+            RpcTrafficGovernorConfig::from_env()?
         ));
         let http = if let Some(range_runtime) = local_range_runtime.clone() {
             HttpApi::with_peers_shards_metrics_and_ranges(
@@ -3830,15 +3840,19 @@ async fn configure_peers(forwarder: &StaticPeerForwarder) -> anyhow::Result<()> 
 }
 
 #[derive(Clone)]
-struct LocalKvRangeExecutor {
-    engine: Arc<dyn KvEngine>,
+struct HostedKvRangeExecutor {
+    host: Arc<dyn KvRangeHost>,
 }
 
 #[async_trait]
-impl KvRangeExecutor for LocalKvRangeExecutor {
+impl KvRangeExecutor for HostedKvRangeExecutor {
     async fn get(&self, range_id: &str, key: &[u8]) -> anyhow::Result<Option<bytes::Bytes>> {
-        let range = self.engine.open_range(range_id).await?;
-        range.reader().get(key).await
+        let hosted = self
+            .host
+            .open_range(range_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("range not found"))?;
+        hosted.space.reader().get(key).await
     }
 
     async fn scan(
@@ -3847,16 +3861,25 @@ impl KvRangeExecutor for LocalKvRangeExecutor {
         boundary: Option<RangeBoundary>,
         limit: usize,
     ) -> anyhow::Result<Vec<(bytes::Bytes, bytes::Bytes)>> {
-        let range = self.engine.open_range(range_id).await?;
-        range
+        let hosted = self
+            .host
+            .open_range(range_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("range not found"))?;
+        hosted
+            .space
             .reader()
             .scan(&boundary.unwrap_or_else(RangeBoundary::full), limit)
             .await
     }
 
     async fn apply(&self, range_id: &str, mutations: Vec<KvMutation>) -> anyhow::Result<()> {
-        let range = self.engine.open_range(range_id).await?;
-        range.writer().apply(mutations).await
+        let hosted = self
+            .host
+            .open_range(range_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("range not found"))?;
+        hosted.space.writer().apply(mutations).await
     }
 
     async fn checkpoint(
@@ -3864,13 +3887,21 @@ impl KvRangeExecutor for LocalKvRangeExecutor {
         range_id: &str,
         checkpoint_id: &str,
     ) -> anyhow::Result<KvRangeCheckpoint> {
-        let range = self.engine.open_range(range_id).await?;
-        range.checkpoint(checkpoint_id).await
+        let hosted = self
+            .host
+            .open_range(range_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("range not found"))?;
+        hosted.space.checkpoint(checkpoint_id).await
     }
 
     async fn snapshot(&self, range_id: &str) -> anyhow::Result<KvRangeSnapshot> {
-        let range = self.engine.open_range(range_id).await?;
-        range.snapshot().await
+        let hosted = self
+            .host
+            .open_range(range_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("range not found"))?;
+        hosted.space.snapshot().await
     }
 }
 
@@ -4047,6 +4078,36 @@ fn single_node_range_descriptors(node_id: u64) -> Vec<ReplicatedRangeDescriptor>
     .collect()
 }
 
+fn metadata_plane_layout_from_env() -> MetadataPlaneLayout {
+    let range_base =
+        std::env::var("GREENMQTT_METADATA_RANGE_ID").unwrap_or_else(|_| "__metadata".to_string());
+    MetadataPlaneLayout {
+        assignments_range_id: std::env::var("GREENMQTT_METADATA_ASSIGNMENTS_RANGE_ID")
+            .unwrap_or_else(|_| format!("{range_base}.assignments")),
+        members_range_id: std::env::var("GREENMQTT_METADATA_MEMBERS_RANGE_ID")
+            .unwrap_or_else(|_| format!("{range_base}.members")),
+        ranges_range_id: std::env::var("GREENMQTT_METADATA_RANGES_RANGE_ID")
+            .unwrap_or_else(|_| format!("{range_base}.ranges")),
+        balancers_range_id: std::env::var("GREENMQTT_METADATA_BALANCERS_RANGE_ID")
+            .unwrap_or_else(|_| format!("{range_base}.balancers")),
+    }
+}
+
+fn local_state_serve_metadata_registry(
+    range_host: Option<Arc<dyn KvRangeHost>>,
+    storage_backend: &str,
+) -> Option<Arc<dyn MetadataRegistry>> {
+    if storage_backend != "rocksdb" {
+        return None;
+    };
+    range_host.map(|host| {
+        Arc::new(ReplicatedMetadataRegistry::with_layout(
+            Arc::new(HostedKvRangeExecutor { host }),
+            metadata_plane_layout_from_env(),
+        )) as Arc<dyn MetadataRegistry>
+    })
+}
+
 async fn range_scoped_rocksdb_stack(
     data_dir: PathBuf,
     node_id: u64,
@@ -4083,9 +4144,7 @@ async fn range_scoped_rocksdb_stack(
         .await?;
     }
     let router: Arc<dyn KvRangeRouter> = Arc::new(SingleNodeServiceRangeRouter::new(descriptors));
-    let executor: Arc<dyn KvRangeExecutor> = Arc::new(LocalKvRangeExecutor {
-        engine: engine.clone(),
-    });
+    let executor: Arc<dyn KvRangeExecutor> = Arc::new(HostedKvRangeExecutor { host: host.clone() });
     let range_runtime = Arc::new(ReplicaRuntime::with_config(
         host.clone(),
         Arc::new(NoopReplicaTransport),

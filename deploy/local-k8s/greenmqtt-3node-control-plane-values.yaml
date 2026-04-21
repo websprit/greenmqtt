@@ -17,7 +17,10 @@ greenmqtt:
   storageBackend: memory
   extraEnv:
     GREENMQTT_STATE_MODE: "replicated"
-    GREENMQTT_PEERS: "1=http://greenmqtt-0.greenmqtt-headless:50051,2=http://greenmqtt-1.greenmqtt-headless:50051,3=http://greenmqtt-2.greenmqtt-headless:50051"
+    GREENMQTT_METADATA_BACKEND: "replicated"
+    GREENMQTT_METADATA_ENDPOINT: "http://greenmqtt-state:50051"
+    GREENMQTT_RANGE_ENDPOINT: "http://greenmqtt-state:50051"
+    GREENMQTT_PEERS: ""
 
 storeTopology:
   enabled: true

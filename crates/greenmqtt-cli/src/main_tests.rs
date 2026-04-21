@@ -7,13 +7,12 @@ use super::{
     listener_specs_from_env, parse_acl_rules, parse_bench_scenario, parse_bench_scenarios,
     parse_bridge_rules, parse_compare_backends, parse_identity_matchers, parse_listener_specs,
     parse_topic_rewrite_rules, range_command_request, redis_services, render_range_lookup_text,
-    render_shard_response_text,
-    replicated_range_clients, resolved_state_mode, run_bench, run_compare_bench, run_compare_soak,
-    run_dist_maintenance_tick, run_inbox_maintenance_tick, run_profile_bench,
-    run_retain_maintenance_tick, run_shard_command, run_soak, shard_command_request,
-    validate_bench_report, validate_soak_report, BenchConfig, BenchReport, BenchScenario,
-    BenchThresholds, DistMaintenanceConfig, InboxMaintenanceConfig, ListenerSpec, OutputMode,
-    RetainMaintenanceConfig, SoakConfig, SoakReport, SoakThresholds, StateMode,
+    render_shard_response_text, replicated_range_clients, resolved_state_mode, run_bench,
+    run_compare_bench, run_compare_soak, run_dist_maintenance_tick, run_inbox_maintenance_tick,
+    run_profile_bench, run_retain_maintenance_tick, run_shard_command, run_soak,
+    shard_command_request, validate_bench_report, validate_soak_report, BenchConfig, BenchReport,
+    BenchScenario, BenchThresholds, DistMaintenanceConfig, InboxMaintenanceConfig, ListenerSpec,
+    OutputMode, RetainMaintenanceConfig, SoakConfig, SoakReport, SoakThresholds, StateMode,
 };
 use async_trait::async_trait;
 use greenmqtt_broker::{BrokerConfig, BrokerRuntime};
@@ -2008,6 +2007,136 @@ fn resolved_state_mode_prefers_service_override_over_global_setting() {
                 StateMode::Legacy
             );
         })
+    });
+}
+
+#[test]
+fn local_state_serve_metadata_registry_reads_and_writes_metadata_ranges() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let data_dir =
+            std::env::temp_dir().join(format!("greenmqtt-state-serve-metadata-{unique}"));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let root = super::range_engine_root(&data_dir);
+        std::fs::create_dir_all(&root).unwrap();
+        let layout = greenmqtt_rpc::MetadataPlaneLayout::sharded("__metadata");
+        let engine = greenmqtt_kv_engine::RocksDbKvEngine::open(&root).unwrap();
+        for range_id in [
+            layout.assignments_range_id.clone(),
+            layout.members_range_id.clone(),
+            layout.ranges_range_id.clone(),
+            layout.balancers_range_id.clone(),
+        ] {
+            engine
+                .bootstrap(KvRangeBootstrap {
+                    range_id,
+                    boundary: greenmqtt_core::RangeBoundary::full(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let host = Arc::new(MemoryKvRangeHost::default());
+        for range_id in [
+            layout.assignments_range_id.clone(),
+            layout.members_range_id.clone(),
+            layout.ranges_range_id.clone(),
+            layout.balancers_range_id.clone(),
+        ] {
+            let descriptor = ReplicatedRangeDescriptor::new(
+                range_id.clone(),
+                ServiceShardKey {
+                    kind: ServiceShardKind::Retain,
+                    tenant_id: "meta".into(),
+                    scope: "*".into(),
+                },
+                greenmqtt_core::RangeBoundary::full(),
+                1,
+                1,
+                Some(1),
+                vec![greenmqtt_core::RangeReplica::new(
+                    1,
+                    greenmqtt_core::ReplicaRole::Voter,
+                    greenmqtt_core::ReplicaSyncState::Replicating,
+                )],
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            );
+            let raft_impl = Arc::new(MemoryRaftNode::single_node(1, &range_id));
+            raft_impl.recover().await.unwrap();
+            let raft: Arc<dyn RaftNode> = raft_impl;
+            host.add_range(HostedRange {
+                descriptor,
+                raft,
+                space: Arc::from(engine.open_range(&range_id).await.unwrap()),
+            })
+            .await
+            .unwrap();
+        }
+
+        let registry = super::local_state_serve_metadata_registry(Some(host), "rocksdb").unwrap();
+        let membership_registry: Arc<dyn ClusterMembershipRegistry> = registry.clone();
+        let member = ClusterNodeMembership::new(
+            7,
+            1,
+            ClusterNodeLifecycle::Serving,
+            vec![ServiceEndpoint::new(
+                ServiceKind::SessionDict,
+                7,
+                "http://127.0.0.1:50077",
+            )],
+        );
+        registry.upsert_member(member.clone()).await.unwrap();
+        assert_eq!(
+            membership_registry.resolve_member(7).await.unwrap(),
+            Some(member)
+        );
+    });
+}
+
+#[test]
+fn range_scoped_rocksdb_stack_routes_sessiondict_for_arbitrary_tenant() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let data_dir = std::env::temp_dir().join(format!("greenmqtt-range-stack-{unique}"));
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let stack = super::range_scoped_rocksdb_stack(data_dir.clone(), 1001)
+            .await
+            .unwrap();
+        let record = SessionRecord {
+            session_id: "smoke:u1:c1:1".into(),
+            node_id: 1,
+            kind: SessionKind::Transient,
+            identity: ClientIdentity {
+                tenant_id: "smoke".into(),
+                user_id: "u1".into(),
+                client_id: "c1".into(),
+            },
+            session_expiry_interval_secs: Some(0),
+            expires_at_ms: None,
+        };
+
+        stack.sessiondict.register(record.clone()).await.unwrap();
+        assert_eq!(
+            stack
+                .sessiondict
+                .lookup_identity(&record.identity)
+                .await
+                .unwrap(),
+            Some(record)
+        );
+
+        std::fs::remove_dir_all(&data_dir).unwrap();
     });
 }
 
