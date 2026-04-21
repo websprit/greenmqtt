@@ -97,6 +97,16 @@ async fn memory_raft_node_recovers_single_node_as_leader_and_applies_proposals()
 }
 
 #[tokio::test]
+async fn memory_raft_node_single_node_renews_leader_lease_on_ticks() {
+    let node = MemoryRaftNode::single_node(1, "range-single-node-lease");
+    node.recover().await.unwrap();
+    for _ in 0..10 {
+        node.tick().await.unwrap();
+    }
+    assert_eq!(node.read_index().await.unwrap(), 0);
+}
+
+#[tokio::test]
 async fn memory_raft_node_supports_transfer_config_change_and_snapshot_install() {
     let node = MemoryRaftNode::new(
         1,

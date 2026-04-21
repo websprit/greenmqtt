@@ -1,4 +1,5 @@
 use super::*;
+use greenmqtt_core::RangeBoundary;
 use greenmqtt_proto::internal::{
     broker_peer_service_server::BrokerPeerService, dist_service_server::DistService,
     inbox_service_server::InboxService as ProtoInboxService,
@@ -1436,10 +1437,61 @@ impl RangeControlService for RangeControlRpc {
             .as_ref()
             .ok_or_else(|| Status::unavailable("range runtime unavailable"))?;
         let request = request.into_inner();
+        let split_key = request.split_key.clone();
+        let source_descriptor = if let Some(registry) = self.registry.as_ref() {
+            registry
+                .resolve_range(&request.range_id)
+                .await
+                .map_err(internal_status)?
+        } else {
+            None
+        };
         let (left_range_id, right_range_id) = runtime
-            .split_range(&request.range_id, request.split_key)
+            .split_range(&request.range_id, split_key.clone())
             .await
             .map_err(internal_status)?;
+        if let (Some(registry), Some(source)) = (self.registry.as_ref(), source_descriptor) {
+            let child_epoch = source.epoch + 2;
+            let left = ReplicatedRangeDescriptor::new(
+                left_range_id.clone(),
+                source.shard.clone(),
+                RangeBoundary::new(
+                    source.boundary.start_key.clone(),
+                    Some(split_key.clone()),
+                ),
+                child_epoch,
+                source.config_version,
+                source.leader_node_id,
+                source.replicas.clone(),
+                source.commit_index,
+                source.applied_index,
+                ServiceShardLifecycle::Serving,
+            );
+            let right = ReplicatedRangeDescriptor::new(
+                right_range_id.clone(),
+                source.shard,
+                RangeBoundary::new(Some(split_key), source.boundary.end_key.clone()),
+                child_epoch,
+                source.config_version,
+                source.leader_node_id,
+                source.replicas,
+                source.commit_index,
+                source.applied_index,
+                ServiceShardLifecycle::Serving,
+            );
+            let _ = registry
+                .remove_range(&request.range_id)
+                .await
+                .map_err(internal_status)?;
+            let _ = registry
+                .upsert_range(left)
+                .await
+                .map_err(internal_status)?;
+            let _ = registry
+                .upsert_range(right)
+                .await
+                .map_err(internal_status)?;
+        }
         self.sync_reconfiguration_state(&request.range_id).await?;
         self.sync_reconfiguration_state(&left_range_id).await?;
         self.sync_reconfiguration_state(&right_range_id).await?;

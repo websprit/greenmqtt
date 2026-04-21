@@ -599,7 +599,7 @@ impl RaftNode for MemoryRaftNode {
                     state.heartbeat_elapsed_ticks = 0;
                     state.leader_lease_acks.clear();
                     let local_node_id = state.local_node_id;
-                    state.leader_lease_acks.insert(local_node_id);
+                    Self::note_leader_lease_ack(&mut state, local_node_id);
                     Self::enqueue_replication_round(&mut state);
                 }
             } else {

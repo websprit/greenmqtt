@@ -13,7 +13,7 @@ pub use client::{
 pub use cache::{CachedKvRangeRouter, RouteCacheConfig};
 pub use consistency::{RangeReadOptions, ReadConsistency};
 pub use control::{RangeControlClient, RangeSplitResult};
-pub use error::{KvRangeErrorKind, RetryDirective};
+pub use error::{classify_kv_error, KvRangeErrorKind, RetryDirective};
 pub use executor::{KvRangeExecutor, KvRangeExecutorFactory};
 pub use router::{KvRangeRouter, MemoryKvRangeRouter, RangeRoute};
 

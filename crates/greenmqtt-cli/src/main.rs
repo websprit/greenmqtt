@@ -27,7 +27,8 @@ use greenmqtt_kv_balance::{
     ControlPlaneRuntimeConfig, MetadataBalanceController,
 };
 use greenmqtt_kv_client::{
-    KvRangeExecutor, KvRangeRouter, LeaderRoutedKvRangeExecutor, RoutedRangeDataClient,
+    classify_kv_error, KvRangeErrorKind, KvRangeExecutor, KvRangeRouter,
+    LeaderRoutedKvRangeExecutor, RoutedRangeDataClient,
 };
 use greenmqtt_kv_engine::{
     KvEngine, KvMutation, KvRangeBootstrap, KvRangeCheckpoint, KvRangeSnapshot, RocksDbKvEngine,
@@ -98,6 +99,91 @@ struct LocalRangeRuntimeStack {
     retain: Arc<dyn RetainService>,
     range_host: Arc<dyn KvRangeHost>,
     range_runtime: Arc<ReplicaRuntime>,
+}
+
+async fn upsert_member_with_startup_retry<R>(
+    registry: Arc<R>,
+    member: ClusterNodeMembership,
+) -> anyhow::Result<()>
+where
+    R: ClusterMembershipRegistry + ?Sized,
+{
+    let max_attempts = env_parse_or("GREENMQTT_METADATA_STARTUP_RETRIES", 60usize)?;
+    let retry_delay = Duration::from_millis(env_parse_or(
+        "GREENMQTT_METADATA_STARTUP_RETRY_DELAY_MS",
+        1_000u64,
+    )?);
+    let mut last_error = None;
+    for attempt in 1..=max_attempts {
+        match registry.upsert_member(member.clone()).await {
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                let kind = classify_kv_error(&error);
+                let retryable = matches!(
+                    kind,
+                    KvRangeErrorKind::NotLeader(_)
+                        | KvRangeErrorKind::EpochMismatch
+                        | KvRangeErrorKind::RangeNotFound
+                        | KvRangeErrorKind::ConfigChanging
+                        | KvRangeErrorKind::SnapshotInProgress
+                        | KvRangeErrorKind::TransportUnavailable
+                        | KvRangeErrorKind::RetryExhausted
+                );
+                if !retryable || attempt == max_attempts {
+                    return Err(error);
+                }
+                eprintln!(
+                    "greenmqtt metadata startup retry attempt={attempt}/{max_attempts} kind={kind:?} error={error}"
+                );
+                last_error = Some(error);
+                tokio::time::sleep(retry_delay).await;
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("metadata startup retry exhausted")))
+}
+
+async fn upsert_range_with_startup_retry<R>(
+    registry: Arc<R>,
+    descriptor: ReplicatedRangeDescriptor,
+) -> anyhow::Result<()>
+where
+    R: greenmqtt_core::ReplicatedRangeRegistry + ?Sized,
+{
+    let max_attempts = env_parse_or("GREENMQTT_METADATA_STARTUP_RETRIES", 60usize)?;
+    let retry_delay = Duration::from_millis(env_parse_or(
+        "GREENMQTT_METADATA_STARTUP_RETRY_DELAY_MS",
+        1_000u64,
+    )?);
+    let mut last_error = None;
+    for attempt in 1..=max_attempts {
+        match registry.upsert_range(descriptor.clone()).await {
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                let kind = classify_kv_error(&error);
+                let retryable = matches!(
+                    kind,
+                    KvRangeErrorKind::NotLeader(_)
+                        | KvRangeErrorKind::EpochMismatch
+                        | KvRangeErrorKind::RangeNotFound
+                        | KvRangeErrorKind::ConfigChanging
+                        | KvRangeErrorKind::SnapshotInProgress
+                        | KvRangeErrorKind::TransportUnavailable
+                        | KvRangeErrorKind::RetryExhausted
+                );
+                if !retryable || attempt == max_attempts {
+                    return Err(error);
+                }
+                eprintln!(
+                    "greenmqtt metadata range seed retry attempt={attempt}/{max_attempts} kind={kind:?} range_id={} error={error}",
+                    descriptor.id
+                );
+                last_error = Some(error);
+                tokio::time::sleep(retry_delay).await;
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("metadata range seed retry exhausted")))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1771,6 +1857,36 @@ fn http_request_body(
     Ok(body.to_string())
 }
 
+fn advertised_rpc_endpoint(rpc_bind: SocketAddr) -> String {
+    let local_fallback = if rpc_bind.ip().is_unspecified() {
+        format!("http://127.0.0.1:{}", rpc_bind.port())
+    } else {
+        format!("http://{rpc_bind}")
+    };
+    std::env::var("GREENMQTT_ADVERTISE_RPC_ENDPOINT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(local_fallback)
+}
+
+fn resolved_control_plane_endpoints(
+    rpc_bind: SocketAddr,
+    state_endpoint: Option<&str>,
+) -> (String, String) {
+    let local_endpoint = advertised_rpc_endpoint(rpc_bind);
+    let metadata_endpoint = std::env::var("GREENMQTT_METADATA_ENDPOINT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| state_endpoint.map(str::to_string))
+        .unwrap_or_else(|| local_endpoint.clone());
+    let range_endpoint = std::env::var("GREENMQTT_RANGE_ENDPOINT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| state_endpoint.map(str::to_string))
+        .unwrap_or_else(|| local_endpoint.clone());
+    (metadata_endpoint, range_endpoint)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
@@ -1847,11 +1963,42 @@ async fn main() -> anyhow::Result<()> {
             RpcTrafficGovernorConfig::from_env()?
         ));
         println!("greenmqtt state grpc listening on {rpc_bind}");
+        let rpc_endpoint = advertised_rpc_endpoint(rpc_bind);
         let assignment_registry =
             local_state_serve_metadata_registry(local_range_host.clone(), &storage_backend);
         let _replica_runtime_handle = local_range_runtime
             .clone()
             .map(|runtime| runtime.spawn(Duration::from_millis(50)));
+        if let (Some(registry), Some(host)) = (assignment_registry.clone(), local_range_host.clone())
+        {
+            upsert_member_with_startup_retry(
+                registry.clone(),
+                ClusterNodeMembership::new(
+                    node_id,
+                    1,
+                    ClusterNodeLifecycle::Serving,
+                    vec![
+                        ServiceEndpoint::new(
+                            ServiceKind::SessionDict,
+                            node_id,
+                            rpc_endpoint.clone(),
+                        ),
+                        ServiceEndpoint::new(ServiceKind::Dist, node_id, rpc_endpoint.clone()),
+                        ServiceEndpoint::new(ServiceKind::Inbox, node_id, rpc_endpoint.clone()),
+                        ServiceEndpoint::new(ServiceKind::Retain, node_id, rpc_endpoint.clone()),
+                    ],
+                ),
+            )
+            .await?;
+            let mut seeded_range_ids = Vec::new();
+            for status in host.list_ranges().await? {
+                seeded_range_ids.push(status.descriptor.id.clone());
+                upsert_range_with_startup_retry(registry.clone(), status.descriptor).await?;
+            }
+            eprintln!(
+                "greenmqtt state metadata seeded node_id={node_id} ranges={seeded_range_ids:?}"
+            );
+        }
         RpcRuntime {
             sessiondict: default_sessiondict,
             dist: default_dist,
@@ -2081,6 +2228,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         println!("greenmqtt internal grpc listening on {rpc_bind}");
+        let rpc_endpoint = advertised_rpc_endpoint(rpc_bind);
         let metadata_backend = std::env::var("GREENMQTT_METADATA_BACKEND")
             .unwrap_or_else(|_| "memory".to_string())
             .to_lowercase();
@@ -2130,8 +2278,9 @@ async fn main() -> anyhow::Result<()> {
             }
             other => anyhow::bail!("unsupported GREENMQTT_METADATA_BACKEND: {other}"),
         };
-        shard_registry
-            .upsert_member(ClusterNodeMembership::new(
+        upsert_member_with_startup_retry(
+            shard_registry.clone(),
+            ClusterNodeMembership::new(
                 node_id,
                 1,
                 ClusterNodeLifecycle::Serving,
@@ -2139,18 +2288,15 @@ async fn main() -> anyhow::Result<()> {
                     ServiceEndpoint::new(
                         ServiceKind::SessionDict,
                         node_id,
-                        format!("http://{rpc_bind}"),
+                        rpc_endpoint.clone(),
                     ),
-                    ServiceEndpoint::new(ServiceKind::Dist, node_id, format!("http://{rpc_bind}")),
-                    ServiceEndpoint::new(ServiceKind::Inbox, node_id, format!("http://{rpc_bind}")),
-                    ServiceEndpoint::new(
-                        ServiceKind::Retain,
-                        node_id,
-                        format!("http://{rpc_bind}"),
-                    ),
+                    ServiceEndpoint::new(ServiceKind::Dist, node_id, rpc_endpoint.clone()),
+                    ServiceEndpoint::new(ServiceKind::Inbox, node_id, rpc_endpoint.clone()),
+                    ServiceEndpoint::new(ServiceKind::Retain, node_id, rpc_endpoint.clone()),
                 ],
-            ))
-            .await?;
+            ),
+        )
+        .await?;
         let metrics_handle = PrometheusBuilder::new().install_recorder()?;
         let rpc_governor = Arc::new(RpcTrafficGovernor::new(
             RpcTrafficGovernorConfig::from_env()?
@@ -2197,7 +2343,15 @@ async fn main() -> anyhow::Result<()> {
             replicated_dist_runtime_handle(state_endpoint.as_deref()).await?,
             configured_dist_maintenance()?,
         ) {
-            spawn_dist_maintenance_task(&mut tasks, dist_runtime, dist_maintenance);
+            let (metadata_endpoint, range_endpoint) =
+                resolved_control_plane_endpoints(rpc_bind, state_endpoint.as_deref());
+            spawn_dist_maintenance_task(
+                &mut tasks,
+                dist_runtime,
+                control_plane_registry.clone(),
+                RoutedRangeControlGrpcClient::connect(metadata_endpoint, range_endpoint).await?,
+                dist_maintenance,
+            );
         }
         if let (Some(inbox_runtime), Some(inbox_maintenance)) = (
             replicated_inbox_runtime_handle(state_endpoint.as_deref()).await?,
@@ -2211,10 +2365,13 @@ async fn main() -> anyhow::Result<()> {
         ) {
             spawn_retain_maintenance_task(&mut tasks, retain_runtime, retain_maintenance);
         }
+        let (control_plane_metadata_endpoint, control_plane_range_endpoint) =
+            resolved_control_plane_endpoints(rpc_bind, state_endpoint.as_deref());
         if let Some(control_plane_runtime) = configured_control_plane_runtime(
             node_id,
             control_plane_registry.clone(),
-            format!("http://{rpc_bind}"),
+            control_plane_metadata_endpoint,
+            control_plane_range_endpoint,
         )
         .await?
         {
@@ -4111,9 +4268,10 @@ fn store_range_descriptors(voter_ids: &[u64]) -> Vec<ReplicatedRangeDescriptor> 
             RangeReplica::new(*node_id, ReplicaRole::Voter, ReplicaSyncState::Replicating)
         })
         .collect::<Vec<_>>();
-    [
+    let metadata_layout = metadata_plane_layout_from_env();
+    let mut descriptors: Vec<(String, ServiceShardKey)> = vec![
         (
-            "__sessiondict",
+            "__sessiondict".to_string(),
             ServiceShardKey {
                 kind: ServiceShardKind::SessionDict,
                 tenant_id: "*".into(),
@@ -4121,7 +4279,7 @@ fn store_range_descriptors(voter_ids: &[u64]) -> Vec<ReplicatedRangeDescriptor> 
             },
         ),
         (
-            "__dist",
+            "__dist".to_string(),
             ServiceShardKey {
                 kind: ServiceShardKind::Dist,
                 tenant_id: "*".into(),
@@ -4129,7 +4287,7 @@ fn store_range_descriptors(voter_ids: &[u64]) -> Vec<ReplicatedRangeDescriptor> 
             },
         ),
         (
-            "__retain",
+            "__retain".to_string(),
             ServiceShardKey {
                 kind: ServiceShardKind::Retain,
                 tenant_id: "*".into(),
@@ -4137,7 +4295,7 @@ fn store_range_descriptors(voter_ids: &[u64]) -> Vec<ReplicatedRangeDescriptor> 
             },
         ),
         (
-            "__inbox",
+            "__inbox".to_string(),
             ServiceShardKey {
                 kind: ServiceShardKind::Inbox,
                 tenant_id: "*".into(),
@@ -4145,30 +4303,65 @@ fn store_range_descriptors(voter_ids: &[u64]) -> Vec<ReplicatedRangeDescriptor> 
             },
         ),
         (
-            "__inflight",
+            "__inflight".to_string(),
             ServiceShardKey {
                 kind: ServiceShardKind::Inflight,
                 tenant_id: "*".into(),
                 scope: "*".into(),
             },
         ),
-    ]
-    .into_iter()
-    .map(|(range_id, shard)| {
-        ReplicatedRangeDescriptor::new(
-            range_id,
-            shard,
-            RangeBoundary::full(),
-            1,
-            1,
-            leader_node_id,
-            replicas.clone(),
-            0,
-            0,
-            ServiceShardLifecycle::Serving,
-        )
-    })
-    .collect()
+    ];
+    descriptors.extend([
+        (
+            metadata_layout.assignments_range_id,
+            ServiceShardKey {
+                kind: ServiceShardKind::SessionDict,
+                tenant_id: "__metadata".into(),
+                scope: "assignments".into(),
+            },
+        ),
+        (
+            metadata_layout.members_range_id,
+            ServiceShardKey {
+                kind: ServiceShardKind::SessionDict,
+                tenant_id: "__metadata".into(),
+                scope: "members".into(),
+            },
+        ),
+        (
+            metadata_layout.ranges_range_id,
+            ServiceShardKey {
+                kind: ServiceShardKind::SessionDict,
+                tenant_id: "__metadata".into(),
+                scope: "ranges".into(),
+            },
+        ),
+        (
+            metadata_layout.balancers_range_id,
+            ServiceShardKey {
+                kind: ServiceShardKind::SessionDict,
+                tenant_id: "__metadata".into(),
+                scope: "balancers".into(),
+            },
+        ),
+    ]);
+    descriptors
+        .into_iter()
+        .map(|(range_id, shard)| {
+            ReplicatedRangeDescriptor::new(
+                range_id,
+                shard,
+                RangeBoundary::full(),
+                1,
+                1,
+                leader_node_id,
+                replicas.clone(),
+                0,
+                0,
+                ServiceShardLifecycle::Serving,
+            )
+        })
+        .collect()
 }
 
 #[derive(Clone, Default)]
@@ -4510,6 +4703,7 @@ async fn configured_control_plane_runtime(
     node_id: u64,
     registry: Arc<dyn ControlPlaneRegistry>,
     metadata_endpoint: String,
+    range_endpoint: String,
 ) -> anyhow::Result<Option<ControlPlaneRuntime>> {
     if !env_parse_bool("GREENMQTT_CONTROL_PLANE_ENABLED", false)? {
         return Ok(None);
@@ -4576,11 +4770,8 @@ async fn configured_control_plane_runtime(
         controller.clone(),
         Arc::new(ControlPlaneExecutor {
             registry: registry.clone(),
-            range_control: RoutedRangeControlGrpcClient::connect(
-                metadata_endpoint.clone(),
-                metadata_endpoint.clone(),
-            )
-            .await?,
+            range_control: RoutedRangeControlGrpcClient::connect(metadata_endpoint, range_endpoint)
+                .await?,
         }),
         registry.clone(),
         config.balancer_name.clone(),
@@ -4657,6 +4848,8 @@ async fn run_dist_maintenance_tick(
 fn spawn_dist_maintenance_task(
     tasks: &mut JoinSet<anyhow::Result<()>>,
     dist: Arc<dyn DistRuntime>,
+    registry: Arc<dyn ControlPlaneRegistry>,
+    range_control: RoutedRangeControlGrpcClient,
     config: DistMaintenanceConfig,
 ) {
     tasks.spawn(async move {
@@ -4666,6 +4859,57 @@ fn spawn_dist_maintenance_task(
             let actions = run_dist_maintenance_tick(dist.clone(), &config).await?;
             if !actions.is_empty() {
                 eprintln!("greenmqtt dist maintenance proposed actions: {:?}", actions);
+                for action in &actions {
+                    if let DistBalanceAction::SplitTenantRange { tenant_id } = action {
+                        let routes = dist.list_routes(Some(tenant_id)).await?;
+                        if routes.len() < 2 {
+                            continue;
+                        }
+                        let mut ranges = registry.list_ranges(Some(ServiceShardKind::Dist)).await?;
+                        ranges.retain(|range| {
+                            range.shard.tenant_id == *tenant_id || range.shard.tenant_id == "*"
+                        });
+                        let mut selected = None;
+                        for range in ranges {
+                            let mut range_topic_filters = routes
+                                .iter()
+                                .map(|route| route.topic_filter.clone())
+                                .filter(|topic_filter| range.contains_key(topic_filter.as_bytes()))
+                                .collect::<Vec<_>>();
+                            if range_topic_filters.len() < 2 {
+                                continue;
+                            }
+                            range_topic_filters.sort();
+                            let split_index = range_topic_filters.len() / 2;
+                            let split_key = range_topic_filters[split_index].as_bytes().to_vec();
+                            if range.boundary.start_key.as_deref() == Some(split_key.as_slice()) {
+                                continue;
+                            }
+                            selected = Some((range.id.clone(), split_key));
+                            break;
+                        }
+                        let Some((range_id, split_key)) = selected else {
+                            continue;
+                        };
+                        match range_control
+                            .split_range(&range_id, split_key.clone())
+                            .await
+                        {
+                            Ok((left_range_id, right_range_id)) => eprintln!(
+                                "greenmqtt dist maintenance split range_id={} left={} right={} split_key={:?}",
+                                range_id,
+                                left_range_id,
+                                right_range_id,
+                                split_key
+                            ),
+                            Err(error) => eprintln!(
+                                "greenmqtt dist maintenance split failed range_id={} split_key={:?} error={error}",
+                                range_id,
+                                split_key
+                            ),
+                        }
+                    }
+                }
             }
         }
     });

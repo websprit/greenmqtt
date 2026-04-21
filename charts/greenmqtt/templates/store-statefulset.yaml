@@ -54,6 +54,7 @@ spec:
                 ''|*[!0-9]*) export GREENMQTT_NODE_ID="{{ .Values.storeTopology.nodeIdBase }}";;
                 *) export GREENMQTT_NODE_ID="$((ordinal + {{ .Values.storeTopology.nodeIdBase }}))";;
               esac
+              export GREENMQTT_ADVERTISE_RPC_ENDPOINT="http://${HOSTNAME}.{{ include "greenmqtt.storeHeadlessServiceName" . }}:{{ .Values.storeTopology.service.rpc.port }}"
               exec /usr/local/bin/greenmqtt state-serve
           ports:
             - name: rpc
