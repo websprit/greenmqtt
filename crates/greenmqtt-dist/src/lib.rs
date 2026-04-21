@@ -8,5 +8,9 @@ pub use dist::{
     ThresholdDistBalancePolicy,
 };
 
+pub trait DistRuntime: DistRouter + DistMaintenance {}
+
+impl<T> DistRuntime for T where T: DistRouter + DistMaintenance + ?Sized {}
+
 #[cfg(test)]
 mod tests;

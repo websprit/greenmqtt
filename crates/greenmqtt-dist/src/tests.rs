@@ -11,7 +11,9 @@ use greenmqtt_core::{
     PublishProperties, PublishRequest, RangeBoundary, RangeReplica, ReplicaRole, ReplicaSyncState,
     ReplicatedRangeDescriptor, RouteRecord, ServiceShardKey, ServiceShardLifecycle, SessionKind,
 };
-use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter, MemoryKvRangeRouter};
+use greenmqtt_kv_client::{
+    KvRangeExecutor, KvRangeRouter, MemoryKvRangeRouter, RoutedRangeDataClient,
+};
 use greenmqtt_kv_engine::{
     KvEngine, KvMutation, KvRangeBootstrap, KvRangeCheckpoint, KvRangeSnapshot, MemoryKvEngine,
 };
@@ -530,7 +532,10 @@ async fn replicated_dist_match_topic_uses_indexed_scans_and_wildcard_cache() {
         engine: engine.clone(),
         ..RecordingKvRangeExecutor::default()
     });
-    let dist = ReplicatedDistHandle::from_router_executor(router, executor.clone());
+    let dist = ReplicatedDistHandle::new(Arc::new(RoutedRangeDataClient::new(
+        router,
+        executor.clone(),
+    )));
     for topic_filter in ["devices/a/state", "devices/+/state"] {
         dist.add_route(RouteRecord {
             tenant_id: "t1".into(),
@@ -611,7 +616,10 @@ async fn replicated_dist_list_session_routes_deduplicates_index_records() {
         engine: engine.clone(),
         ..RecordingKvRangeExecutor::default()
     });
-    let dist = ReplicatedDistHandle::from_router_executor(router, executor.clone());
+    let dist = ReplicatedDistHandle::new(Arc::new(RoutedRangeDataClient::new(
+        router,
+        executor.clone(),
+    )));
     dist.add_route(RouteRecord {
         tenant_id: "t1".into(),
         topic_filter: "devices/+/state".into(),
@@ -745,13 +753,13 @@ async fn dist_maintenance_worker_refreshes_tenant_cache() {
         ))
         .await
         .unwrap();
-    let dist = Arc::new(ReplicatedDistHandle::from_router_executor(
+    let dist = Arc::new(ReplicatedDistHandle::new(Arc::new(RoutedRangeDataClient::new(
         router,
         Arc::new(RecordingKvRangeExecutor {
             engine: engine.clone(),
             ..RecordingKvRangeExecutor::default()
         }),
-    ));
+    ))));
     dist.add_route(RouteRecord {
         tenant_id: "t1".into(),
         topic_filter: "devices/#".into(),
@@ -983,12 +991,12 @@ async fn replicated_dist_routes_and_matches_topics_over_kv_ranges() {
         .await
         .unwrap();
 
-    let dist = ReplicatedDistHandle::from_router_executor(
+    let dist = ReplicatedDistHandle::new(Arc::new(RoutedRangeDataClient::new(
         router,
         Arc::new(LocalKvRangeExecutor {
             engine: engine.clone(),
         }),
-    );
+    )));
     dist.add_route(RouteRecord {
         tenant_id: "t1".into(),
         topic_filter: "alerts/door".into(),
@@ -1059,12 +1067,12 @@ async fn replicated_dist_reapplying_same_route_keeps_single_record() {
         ))
         .await
         .unwrap();
-    let dist = ReplicatedDistHandle::from_router_executor(
+    let dist = ReplicatedDistHandle::new(Arc::new(RoutedRangeDataClient::new(
         router,
         Arc::new(LocalKvRangeExecutor {
             engine: engine.clone(),
         }),
-    );
+    )));
     let route = RouteRecord {
         tenant_id: "t1".into(),
         topic_filter: "devices/+/state".into(),

@@ -11,4 +11,5 @@ bytes.workspace = true
 greenmqtt-core = { path = "../greenmqtt-core" }
 greenmqtt-kv-client = { path = "../greenmqtt-kv-client" }
 greenmqtt-kv-engine = { path = "../greenmqtt-kv-engine" }
+greenmqtt-retain = { path = "../greenmqtt-retain" }
 greenmqtt-rpc = { path = "../greenmqtt-rpc" }

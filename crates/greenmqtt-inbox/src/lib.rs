@@ -4,9 +4,7 @@ use greenmqtt_core::{
     InflightMessage, InflightPhase, OfflineMessage, PublishProperties, PublishRequest,
     RangeBoundary, ServiceShardKey, ServiceShardKind, SessionId, Subscription,
 };
-use greenmqtt_kv_client::{
-    KvRangeExecutor, KvRangeRouter, RangeDataClient, RoutedRangeDataClient,
-};
+use greenmqtt_kv_client::RangeDataClient;
 use greenmqtt_kv_engine::KvMutation;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,6 +16,18 @@ use tokio::task::JoinHandle;
 pub trait InboxService: Send + Sync {
     async fn attach(&self, session_id: &SessionId) -> anyhow::Result<()>;
     async fn detach(&self, session_id: &SessionId) -> anyhow::Result<()>;
+    async fn attach_batch(&self, session_ids: &[SessionId]) -> anyhow::Result<()> {
+        for session_id in session_ids {
+            self.attach(session_id).await?;
+        }
+        Ok(())
+    }
+    async fn detach_batch(&self, session_ids: &[SessionId]) -> anyhow::Result<()> {
+        for session_id in session_ids {
+            self.detach(session_id).await?;
+        }
+        Ok(())
+    }
     async fn register_delayed_lwt(
         &self,
         generation: u64,
@@ -255,6 +265,16 @@ pub trait InboxService: Send + Sync {
         }
         Ok(())
     }
+    async fn fetch_batch(
+        &self,
+        session_ids: &[SessionId],
+    ) -> anyhow::Result<BTreeMap<SessionId, Vec<OfflineMessage>>> {
+        let mut fetched = BTreeMap::new();
+        for session_id in session_ids {
+            fetched.insert(session_id.clone(), self.fetch(session_id).await?);
+        }
+        Ok(fetched)
+    }
     async fn list_subscriptions(&self, session_id: &SessionId)
         -> anyhow::Result<Vec<Subscription>>;
     async fn list_tenant_subscriptions(
@@ -324,6 +344,13 @@ pub trait InboxService: Send + Sync {
         }
         Ok(())
     }
+    async fn commit_batch(&self, commits: &[InboxInflightCommit]) -> anyhow::Result<()> {
+        for commit in commits {
+            self.ack_inflight_batch(&commit.session_id, &commit.packet_ids)
+                .await?;
+        }
+        Ok(())
+    }
     async fn promote_inflight_release(
         &self,
         session_id: &SessionId,
@@ -371,6 +398,31 @@ pub trait InboxService: Send + Sync {
     async fn subscription_count(&self) -> anyhow::Result<usize>;
     async fn offline_count(&self) -> anyhow::Result<usize>;
     async fn inflight_count(&self) -> anyhow::Result<usize>;
+    async fn subscribe_batch(&self, subscriptions: Vec<Subscription>) -> anyhow::Result<()> {
+        for subscription in subscriptions {
+            self.subscribe(subscription).await?;
+        }
+        Ok(())
+    }
+    async fn unsubscribe_batch(
+        &self,
+        requests: &[InboxUnsubscribeSpec],
+    ) -> anyhow::Result<usize> {
+        let mut removed = 0usize;
+        for request in requests {
+            if self
+                .unsubscribe_shared(
+                    &request.session_id,
+                    &request.topic_filter,
+                    request.shared_group.as_deref(),
+                )
+                .await?
+            {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
     async fn expire_messages(&self, now_ms: u64) -> anyhow::Result<InboxExpiryStats> {
         let _ = now_ms;
         Ok(InboxExpiryStats::default())
@@ -667,37 +719,22 @@ impl InboxBatchScheduler {
     }
 
     pub async fn attach_all(&self, session_ids: &[SessionId]) -> anyhow::Result<()> {
-        for session_id in session_ids {
-            self.inbox.attach(session_id).await?;
-        }
-        Ok(())
+        self.inbox.attach_batch(session_ids).await
     }
 
     pub async fn detach_all(&self, session_ids: &[SessionId]) -> anyhow::Result<()> {
-        for session_id in session_ids {
-            self.inbox.detach(session_id).await?;
-        }
-        Ok(())
+        self.inbox.detach_batch(session_ids).await
     }
 
     pub async fn fetch_all(
         &self,
         session_ids: &[SessionId],
     ) -> anyhow::Result<BTreeMap<SessionId, Vec<OfflineMessage>>> {
-        let mut fetched = BTreeMap::new();
-        for session_id in session_ids {
-            fetched.insert(session_id.clone(), self.inbox.fetch(session_id).await?);
-        }
-        Ok(fetched)
+        self.inbox.fetch_batch(session_ids).await
     }
 
     pub async fn commit_all(&self, commits: &[InboxInflightCommit]) -> anyhow::Result<()> {
-        for commit in commits {
-            self.inbox
-                .ack_inflight_batch(&commit.session_id, &commit.packet_ids)
-                .await?;
-        }
-        Ok(())
+        self.inbox.commit_batch(commits).await
     }
 
     pub async fn insert_all(&self, messages: Vec<OfflineMessage>) -> anyhow::Result<()> {
@@ -705,31 +742,14 @@ impl InboxBatchScheduler {
     }
 
     pub async fn subscribe_all(&self, subscriptions: Vec<Subscription>) -> anyhow::Result<()> {
-        for subscription in subscriptions {
-            self.inbox.subscribe(subscription).await?;
-        }
-        Ok(())
+        self.inbox.subscribe_batch(subscriptions).await
     }
 
     pub async fn unsubscribe_all(
         &self,
         requests: &[InboxUnsubscribeSpec],
     ) -> anyhow::Result<usize> {
-        let mut removed = 0usize;
-        for request in requests {
-            if self
-                .inbox
-                .unsubscribe_shared(
-                    &request.session_id,
-                    &request.topic_filter,
-                    request.shared_group.as_deref(),
-                )
-                .await?
-            {
-                removed += 1;
-            }
-        }
-        Ok(removed)
+        self.inbox.unsubscribe_batch(requests).await
     }
 }
 
@@ -860,13 +880,6 @@ impl ReplicatedInboxHandle {
             active_sessions: Arc::new(RwLock::new(HashMap::new())),
             delayed_lwts: Arc::new(RwLock::new(HashMap::new())),
         }
-    }
-
-    pub fn from_router_executor(
-        router: Arc<dyn KvRangeRouter>,
-        executor: Arc<dyn KvRangeExecutor>,
-    ) -> Self {
-        Self::new(Arc::new(RoutedRangeDataClient::new(router, executor)))
     }
 
     async fn remove_offline_messages(&self, messages: &[OfflineMessage]) -> anyhow::Result<usize> {
@@ -1169,6 +1182,28 @@ impl InboxService for ReplicatedInboxHandle {
         Ok(())
     }
 
+    async fn attach_batch(&self, session_ids: &[SessionId]) -> anyhow::Result<()> {
+        let mut guard = self
+            .active_sessions
+            .write()
+            .expect("replicated inbox poisoned");
+        for session_id in session_ids {
+            guard.insert(session_id.clone(), true);
+        }
+        Ok(())
+    }
+
+    async fn detach_batch(&self, session_ids: &[SessionId]) -> anyhow::Result<()> {
+        let mut guard = self
+            .active_sessions
+            .write()
+            .expect("replicated inbox poisoned");
+        for session_id in session_ids {
+            guard.insert(session_id.clone(), false);
+        }
+        Ok(())
+    }
+
     async fn register_delayed_lwt(
         &self,
         generation: u64,
@@ -1329,6 +1364,27 @@ impl InboxService for ReplicatedInboxHandle {
             .await
     }
 
+    async fn subscribe_batch(&self, subscriptions: Vec<Subscription>) -> anyhow::Result<()> {
+        let mut grouped: BTreeMap<String, Vec<KvMutation>> = BTreeMap::new();
+        for subscription in subscriptions {
+            let range_id = self
+                .inbox_range_id_for_tenant(&subscription.tenant_id)
+                .await?;
+            grouped.entry(range_id).or_default().push(KvMutation {
+                key: subscription_key(
+                    &subscription.session_id,
+                    &subscription.topic_filter,
+                    subscription.shared_group.as_deref(),
+                ),
+                value: Some(encode_subscription(&subscription)?),
+            });
+        }
+        for (range_id, mutations) in grouped {
+            self.client.apply(&range_id, mutations).await?;
+        }
+        Ok(())
+    }
+
     async fn unsubscribe(
         &self,
         session_id: &SessionId,
@@ -1365,6 +1421,42 @@ impl InboxService for ReplicatedInboxHandle {
         Ok(true)
     }
 
+    async fn unsubscribe_batch(
+        &self,
+        requests: &[InboxUnsubscribeSpec],
+    ) -> anyhow::Result<usize> {
+        let mut grouped: BTreeMap<String, Vec<KvMutation>> = BTreeMap::new();
+        let mut removed = 0usize;
+        for request in requests {
+            let Some(subscription) = self
+                .lookup_subscription(
+                    &request.session_id,
+                    &request.topic_filter,
+                    request.shared_group.as_deref(),
+                )
+                .await?
+            else {
+                continue;
+            };
+            let range_id = self
+                .inbox_range_id_for_tenant(&subscription.tenant_id)
+                .await?;
+            grouped.entry(range_id).or_default().push(KvMutation {
+                key: subscription_key(
+                    &request.session_id,
+                    &request.topic_filter,
+                    request.shared_group.as_deref(),
+                ),
+                value: None,
+            });
+            removed += 1;
+        }
+        for (range_id, mutations) in grouped {
+            self.client.apply(&range_id, mutations).await?;
+        }
+        Ok(removed)
+    }
+
     async fn lookup_subscription(
         &self,
         session_id: &SessionId,
@@ -1391,6 +1483,22 @@ impl InboxService for ReplicatedInboxHandle {
                 }],
             )
             .await
+    }
+
+    async fn enqueue_batch(&self, messages: Vec<OfflineMessage>) -> anyhow::Result<()> {
+        let mut grouped: BTreeMap<String, Vec<KvMutation>> = BTreeMap::new();
+        for message in messages {
+            let range_id = self.inbox_range_id_for_tenant(&message.tenant_id).await?;
+            let seq = self.next_offline_seq().await?;
+            grouped.entry(range_id).or_default().push(KvMutation {
+                key: offline_key(&message.session_id, seq),
+                value: Some(encode_offline(&message)?),
+            });
+        }
+        for (range_id, mutations) in grouped {
+            self.client.apply(&range_id, mutations).await?;
+        }
+        Ok(())
     }
 
     async fn list_subscriptions(
@@ -1508,6 +1616,23 @@ impl InboxService for ReplicatedInboxHandle {
                 }],
             )
             .await
+    }
+
+    async fn stage_inflight_batch(&self, messages: Vec<InflightMessage>) -> anyhow::Result<()> {
+        let mut grouped: BTreeMap<String, Vec<KvMutation>> = BTreeMap::new();
+        for message in messages {
+            let range_id = self
+                .inflight_range_id_for_tenant(&message.tenant_id)
+                .await?;
+            grouped.entry(range_id).or_default().push(KvMutation {
+                key: inflight_key(&message.session_id, message.packet_id),
+                value: Some(encode_inflight(&message)?),
+            });
+        }
+        for (range_id, mutations) in grouped {
+            self.client.apply(&range_id, mutations).await?;
+        }
+        Ok(())
     }
 
     async fn ack_inflight(&self, session_id: &SessionId, packet_id: u16) -> anyhow::Result<()> {

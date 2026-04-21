@@ -22,7 +22,7 @@ use greenmqtt_core::{
 use greenmqtt_dist::{DistHandle, DistRouter};
 use greenmqtt_inbox::PersistentInboxHandle;
 use greenmqtt_inbox::{DelayedLwtPublish, DelayedLwtSink, InboxHandle, InboxService};
-use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter, MemoryKvRangeRouter};
+use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter, MemoryKvRangeRouter, RoutedRangeDataClient};
 use greenmqtt_kv_engine::{
     KvEngine, KvMutation, KvRangeBootstrap, KvRangeSpace, MemoryKvEngine, RocksDbKvEngine,
 };
@@ -2203,9 +2203,10 @@ async fn grpc_round_trip_for_range_control_service() {
         .await
         .unwrap();
     client
-        .transfer_leadership("range-control", 2)
+        .change_replicas("range-control", vec![1, 2], Vec::new())
         .await
         .unwrap();
+    client.transfer_leadership("range-control", 1).await.unwrap();
     client.recover_range("range-control", 1).await.unwrap();
 
     let (left, right) = client
@@ -2908,7 +2909,9 @@ async fn replicated_retain_can_use_kv_range_grpc_executor() {
             .await
             .unwrap(),
     );
-    let retain = ReplicatedRetainHandle::new(router, executor);
+    let retain = ReplicatedRetainHandle::new(Arc::new(RoutedRangeDataClient::new(
+        router, executor,
+    )));
 
     retain
         .retain(RetainedMessage {

@@ -1,9 +1,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use greenmqtt_core::{ClientIdentity, Lifecycle, ServiceShardKey, ServiceShardKind, SessionRecord};
-use greenmqtt_kv_client::{
-    KvRangeExecutor, KvRangeRouter, RangeDataClient, RoutedRangeDataClient,
-};
+use greenmqtt_kv_client::RangeDataClient;
 use greenmqtt_kv_engine::KvMutation;
 use greenmqtt_storage::SessionStore;
 use std::collections::BTreeMap;
@@ -30,6 +28,47 @@ pub trait SessionDirectory: Send + Sync {
     }
     async fn list_sessions(&self, tenant_id: Option<&str>) -> anyhow::Result<Vec<SessionRecord>>;
     async fn session_count(&self) -> anyhow::Result<usize>;
+    async fn session_exists_many(
+        &self,
+        session_ids: &[String],
+    ) -> anyhow::Result<BTreeMap<String, bool>> {
+        let known = self
+            .list_sessions(None)
+            .await?
+            .into_iter()
+            .map(|record| record.session_id)
+            .collect::<HashSet<_>>();
+        Ok(session_ids
+            .iter()
+            .map(|session_id| (session_id.clone(), known.contains(session_id)))
+            .collect())
+    }
+    async fn identity_exists_many(
+        &self,
+        identities: &[ClientIdentity],
+    ) -> anyhow::Result<BTreeMap<(String, String, String), bool>> {
+        let mut grouped: BTreeMap<String, Vec<&ClientIdentity>> = BTreeMap::new();
+        for identity in identities {
+            grouped
+                .entry(identity.tenant_id.clone())
+                .or_default()
+                .push(identity);
+        }
+        let mut results = BTreeMap::new();
+        for (tenant_id, identities) in grouped {
+            let known = self
+                .list_sessions(Some(&tenant_id))
+                .await?
+                .into_iter()
+                .map(|record| SessionDictHandle::identity_key(&record.identity))
+                .collect::<HashSet<_>>();
+            for identity in identities {
+                let key = SessionDictHandle::identity_key(identity);
+                results.insert(key.clone(), known.contains(&key));
+            }
+        }
+        Ok(results)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -350,45 +389,14 @@ impl SessionOnlineCheckScheduler {
         &self,
         session_ids: &[String],
     ) -> anyhow::Result<BTreeMap<String, bool>> {
-        let known = self
-            .directory
-            .list_sessions(None)
-            .await?
-            .into_iter()
-            .map(|record| record.session_id)
-            .collect::<HashSet<_>>();
-        Ok(session_ids
-            .iter()
-            .map(|session_id| (session_id.clone(), known.contains(session_id)))
-            .collect())
+        self.directory.session_exists_many(session_ids).await
     }
 
     pub async fn check_identities(
         &self,
         identities: &[ClientIdentity],
     ) -> anyhow::Result<BTreeMap<(String, String, String), bool>> {
-        let mut grouped: BTreeMap<String, Vec<&ClientIdentity>> = BTreeMap::new();
-        for identity in identities {
-            grouped
-                .entry(identity.tenant_id.clone())
-                .or_default()
-                .push(identity);
-        }
-        let mut results = BTreeMap::new();
-        for (tenant_id, identities) in grouped {
-            let known = self
-                .directory
-                .list_sessions(Some(&tenant_id))
-                .await?
-                .into_iter()
-                .map(|record| SessionDictHandle::identity_key(&record.identity))
-                .collect::<HashSet<_>>();
-            for identity in identities {
-                let key = SessionDictHandle::identity_key(identity);
-                results.insert(key.clone(), known.contains(&key));
-            }
-        }
-        Ok(results)
+        self.directory.identity_exists_many(identities).await
     }
 }
 
@@ -458,13 +466,6 @@ impl ReplicatedSessionDictHandle {
             session_cache: Arc::new(RwLock::new(HashMap::new())),
             session_range_cache: Arc::new(RwLock::new(HashMap::new())),
         }
-    }
-
-    pub fn from_router_executor(
-        router: Arc<dyn KvRangeRouter>,
-        executor: Arc<dyn KvRangeExecutor>,
-    ) -> Self {
-        Self::new(Arc::new(RoutedRangeDataClient::new(router, executor)))
     }
 
     async fn tenant_routes(
@@ -1047,7 +1048,9 @@ mod tests {
         ReplicatedRangeDescriptor, ServiceShardKey, ServiceShardLifecycle, SessionKind,
         SessionRecord,
     };
-    use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter, MemoryKvRangeRouter};
+    use greenmqtt_kv_client::{
+        KvRangeExecutor, KvRangeRouter, MemoryKvRangeRouter, RoutedRangeDataClient,
+    };
     use greenmqtt_kv_engine::{
         KvEngine, KvMutation, KvRangeBootstrap, KvRangeCheckpoint, KvRangeSnapshot, MemoryKvEngine,
     };
@@ -1256,12 +1259,12 @@ mod tests {
             ))
             .await
             .unwrap();
-        let service = ReplicatedSessionDictHandle::from_router_executor(
+        let service = ReplicatedSessionDictHandle::new(Arc::new(RoutedRangeDataClient::new(
             router,
             Arc::new(LocalKvRangeExecutor {
                 engine: engine.clone(),
             }),
-        );
+        )));
 
         let identity = ClientIdentity {
             tenant_id: "t1".into(),
@@ -1330,12 +1333,12 @@ mod tests {
             ))
             .await
             .unwrap();
-        let service = ReplicatedSessionDictHandle::from_router_executor(
+        let service = ReplicatedSessionDictHandle::new(Arc::new(RoutedRangeDataClient::new(
             router,
             Arc::new(LocalKvRangeExecutor {
                 engine: engine.clone(),
             }),
-        );
+        )));
         let identity = ClientIdentity {
             tenant_id: "t1".into(),
             user_id: "u1".into(),
@@ -1960,6 +1963,111 @@ mod tests {
         assert_eq!(directory.list_tenant_calls.load(Ordering::SeqCst), 2);
     }
 
+    #[derive(Default)]
+    struct BatchAwareDirectory {
+        session_many_calls: AtomicUsize,
+        identity_many_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl SessionDirectory for BatchAwareDirectory {
+        async fn register(&self, _record: SessionRecord) -> anyhow::Result<Option<SessionRecord>> {
+            Ok(None)
+        }
+
+        async fn unregister(
+            &self,
+            _session_id: &str,
+        ) -> anyhow::Result<Option<SessionRecord>> {
+            Ok(None)
+        }
+
+        async fn lookup_identity(
+            &self,
+            _identity: &ClientIdentity,
+        ) -> anyhow::Result<Option<SessionRecord>> {
+            Ok(None)
+        }
+
+        async fn lookup_session(
+            &self,
+            _session_id: &str,
+        ) -> anyhow::Result<Option<SessionRecord>> {
+            Ok(None)
+        }
+
+        async fn list_sessions(
+            &self,
+            _tenant_id: Option<&str>,
+        ) -> anyhow::Result<Vec<SessionRecord>> {
+            anyhow::bail!("list_sessions should not be used")
+        }
+
+        async fn session_count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn session_exists_many(
+            &self,
+            session_ids: &[String],
+        ) -> anyhow::Result<BTreeMap<String, bool>> {
+            self.session_many_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(session_ids
+                .iter()
+                .map(|session_id| (session_id.clone(), session_id == "s1"))
+                .collect())
+        }
+
+        async fn identity_exists_many(
+            &self,
+            identities: &[ClientIdentity],
+        ) -> anyhow::Result<BTreeMap<(String, String, String), bool>> {
+            self.identity_many_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(identities
+                .iter()
+                .map(|identity| {
+                    (
+                        SessionDictHandle::identity_key(identity),
+                        identity.user_id == "u1",
+                    )
+                })
+                .collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn session_online_check_scheduler_prefers_batch_directory_hooks() {
+        let directory = Arc::new(BatchAwareDirectory::default());
+        let scheduler = SessionOnlineCheckScheduler::new(directory.clone());
+
+        let sessions = scheduler
+            .check_sessions(&["s1".into(), "missing".into()])
+            .await
+            .unwrap();
+        assert_eq!(sessions["s1"], true);
+        assert_eq!(sessions["missing"], false);
+        assert_eq!(directory.session_many_calls.load(Ordering::SeqCst), 1);
+
+        let identities = scheduler
+            .check_identities(&[
+                ClientIdentity {
+                    tenant_id: "t1".into(),
+                    user_id: "u1".into(),
+                    client_id: "c1".into(),
+                },
+                ClientIdentity {
+                    tenant_id: "t1".into(),
+                    user_id: "u2".into(),
+                    client_id: "c2".into(),
+                },
+            ])
+            .await
+            .unwrap();
+        assert_eq!(identities[&("t1".into(), "u1".into(), "c1".into())], true);
+        assert_eq!(identities[&("t1".into(), "u2".into(), "c2".into())], false);
+        assert_eq!(directory.identity_many_calls.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn persistent_sessiondict_recovers_large_tenant_population() {
         let store = Arc::new(MemorySessionStore::default());
@@ -2025,8 +2133,10 @@ mod tests {
             engine: engine.clone(),
             ..RecordingKvRangeExecutor::default()
         });
-        let service =
-            ReplicatedSessionDictHandle::from_router_executor(router.clone(), executor.clone());
+        let service = ReplicatedSessionDictHandle::new(Arc::new(RoutedRangeDataClient::new(
+            router.clone(),
+            executor.clone(),
+        )));
         let record = SessionRecord {
             session_id: "s1".into(),
             node_id: 1,
@@ -2042,7 +2152,10 @@ mod tests {
         service.register(record).await.unwrap();
         executor.get_calls.store(0, Ordering::SeqCst);
         executor.scan_calls.store(0, Ordering::SeqCst);
-        let cold = ReplicatedSessionDictHandle::from_router_executor(router, executor.clone());
+        let cold = ReplicatedSessionDictHandle::new(Arc::new(RoutedRangeDataClient::new(
+            router,
+            executor.clone(),
+        )));
 
         let loaded = cold.lookup_session("s1").await.unwrap().unwrap();
         assert_eq!(loaded.session_id, "s1");
@@ -2084,7 +2197,10 @@ mod tests {
             engine: engine.clone(),
             ..RecordingKvRangeExecutor::default()
         });
-        let service = ReplicatedSessionDictHandle::from_router_executor(router, executor.clone());
+        let service = ReplicatedSessionDictHandle::new(Arc::new(RoutedRangeDataClient::new(
+            router,
+            executor.clone(),
+        )));
         service
             .register(SessionRecord {
                 session_id: "s1".into(),

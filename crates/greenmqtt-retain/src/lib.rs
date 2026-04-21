@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use greenmqtt_core::{CompiledTopicFilter, Lifecycle, RetainedMessage, ServiceShardKey};
-use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter, RangeDataClient, RoutedRangeDataClient};
+use greenmqtt_kv_client::RangeDataClient;
 use greenmqtt_kv_engine::KvMutation;
 use greenmqtt_storage::RetainStore;
 use std::collections::{HashMap, HashSet};
@@ -247,13 +247,6 @@ impl ReplicatedRetainHandle {
             tenant_cache: Arc::new(RwLock::new(HashMap::new())),
             filter_cache: Arc::new(RwLock::new(HashMap::new())),
         }
-    }
-
-    pub fn from_router_executor(
-        router: Arc<dyn KvRangeRouter>,
-        executor: Arc<dyn KvRangeExecutor>,
-    ) -> Self {
-        Self::new(Arc::new(RoutedRangeDataClient::new(router, executor)))
     }
 
     fn invalidate_tenant_cache(&self, tenant_id: &str) {
@@ -852,7 +845,9 @@ mod tests {
         RangeBoundary, RangeReplica, ReplicaRole, ReplicaSyncState, ReplicatedRangeDescriptor,
         RetainedMessage, ServiceShardKey, ServiceShardLifecycle,
     };
-    use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter, MemoryKvRangeRouter};
+    use greenmqtt_kv_client::{
+        KvRangeExecutor, KvRangeRouter, MemoryKvRangeRouter, RoutedRangeDataClient,
+    };
     use greenmqtt_kv_engine::{
         KvEngine, KvMutation, KvRangeBootstrap, KvRangeCheckpoint, KvRangeSnapshot, MemoryKvEngine,
     };
@@ -1506,12 +1501,12 @@ mod tests {
             .await
             .unwrap();
 
-        let retain = ReplicatedRetainHandle::from_router_executor(
+        let retain = ReplicatedRetainHandle::new(Arc::new(RoutedRangeDataClient::new(
             router,
             Arc::new(LocalKvRangeExecutor {
                 engine: engine.clone(),
             }),
-        );
+        )));
         retain
             .retain(RetainedMessage {
                 tenant_id: "t1".into(),
@@ -1574,12 +1569,12 @@ mod tests {
             ))
             .await
             .unwrap();
-        let retain = ReplicatedRetainHandle::from_router_executor(
+        let retain = ReplicatedRetainHandle::new(Arc::new(RoutedRangeDataClient::new(
             router,
             Arc::new(LocalKvRangeExecutor {
                 engine: engine.clone(),
             }),
-        );
+        )));
 
         let message = RetainedMessage {
             tenant_id: "t1".into(),
@@ -1643,12 +1638,12 @@ mod tests {
             router.upsert(descriptor).await.unwrap();
         }
 
-        let retain = ReplicatedRetainHandle::from_router_executor(
+        let retain = ReplicatedRetainHandle::new(Arc::new(RoutedRangeDataClient::new(
             router.clone(),
             Arc::new(LocalKvRangeExecutor {
                 engine: engine.clone(),
             }),
-        );
+        )));
 
         for (topic, payload, qos) in [
             ("alerts/door", b"open".as_slice(), 1),
@@ -1796,12 +1791,12 @@ mod tests {
             .await
             .unwrap();
 
-        let retain = ReplicatedRetainHandle::from_router_executor(
+        let retain = ReplicatedRetainHandle::new(Arc::new(RoutedRangeDataClient::new(
             router.clone(),
             Arc::new(LocalKvRangeExecutor {
                 engine: engine.clone(),
             }),
-        );
+        )));
         retain
             .retain(RetainedMessage {
                 tenant_id: "t1".into(),
@@ -1887,12 +1882,12 @@ mod tests {
             ))
             .await
             .unwrap();
-        let retain = ReplicatedRetainHandle::from_router_executor(
+        let retain = ReplicatedRetainHandle::new(Arc::new(RoutedRangeDataClient::new(
             router,
             Arc::new(LocalKvRangeExecutor {
                 engine: engine.clone(),
             }),
-        );
+        )));
         for topic in ["alerts/a", "alerts/b"] {
             retain
                 .retain(RetainedMessage {
@@ -1975,12 +1970,14 @@ mod tests {
             ))
             .await
             .unwrap();
-        let retain = Arc::new(ReplicatedRetainHandle::from_router_executor(
-            router,
-            Arc::new(LocalKvRangeExecutor {
-                engine: engine.clone(),
-            }),
-        ));
+        let retain = Arc::new(ReplicatedRetainHandle::new(Arc::new(
+            RoutedRangeDataClient::new(
+                router,
+                Arc::new(LocalKvRangeExecutor {
+                    engine: engine.clone(),
+                }),
+            ),
+        )));
         retain
             .retain(RetainedMessage {
                 tenant_id: "t1".into(),

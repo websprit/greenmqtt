@@ -988,6 +988,7 @@ dependencies = [
  "greenmqtt-core",
  "greenmqtt-kv-client",
  "greenmqtt-kv-engine",
+ "greenmqtt-retain",
  "greenmqtt-rpc",
 ]
 

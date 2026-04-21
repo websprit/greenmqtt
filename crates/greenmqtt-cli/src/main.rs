@@ -13,6 +13,7 @@ use greenmqtt_core::{
 };
 use greenmqtt_dist::{
     DistBalanceAction, DistBalancePolicy, DistHandle, DistMaintenanceWorker, DistRouter,
+    DistRuntime,
     DistTenantStats, PersistentDistHandle, ReplicatedDistHandle, ThresholdDistBalancePolicy,
 };
 use greenmqtt_http_api::HttpApi;
@@ -26,7 +27,7 @@ use greenmqtt_kv_balance::{
     ControlPlaneRuntimeConfig, MetadataBalanceController,
 };
 use greenmqtt_kv_client::{
-    KvRangeExecutor, KvRangeRouter, LeaderRoutedKvRangeExecutor, RangeDataClient,
+    KvRangeExecutor, KvRangeRouter, LeaderRoutedKvRangeExecutor, RoutedRangeDataClient,
 };
 use greenmqtt_kv_engine::{
     KvEngine, KvMutation, KvRangeBootstrap, KvRangeCheckpoint, KvRangeSnapshot, RocksDbKvEngine,
@@ -35,7 +36,6 @@ use greenmqtt_kv_raft::{MemoryRaftNode, RaftNode};
 use greenmqtt_kv_server::{
     HostedRange, KvRangeHost, MemoryKvRangeHost, RangeLifecycleManager, ReplicaRuntime,
 };
-use greenmqtt_range_client::RemoteRangeClientBuilder;
 use greenmqtt_plugin_api::{
     current_listener_profile, AclAction, AclDecision, AclProvider, AclRule, AuthProvider,
     BridgeEventHook, BridgeRule, ConfiguredAcl, ConfiguredAuth, ConfiguredEventHook, EventHook,
@@ -4356,19 +4356,20 @@ async fn range_scoped_rocksdb_stack(
         64,
     ));
     Ok(LocalRangeRuntimeStack {
-        sessiondict: Arc::new(ReplicatedSessionDictHandle::from_router_executor(
+        sessiondict: Arc::new(ReplicatedSessionDictHandle::new(Arc::new(
+            RoutedRangeDataClient::new(router.clone(), executor.clone()),
+        ))),
+        dist: Arc::new(ReplicatedDistHandle::new(Arc::new(RoutedRangeDataClient::new(
             router.clone(),
             executor.clone(),
-        )),
-        dist: Arc::new(ReplicatedDistHandle::from_router_executor(
+        )))),
+        inbox: Arc::new(ReplicatedInboxHandle::new(Arc::new(RoutedRangeDataClient::new(
             router.clone(),
             executor.clone(),
-        )),
-        inbox: Arc::new(ReplicatedInboxHandle::from_router_executor(
-            router.clone(),
-            executor.clone(),
-        )),
-        retain: Arc::new(ReplicatedRetainHandle::from_router_executor(router, executor)),
+        )))),
+        retain: Arc::new(ReplicatedRetainHandle::new(Arc::new(
+            RoutedRangeDataClient::new(router, executor),
+        ))),
         range_host: host,
         range_runtime,
     })
@@ -4441,19 +4442,6 @@ async fn redis_services(
     ))
 }
 
-async fn replicated_range_data_client(
-    metadata_endpoint: &str,
-    range_endpoint: &str,
-) -> anyhow::Result<Arc<dyn RangeDataClient>> {
-    Ok(Arc::new(
-        RemoteRangeClientBuilder::new()
-            .metadata_endpoint(metadata_endpoint)
-            .range_endpoint(range_endpoint)
-            .build_data()
-            .await?,
-    ))
-}
-
 async fn configured_retain_service(
     default_retain: Arc<dyn RetainService>,
     state_endpoint: Option<&str>,
@@ -4461,10 +4449,9 @@ async fn configured_retain_service(
     match resolved_state_mode("GREENMQTT_RETAIN_MODE")? {
         StateMode::Legacy => Ok(default_retain),
         StateMode::Replicated => {
-            let (metadata_endpoint, range_endpoint) =
+            let (_metadata_endpoint, range_endpoint) =
                 resolved_replicated_endpoints(state_endpoint, "retain")?;
-            let client = replicated_range_data_client(&metadata_endpoint, &range_endpoint).await?;
-            Ok(Arc::new(ReplicatedRetainHandle::new(client)))
+            Ok(Arc::new(RetainGrpcClient::connect(range_endpoint).await?))
         }
     }
 }
@@ -4476,10 +4463,9 @@ async fn configured_dist_service(
     match resolved_state_mode("GREENMQTT_DIST_MODE")? {
         StateMode::Legacy => Ok(default_dist),
         StateMode::Replicated => {
-            let (metadata_endpoint, range_endpoint) =
+            let (_metadata_endpoint, range_endpoint) =
                 resolved_replicated_endpoints(state_endpoint, "dist")?;
-            let client = replicated_range_data_client(&metadata_endpoint, &range_endpoint).await?;
-            Ok(Arc::new(ReplicatedDistHandle::new(client)))
+            Ok(Arc::new(DistGrpcClient::connect(range_endpoint).await?))
         }
     }
 }
@@ -4632,18 +4618,17 @@ fn configured_dist_maintenance() -> anyhow::Result<Option<DistMaintenanceConfig>
 
 async fn replicated_dist_runtime_handle(
     state_endpoint: Option<&str>,
-) -> anyhow::Result<Option<Arc<ReplicatedDistHandle>>> {
+) -> anyhow::Result<Option<Arc<dyn DistRuntime>>> {
     if resolved_state_mode("GREENMQTT_DIST_MODE")? != StateMode::Replicated {
         return Ok(None);
     }
-    let (metadata_endpoint, range_endpoint) =
+    let (_metadata_endpoint, range_endpoint) =
         resolved_replicated_endpoints(state_endpoint, "dist")?;
-    let client = replicated_range_data_client(&metadata_endpoint, &range_endpoint).await?;
-    Ok(Some(Arc::new(ReplicatedDistHandle::new(client))))
+    Ok(Some(Arc::new(DistGrpcClient::connect(range_endpoint).await?)))
 }
 
 async fn run_dist_maintenance_tick(
-    dist: Arc<ReplicatedDistHandle>,
+    dist: Arc<dyn DistRuntime>,
     config: &DistMaintenanceConfig,
 ) -> anyhow::Result<Vec<DistBalanceAction>> {
     let worker = DistMaintenanceWorker::new(dist.clone());
@@ -4671,7 +4656,7 @@ async fn run_dist_maintenance_tick(
 
 fn spawn_dist_maintenance_task(
     tasks: &mut JoinSet<anyhow::Result<()>>,
-    dist: Arc<ReplicatedDistHandle>,
+    dist: Arc<dyn DistRuntime>,
     config: DistMaintenanceConfig,
 ) {
     tasks.spawn(async move {
@@ -4718,18 +4703,17 @@ fn configured_inbox_maintenance() -> anyhow::Result<Option<InboxMaintenanceConfi
 
 async fn replicated_inbox_runtime_handle(
     state_endpoint: Option<&str>,
-) -> anyhow::Result<Option<Arc<ReplicatedInboxHandle>>> {
+) -> anyhow::Result<Option<Arc<dyn InboxService>>> {
     if resolved_state_mode("GREENMQTT_INBOX_MODE")? != StateMode::Replicated {
         return Ok(None);
     }
-    let (metadata_endpoint, range_endpoint) =
+    let (_metadata_endpoint, range_endpoint) =
         resolved_replicated_endpoints(state_endpoint, "inbox")?;
-    let client = replicated_range_data_client(&metadata_endpoint, &range_endpoint).await?;
-    Ok(Some(Arc::new(ReplicatedInboxHandle::new(client))))
+    Ok(Some(Arc::new(InboxGrpcClient::connect(range_endpoint).await?)))
 }
 
 async fn run_inbox_maintenance_tick(
-    inbox: Arc<ReplicatedInboxHandle>,
+    inbox: Arc<dyn InboxService>,
     config: &InboxMaintenanceConfig,
 ) -> anyhow::Result<Vec<InboxBalanceAction>> {
     let mut stats = Vec::new();
@@ -4747,7 +4731,7 @@ async fn run_inbox_maintenance_tick(
 
 fn spawn_inbox_maintenance_task(
     tasks: &mut JoinSet<anyhow::Result<()>>,
-    inbox: Arc<ReplicatedInboxHandle>,
+    inbox: Arc<dyn InboxService>,
     config: InboxMaintenanceConfig,
 ) {
     tasks.spawn(async move {
@@ -4789,18 +4773,17 @@ fn configured_retain_maintenance() -> anyhow::Result<Option<RetainMaintenanceCon
 
 async fn replicated_retain_runtime_handle(
     state_endpoint: Option<&str>,
-) -> anyhow::Result<Option<Arc<ReplicatedRetainHandle>>> {
+) -> anyhow::Result<Option<Arc<dyn RetainService>>> {
     if resolved_state_mode("GREENMQTT_RETAIN_MODE")? != StateMode::Replicated {
         return Ok(None);
     }
-    let (metadata_endpoint, range_endpoint) =
+    let (_metadata_endpoint, range_endpoint) =
         resolved_replicated_endpoints(state_endpoint, "retain")?;
-    let client = replicated_range_data_client(&metadata_endpoint, &range_endpoint).await?;
-    Ok(Some(Arc::new(ReplicatedRetainHandle::new(client))))
+    Ok(Some(Arc::new(RetainGrpcClient::connect(range_endpoint).await?)))
 }
 
 async fn run_retain_maintenance_tick(
-    retain: Arc<ReplicatedRetainHandle>,
+    retain: Arc<dyn RetainService>,
     config: &RetainMaintenanceConfig,
 ) -> anyhow::Result<Vec<RetainBalanceAction>> {
     let mut stats = Vec::new();
@@ -4816,7 +4799,7 @@ async fn run_retain_maintenance_tick(
 
 fn spawn_retain_maintenance_task(
     tasks: &mut JoinSet<anyhow::Result<()>>,
-    retain: Arc<ReplicatedRetainHandle>,
+    retain: Arc<dyn RetainService>,
     config: RetainMaintenanceConfig,
 ) {
     tasks.spawn(async move {
@@ -4841,10 +4824,9 @@ async fn configured_sessiondict_service(
     match resolved_state_mode("GREENMQTT_SESSIONDICT_MODE")? {
         StateMode::Legacy => Ok(default_sessiondict),
         StateMode::Replicated => {
-            let (metadata_endpoint, range_endpoint) =
+            let (_metadata_endpoint, range_endpoint) =
                 resolved_replicated_endpoints(state_endpoint, "sessiondict")?;
-            let client = replicated_range_data_client(&metadata_endpoint, &range_endpoint).await?;
-            Ok(Arc::new(ReplicatedSessionDictHandle::new(client)))
+            Ok(Arc::new(SessionDictGrpcClient::connect(range_endpoint).await?))
         }
     }
 }
@@ -4856,10 +4838,9 @@ async fn configured_inbox_service(
     match resolved_state_mode("GREENMQTT_INBOX_MODE")? {
         StateMode::Legacy => Ok(default_inbox),
         StateMode::Replicated => {
-            let (metadata_endpoint, range_endpoint) =
+            let (_metadata_endpoint, range_endpoint) =
                 resolved_replicated_endpoints(state_endpoint, "inbox")?;
-            let client = replicated_range_data_client(&metadata_endpoint, &range_endpoint).await?;
-            Ok(Arc::new(ReplicatedInboxHandle::new(client)))
+            Ok(Arc::new(InboxGrpcClient::connect(range_endpoint).await?))
         }
     }
 }

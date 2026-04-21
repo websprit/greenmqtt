@@ -7,7 +7,7 @@ use super::{
     listener_specs_from_env, parse_acl_rules, parse_bench_scenario, parse_bench_scenarios,
     parse_bridge_rules, parse_compare_backends, parse_identity_matchers, parse_listener_specs,
     parse_topic_rewrite_rules, range_command_request, redis_services, render_range_lookup_text,
-    render_shard_response_text, replicated_range_clients, resolved_state_mode, run_bench,
+    render_shard_response_text, resolved_state_mode, run_bench,
     run_compare_bench, run_compare_soak, run_dist_maintenance_tick, run_inbox_maintenance_tick,
     run_profile_bench, run_retain_maintenance_tick, run_shard_command, run_soak,
     shard_command_request, validate_bench_report, validate_soak_report, BenchConfig, BenchReport,
@@ -37,6 +37,7 @@ use greenmqtt_plugin_api::{
     with_listener_profile, AclAction, AclDecision, AclProvider, AllowAllAcl, AllowAllAuth,
     AuthProvider, ConfiguredAcl, ConfiguredAuth, ConfiguredEventHook, EventHook, NoopEventHook,
 };
+use greenmqtt_range_client::{RemoteRangeClientBuilder, RemoteRetainRangeStore};
 use greenmqtt_retain::{
     retain_tenant_shard, ReplicatedRetainHandle, RetainBalanceAction, RetainHandle, RetainService,
     ThresholdRetainBalancePolicy,
@@ -898,11 +899,15 @@ fn dist_maintenance_tick_refreshes_routes_and_proposes_hot_tenant_actions() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let (router, executor) =
-            replicated_range_clients("http://127.0.0.1:50068", "http://127.0.0.1:50068")
+        let client = Arc::new(
+            RemoteRangeClientBuilder::new()
+                .metadata_endpoint("http://127.0.0.1:50068")
+                .range_endpoint("http://127.0.0.1:50068")
+                .build_data()
                 .await
-                .unwrap();
-        let dist = Arc::new(ReplicatedDistHandle::new(router, executor));
+                .unwrap(),
+        );
+        let dist = Arc::new(ReplicatedDistHandle::new(client));
         for (topic_filter, session_id, shared_group) in [
             ("devices/#", "s1", None),
             ("devices/+/state", "s2", Some("shared")),
@@ -1015,11 +1020,15 @@ fn inbox_maintenance_tick_expires_tenant_state_and_proposes_hot_tenant_actions()
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let (router, executor) =
-            replicated_range_clients("http://127.0.0.1:50069", "http://127.0.0.1:50069")
+        let client = Arc::new(
+            RemoteRangeClientBuilder::new()
+                .metadata_endpoint("http://127.0.0.1:50069")
+                .range_endpoint("http://127.0.0.1:50069")
+                .build_data()
                 .await
-                .unwrap();
-        let inbox = Arc::new(ReplicatedInboxHandle::new(router, executor));
+                .unwrap(),
+        );
+        let inbox = Arc::new(ReplicatedInboxHandle::new(client));
         inbox
             .subscribe(Subscription {
                 session_id: "s1".into(),
@@ -1165,11 +1174,12 @@ fn retain_maintenance_tick_refreshes_routes_and_proposes_hot_tenant_actions() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let (router, executor) =
-            replicated_range_clients("http://127.0.0.1:50070", "http://127.0.0.1:50070")
+        let store = Arc::new(
+            RemoteRetainRangeStore::connect("http://127.0.0.1:50070")
                 .await
-                .unwrap();
-        let retain = Arc::new(ReplicatedRetainHandle::new(router, executor));
+                .unwrap(),
+        );
+        let retain = Arc::new(ReplicatedRetainHandle::from_range_store(store));
         for topic in ["devices/a/state", "devices/b/state"] {
             retain
                 .retain(greenmqtt_core::RetainedMessage {

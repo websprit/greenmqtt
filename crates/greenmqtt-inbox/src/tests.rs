@@ -3,7 +3,7 @@ use super::{
     inflight_tenant_scan_shard, subscription_shard, DelayedLwtPublish, InboxBalanceAction,
     InboxBalancePolicy, InboxBatchScheduler, InboxDelayTaskRunner, InboxDelayedTask,
     InboxDelayedTaskHandler, InboxExpiryStats, InboxHandle, InboxInflightCommit, InboxLwtResult,
-    InboxMaintenanceWorker, InboxService, InboxTenantStats, InboxUnsubscribeSpec,
+    InboxMaintenanceWorker, InboxService, InboxTenantStats, InboxUnsubscribeSpec, DelayedLwtSink,
     PersistentInboxHandle, ReplicatedInboxHandle, TenantInboxGcRunner, ThresholdInboxBalancePolicy,
     OFFLINE_KEY_PREFIX,
 };
@@ -14,7 +14,9 @@ use greenmqtt_core::{
     RangeBoundary, RangeReplica, ReplicaRole, ReplicaSyncState, ReplicatedRangeDescriptor,
     ServiceShardKey, ServiceShardLifecycle, SessionId, SessionKind, Subscription,
 };
-use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter, MemoryKvRangeRouter};
+use greenmqtt_kv_client::{
+    KvRangeExecutor, KvRangeRouter, MemoryKvRangeRouter, RoutedRangeDataClient,
+};
 use greenmqtt_kv_engine::{
     KvEngine, KvMutation, KvRangeBootstrap, KvRangeCheckpoint, KvRangeSnapshot, MemoryKvEngine,
 };
@@ -22,6 +24,7 @@ use greenmqtt_storage::{
     InboxStore, InflightStore, MemoryInboxStore, MemoryInflightStore, MemorySubscriptionStore,
     SubscriptionStore,
 };
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -2121,12 +2124,12 @@ async fn replicated_inbox_handles_subscriptions_offline_and_inflight_over_kv_ran
         .await
         .unwrap();
 
-    let inbox = ReplicatedInboxHandle::from_router_executor(
+    let inbox = ReplicatedInboxHandle::new(Arc::new(RoutedRangeDataClient::new(
         router,
         Arc::new(LocalKvRangeExecutor {
             engine: engine.clone(),
         }),
-    );
+    )));
     let subscription = Subscription {
         session_id: "s1".into(),
         tenant_id: "t1".into(),
@@ -2216,7 +2219,10 @@ async fn replicated_inbox_resumes_offline_sequence_after_restart() {
     let executor = Arc::new(LocalKvRangeExecutor {
         engine: engine.clone(),
     });
-    let inbox = ReplicatedInboxHandle::from_router_executor(router.clone(), executor.clone());
+    let inbox = ReplicatedInboxHandle::new(Arc::new(RoutedRangeDataClient::new(
+        router.clone(),
+        executor.clone(),
+    )));
     inbox
         .enqueue(OfflineMessage {
             tenant_id: "t1".into(),
@@ -2232,7 +2238,9 @@ async fn replicated_inbox_resumes_offline_sequence_after_restart() {
         .unwrap();
     drop(inbox);
 
-    let reopened = ReplicatedInboxHandle::from_router_executor(router, executor);
+    let reopened = ReplicatedInboxHandle::new(Arc::new(RoutedRangeDataClient::new(
+        router, executor,
+    )));
     reopened
         .enqueue(OfflineMessage {
             tenant_id: "t1".into(),
@@ -2291,7 +2299,10 @@ async fn replicated_inbox_replaying_same_offline_mutation_is_idempotent() {
     let executor = Arc::new(LocalKvRangeExecutor {
         engine: engine.clone(),
     });
-    let inbox = ReplicatedInboxHandle::from_router_executor(router, executor.clone());
+    let inbox = ReplicatedInboxHandle::new(Arc::new(RoutedRangeDataClient::new(
+        router,
+        executor.clone(),
+    )));
     inbox
         .enqueue(OfflineMessage {
             tenant_id: "t1".into(),
@@ -2718,6 +2729,208 @@ async fn inbox_batch_scheduler_covers_attach_fetch_commit_insert_subscribe_and_u
         .unwrap();
 }
 
+#[derive(Default)]
+struct BatchAwareInbox {
+    attach_batch_calls: AtomicUsize,
+    detach_batch_calls: AtomicUsize,
+    fetch_batch_calls: AtomicUsize,
+    commit_batch_calls: AtomicUsize,
+    subscribe_batch_calls: AtomicUsize,
+    unsubscribe_batch_calls: AtomicUsize,
+}
+
+#[async_trait]
+impl InboxService for BatchAwareInbox {
+    async fn attach(&self, _session_id: &SessionId) -> anyhow::Result<()> {
+        anyhow::bail!("attach should not be used")
+    }
+
+    async fn detach(&self, _session_id: &SessionId) -> anyhow::Result<()> {
+        anyhow::bail!("detach should not be used")
+    }
+
+    async fn attach_batch(&self, _session_ids: &[SessionId]) -> anyhow::Result<()> {
+        self.attach_batch_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn detach_batch(&self, _session_ids: &[SessionId]) -> anyhow::Result<()> {
+        self.detach_batch_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn register_delayed_lwt(
+        &self,
+        _generation: u64,
+        _publish: DelayedLwtPublish,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn clear_delayed_lwt(&self, _session_id: &SessionId) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn send_delayed_lwt(
+        &self,
+        _session_id: &SessionId,
+        _generation: u64,
+        _sink: &dyn DelayedLwtSink,
+    ) -> anyhow::Result<InboxLwtResult> {
+        Ok(InboxLwtResult::NoLwt)
+    }
+
+    async fn purge_session(&self, _session_id: &SessionId) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn subscribe(&self, _subscription: Subscription) -> anyhow::Result<()> {
+        anyhow::bail!("subscribe should not be used")
+    }
+
+    async fn subscribe_batch(&self, _subscriptions: Vec<Subscription>) -> anyhow::Result<()> {
+        self.subscribe_batch_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn unsubscribe(
+        &self,
+        _session_id: &SessionId,
+        _topic_filter: &str,
+    ) -> anyhow::Result<bool> {
+        anyhow::bail!("unsubscribe should not be used")
+    }
+
+    async fn unsubscribe_shared(
+        &self,
+        _session_id: &SessionId,
+        _topic_filter: &str,
+        _shared_group: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        anyhow::bail!("unsubscribe_shared should not be used")
+    }
+
+    async fn unsubscribe_batch(
+        &self,
+        _requests: &[InboxUnsubscribeSpec],
+    ) -> anyhow::Result<usize> {
+        self.unsubscribe_batch_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(1)
+    }
+
+    async fn enqueue(&self, _message: OfflineMessage) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn enqueue_batch(&self, _messages: Vec<OfflineMessage>) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn fetch_batch(
+        &self,
+        session_ids: &[SessionId],
+    ) -> anyhow::Result<BTreeMap<SessionId, Vec<OfflineMessage>>> {
+        self.fetch_batch_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(session_ids
+            .iter()
+            .map(|session_id| (session_id.clone(), Vec::new()))
+            .collect())
+    }
+
+    async fn list_subscriptions(&self, _session_id: &SessionId) -> anyhow::Result<Vec<Subscription>> {
+        Ok(Vec::new())
+    }
+
+    async fn list_all_subscriptions(&self) -> anyhow::Result<Vec<Subscription>> {
+        Ok(Vec::new())
+    }
+
+    async fn peek(&self, _session_id: &SessionId) -> anyhow::Result<Vec<OfflineMessage>> {
+        Ok(Vec::new())
+    }
+
+    async fn list_all_offline(&self) -> anyhow::Result<Vec<OfflineMessage>> {
+        Ok(Vec::new())
+    }
+
+    async fn fetch(&self, _session_id: &SessionId) -> anyhow::Result<Vec<OfflineMessage>> {
+        anyhow::bail!("fetch should not be used")
+    }
+
+    async fn stage_inflight(&self, _message: InflightMessage) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn stage_inflight_batch(&self, _messages: Vec<InflightMessage>) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn commit_batch(&self, _commits: &[InboxInflightCommit]) -> anyhow::Result<()> {
+        self.commit_batch_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn ack_inflight(&self, _session_id: &SessionId, _packet_id: u16) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn ack_inflight_batch(
+        &self,
+        _session_id: &SessionId,
+        _packet_ids: &[u16],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn fetch_inflight(&self, _session_id: &SessionId) -> anyhow::Result<Vec<InflightMessage>> {
+        Ok(Vec::new())
+    }
+
+    async fn list_all_inflight(&self) -> anyhow::Result<Vec<InflightMessage>> {
+        Ok(Vec::new())
+    }
+
+    async fn subscription_count(&self) -> anyhow::Result<usize> {
+        Ok(0)
+    }
+
+    async fn offline_count(&self) -> anyhow::Result<usize> {
+        Ok(0)
+    }
+
+    async fn inflight_count(&self) -> anyhow::Result<usize> {
+        Ok(0)
+    }
+}
+
+#[tokio::test]
+async fn inbox_batch_scheduler_prefers_batch_inbox_hooks() {
+    let batch = Arc::new(BatchAwareInbox::default());
+    let inbox: Arc<dyn InboxService> = batch.clone();
+    let scheduler = InboxBatchScheduler::new(inbox);
+
+    scheduler.attach_all(&["s1".into()]).await.unwrap();
+    scheduler.detach_all(&["s1".into()]).await.unwrap();
+    let _ = scheduler.fetch_all(&["s1".into()]).await.unwrap();
+    scheduler
+        .commit_all(&[InboxInflightCommit {
+            session_id: "s1".into(),
+            packet_ids: vec![1],
+        }])
+        .await
+        .unwrap();
+    scheduler.subscribe_all(Vec::new()).await.unwrap();
+    let removed = scheduler.unsubscribe_all(&[]).await.unwrap();
+
+    assert_eq!(batch.attach_batch_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(batch.detach_batch_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(batch.fetch_batch_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(batch.commit_batch_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(batch.subscribe_batch_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(batch.unsubscribe_batch_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(removed, 1);
+}
+
 #[test]
 fn threshold_inbox_balance_policy_proposes_actions_for_hot_tenant() {
     let policy = ThresholdInboxBalancePolicy {
@@ -2961,7 +3174,10 @@ async fn replicated_inbox_uses_prefix_scans_and_exact_gets_for_session_paths() {
         engine: engine.clone(),
         ..RecordingKvRangeExecutor::default()
     });
-    let inbox = ReplicatedInboxHandle::from_router_executor(router, executor.clone());
+    let inbox = ReplicatedInboxHandle::new(Arc::new(RoutedRangeDataClient::new(
+        router,
+        executor.clone(),
+    )));
 
     inbox
         .subscribe(Subscription {
@@ -3131,7 +3347,9 @@ async fn replicated_qos2_release_transition_is_idempotent() {
     let executor = Arc::new(LocalKvRangeExecutor {
         engine: engine.clone(),
     });
-    let inbox = ReplicatedInboxHandle::from_router_executor(router, executor);
+    let inbox = ReplicatedInboxHandle::new(Arc::new(RoutedRangeDataClient::new(
+        router, executor,
+    )));
 
     inbox
         .stage_inflight(InflightMessage {

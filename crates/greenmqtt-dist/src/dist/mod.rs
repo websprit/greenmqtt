@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use greenmqtt_core::RangeBoundary;
 use greenmqtt_core::{dedupe_sessions, PublishOutcome, PublishRequest, RouteRecord, TopicName};
-use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter, RangeDataClient, RoutedRangeDataClient};
+use greenmqtt_kv_client::RangeDataClient;
 pub use handle::{dist_route_shard, dist_tenant_shard, DistHandle};
 pub(crate) use handle::{
     exact_topic_loaded, insert_tenant_route, remove_tenant_route, retain_tenant_routes,
@@ -32,13 +32,6 @@ impl ReplicatedDistHandle {
             client,
             tenant_wildcard_cache: Arc::new(RwLock::new(HashMap::new())),
         }
-    }
-
-    pub fn from_router_executor(
-        router: Arc<dyn KvRangeRouter>,
-        executor: Arc<dyn KvRangeExecutor>,
-    ) -> Self {
-        Self::new(Arc::new(RoutedRangeDataClient::new(router, executor)))
     }
 
     async fn tenant_ranges(

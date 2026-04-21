@@ -1,7 +1,7 @@
 use super::*;
 use async_trait::async_trait;
 use greenmqtt_broker::{DeliverySink, PeerForwarder};
-use greenmqtt_dist::DistRouter;
+use greenmqtt_dist::{DistMaintenance, DistRouter};
 use greenmqtt_inbox::InboxService;
 use greenmqtt_kv_server::ReplicaTransport;
 use greenmqtt_retain::RetainService as RetainStoreService;
@@ -83,6 +83,20 @@ impl SessionDirectory for SessionDictGrpcClient {
         let mut client = self.inner.lock().await;
         let reply = client.count_sessions(()).await?.into_inner();
         Ok(reply.count as usize)
+    }
+
+    async fn session_exists_many(
+        &self,
+        session_ids: &[String],
+    ) -> anyhow::Result<BTreeMap<String, bool>> {
+        SessionDictGrpcClient::session_exists(self, session_ids).await
+    }
+
+    async fn identity_exists_many(
+        &self,
+        identities: &[ClientIdentity],
+    ) -> anyhow::Result<BTreeMap<(String, String, String), bool>> {
+        SessionDictGrpcClient::identity_exists(self, identities).await
     }
 }
 
@@ -210,6 +224,13 @@ impl DistRouter for DistGrpcClient {
         let mut client = self.inner.lock().await;
         let reply = client.count_routes(()).await?.into_inner();
         Ok(reply.count as usize)
+    }
+}
+
+#[async_trait]
+impl DistMaintenance for DistGrpcClient {
+    async fn refresh_tenant(&self, tenant_id: &str) -> anyhow::Result<usize> {
+        Ok(self.list_routes(Some(tenant_id)).await?.len())
     }
 }
 

@@ -24,12 +24,12 @@ Execution rules:
 - [x] T10 Migrate replicated sessiondict handle to facade
 - [x] T11 Migrate replicated dist handle to facade
 - [x] T12 Migrate replicated inbox handle to facade
-- [ ] T13 Add retain typed internal range RPC
-- [ ] T14 Add sessiondict typed internal range RPC
-- [ ] T15 Add dist typed internal range RPC
-- [ ] T16 Add inbox typed internal range RPC
-- [ ] T17 Replace simple loop schedulers with range-aware batching
-- [ ] T18 Remove obsolete primitive paths and harden tests
+- [x] T13 Add retain typed internal range RPC
+- [x] T14 Add sessiondict typed internal range RPC
+- [x] T15 Add dist typed internal range RPC
+- [x] T16 Add inbox typed internal range RPC
+- [x] T17 Replace simple loop schedulers with range-aware batching
+- [x] T18 Remove obsolete primitive paths and harden tests
 
 ## T01 Create crate and module boundaries
 
@@ -434,7 +434,7 @@ Validation:
 
 ## T12 Migrate replicated inbox handle to facade
 
-Status: `in progress`
+Status: `done`
 
 Goal:
 Make inbox depend on the unified data client rather than raw router/executor pair.
@@ -468,7 +468,7 @@ Validation:
 
 ## T13 Add retain typed internal range RPC
 
-Status: `todo`
+Status: `done`
 
 Goal:
 Move retain match/write logic from client-side primitive composition into a typed internal service.
@@ -510,7 +510,7 @@ Validation:
 
 ## T14 Add sessiondict typed internal range RPC
 
-Status: `todo`
+Status: `done`
 
 Goal:
 Move register/lookup/unregister logic from client-side primitive composition into a typed internal service.
@@ -552,7 +552,7 @@ Validation:
 
 ## T15 Add dist typed internal range RPC
 
-Status: `todo`
+Status: `done`
 
 Goal:
 Move route add/remove/match/list logic from primitive calls into a typed internal service.
@@ -594,7 +594,7 @@ Validation:
 
 ## T16 Add inbox typed internal range RPC
 
-Status: `todo`
+Status: `done`
 
 Goal:
 Move inbox fetch/ack/commit/expire logic from primitive scan-and-delete flows into a typed internal service.
@@ -636,7 +636,7 @@ Validation:
 
 ## T17 Replace simple loop schedulers with range-aware batching
 
-Status: `todo`
+Status: `done`
 
 Goal:
 Upgrade ad hoc loop schedulers to batch per range and per epoch.
