@@ -685,17 +685,20 @@ async fn inbox_rpc_supports_delayed_lwt_dispatch() {
         .await
         .unwrap();
     let reply = client
-        .send_lwt(1, DelayedLwtPublish {
-            tenant_id: "demo".into(),
-            session_id: "s1".into(),
-            publish: PublishRequest {
-                topic: "devices/lwt".into(),
-                payload: b"bye".to_vec().into(),
-                qos: 1,
-                retain: false,
-                properties: PublishProperties::default(),
+        .send_lwt(
+            1,
+            DelayedLwtPublish {
+                tenant_id: "demo".into(),
+                session_id: "s1".into(),
+                publish: PublishRequest {
+                    topic: "devices/lwt".into(),
+                    payload: b"bye".to_vec().into(),
+                    qos: 1,
+                    retain: false,
+                    properties: PublishProperties::default(),
+                },
             },
-        })
+        )
         .await
         .unwrap();
     assert_eq!(reply.code, "Ok");

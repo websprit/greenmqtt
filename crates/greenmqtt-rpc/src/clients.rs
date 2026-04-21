@@ -1040,10 +1040,7 @@ impl RetainGrpcClient {
             .into_inner())
     }
 
-    pub async fn tenant_gc_run(
-        &self,
-        tenant_id: &str,
-    ) -> anyhow::Result<RetainMaintenanceReply> {
+    pub async fn tenant_gc_run(&self, tenant_id: &str) -> anyhow::Result<RetainMaintenanceReply> {
         let mut client = self.inner.lock().await;
         Ok(client
             .tenant_gc_run(RetainTenantGcRequest {

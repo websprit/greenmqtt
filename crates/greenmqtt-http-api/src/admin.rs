@@ -1,8 +1,7 @@
 use async_trait::async_trait;
 use axum::{
     extract::{Path, Query, State},
-    Extension,
-    Json,
+    Extension, Json,
 };
 use greenmqtt_broker::{AdminAuditEntry, BrokerRuntime};
 use greenmqtt_core::{
@@ -280,7 +279,10 @@ where
     let Some(registry) = range_routing else {
         return Ok(Json(Vec::new()));
     };
-    let mut commands = registry.list_control_commands().await.map_err(ApiError::from)?;
+    let mut commands = registry
+        .list_control_commands()
+        .await
+        .map_err(ApiError::from)?;
     commands.retain(|record| matches_control_command_query(record, &query));
     Ok(Json(commands))
 }
@@ -394,7 +396,9 @@ where
         payload: BTreeMap::from([("parent_command_id".into(), record.command_id.clone())]),
         execution_state: ControlCommandExecutionState::TerminalFailed,
         reflection_state: ControlCommandReflectionState::Unreflected,
-        last_error: body.last_error.or_else(|| Some("manually marked terminal".into())),
+        last_error: body
+            .last_error
+            .or_else(|| Some("manually marked terminal".into())),
     };
     registry
         .upsert_control_command(failed.clone())
@@ -422,7 +426,10 @@ where
         return Ok(Json(PurgeReply { removed: 0 }));
     };
     let cutoff = current_time_ms().saturating_sub(query.older_than_ms);
-    let commands = registry.list_control_commands().await.map_err(ApiError::from)?;
+    let commands = registry
+        .list_control_commands()
+        .await
+        .map_err(ApiError::from)?;
     let mut removed = 0usize;
     for record in commands {
         if record.issued_at_ms < cutoff {

@@ -158,15 +158,7 @@ where
         range_routing: Option<Arc<dyn ControlPlaneRegistry>>,
         metrics: Option<PrometheusHandle>,
     ) -> Router {
-        Self::router_with_all(
-            broker,
-            peers,
-            shards,
-            range_routing,
-            None,
-            None,
-            metrics,
-        )
+        Self::router_with_all(broker, peers, shards, range_routing, None, None, metrics)
     }
 
     pub fn router_with_peers_shards_metrics_and_ranges(
@@ -227,7 +219,10 @@ where
                 post(super::shard::failover_shard),
             )
             .route("/v1/ranges", get(super::range::list_ranges))
-            .route("/v1/ranges/{range_id}", get(super::range::get_range).delete(super::range::retire_range))
+            .route(
+                "/v1/ranges/{range_id}",
+                get(super::range::get_range).delete(super::range::retire_range),
+            )
             .route("/v1/ranges/bootstrap", post(super::range::bootstrap_range))
             .route("/v1/ranges/merge", post(super::range::merge_ranges))
             .route("/v1/ranges/zombies", get(super::range::list_zombie_ranges))
@@ -247,13 +242,15 @@ where
                 "/v1/ranges/{range_id}/split",
                 post(super::range::split_range),
             )
-            .route("/v1/ranges/{range_id}/drain", post(super::range::drain_range))
+            .route(
+                "/v1/ranges/{range_id}/drain",
+                post(super::range::drain_range),
+            )
             .route("/v1/audit", get(super::admin::list_admin_audit))
             .route("/v1/rpc/services", get(super::admin::list_rpc_services))
             .route(
                 "/v1/rpc/services/{service}/rules",
-                get(super::admin::get_rpc_service_rules)
-                    .put(super::admin::put_rpc_service_rules),
+                get(super::admin::get_rpc_service_rules).put(super::admin::put_rpc_service_rules),
             )
             .route(
                 "/v1/rpc/services/{service}/landscape",

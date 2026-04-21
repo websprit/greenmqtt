@@ -2844,7 +2844,10 @@ async fn inbox_send_lwt_returns_typed_results() {
         InboxLwtResult::NoLwt
     );
 
-    inbox.register_delayed_lwt(1, publish.clone()).await.unwrap();
+    inbox
+        .register_delayed_lwt(1, publish.clone())
+        .await
+        .unwrap();
     assert_eq!(
         inbox_send_lwt(inbox.as_ref(), &session_id, 2, &RecordingLwtSink::default())
             .await
@@ -2892,7 +2895,10 @@ async fn inbox_send_lwt_returns_typed_results() {
             .unwrap(),
         InboxLwtResult::Ok
     );
-    assert_eq!(sink.sessions.lock().expect("sink poisoned").as_slice(), ["s1"]);
+    assert_eq!(
+        sink.sessions.lock().expect("sink poisoned").as_slice(),
+        ["s1"]
+    );
 }
 
 #[tokio::test]

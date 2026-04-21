@@ -200,7 +200,9 @@ where
     }
 
     async fn cancel_delayed_will_for_session(&self, session_id: &str) -> anyhow::Result<()> {
-        self.inbox.clear_delayed_lwt(&session_id.to_string()).await?;
+        self.inbox
+            .clear_delayed_lwt(&session_id.to_string())
+            .await?;
         let identity = if let Some(state) = self.local_sessions.get_cloned(session_id) {
             Some(state.record.identity)
         } else {

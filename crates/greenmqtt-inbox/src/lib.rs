@@ -1176,7 +1176,13 @@ impl InboxService for ReplicatedInboxHandle {
         self.delayed_lwts
             .write()
             .expect("replicated inbox poisoned")
-            .insert(session_id, RegisteredDelayedLwt { generation, publish });
+            .insert(
+                session_id,
+                RegisteredDelayedLwt {
+                    generation,
+                    publish,
+                },
+            );
         Ok(())
     }
 

@@ -327,7 +327,9 @@ async fn range_matches_structured_filters(
     query: &RangeListQuery,
 ) -> Result<bool, ApiError> {
     let Some(registry) = registry else {
-        return Ok(query.owner_node_id.is_none() && query.tenant_id.is_none() && query.service_kind.is_none());
+        return Ok(query.owner_node_id.is_none()
+            && query.tenant_id.is_none()
+            && query.service_kind.is_none());
     };
     let Some(descriptor) = registry
         .resolve_range(&health.range_id)
@@ -590,7 +592,11 @@ where
         "ranges",
         BTreeMap::from([("range_id".into(), range_id.clone())]),
     );
-    let mode = if target.is_some() { "forwarded" } else { "local" };
+    let mode = if target.is_some() {
+        "forwarded"
+    } else {
+        "local"
+    };
     let command_id = record_manual_range_command(
         range_routing.as_ref(),
         "bootstrap",
@@ -626,9 +632,13 @@ where
     C: AclProvider + 'static,
     H: EventHook + 'static,
 {
-    let (status, reason, target) = if let Some(remote) =
-        remote_range_control_client(&broker, range_runtime.clone(), range_routing.clone(), &range_id)
-            .await?
+    let (status, reason, target) = if let Some(remote) = remote_range_control_client(
+        &broker,
+        range_runtime.clone(),
+        range_routing.clone(),
+        &range_id,
+    )
+    .await?
     {
         remote
             .client
@@ -681,13 +691,21 @@ where
         "change_replicas",
         &range_id,
         "http",
-        if target.is_some() { "forwarded" } else { "local" },
+        if target.is_some() {
+            "forwarded"
+        } else {
+            "local"
+        },
         target.clone(),
     )
     .await?;
     Ok(Json(range_action_reply(
         "change-replicas",
-        if target.is_some() { "forwarded" } else { "local" },
+        if target.is_some() {
+            "forwarded"
+        } else {
+            "local"
+        },
         status,
         reason,
         target,
@@ -711,9 +729,13 @@ where
     C: AclProvider + 'static,
     H: EventHook + 'static,
 {
-    let target = if let Some(remote) =
-        remote_range_control_client(&broker, range_runtime.clone(), range_routing.clone(), &range_id)
-            .await?
+    let target = if let Some(remote) = remote_range_control_client(
+        &broker,
+        range_runtime.clone(),
+        range_routing.clone(),
+        &range_id,
+    )
+    .await?
     {
         remote
             .client
@@ -739,13 +761,21 @@ where
         "transfer_leadership",
         &range_id,
         "http",
-        if target.is_some() { "forwarded" } else { "local" },
+        if target.is_some() {
+            "forwarded"
+        } else {
+            "local"
+        },
         target.clone(),
     )
     .await?;
     Ok(Json(range_action_reply(
         "transfer-leadership",
-        if target.is_some() { "forwarded" } else { "local" },
+        if target.is_some() {
+            "forwarded"
+        } else {
+            "local"
+        },
         "leadership-updated",
         "Leadership transfer accepted; if the target already led the range this was a no-op.",
         target,
@@ -769,9 +799,13 @@ where
     C: AclProvider + 'static,
     H: EventHook + 'static,
 {
-    let target = if let Some(remote) =
-        remote_range_control_client(&broker, range_runtime.clone(), range_routing.clone(), &range_id)
-            .await?
+    let target = if let Some(remote) = remote_range_control_client(
+        &broker,
+        range_runtime.clone(),
+        range_routing.clone(),
+        &range_id,
+    )
+    .await?
     {
         remote
             .client
@@ -797,13 +831,21 @@ where
         "recover",
         &range_id,
         "http",
-        if target.is_some() { "forwarded" } else { "local" },
+        if target.is_some() {
+            "forwarded"
+        } else {
+            "local"
+        },
         target.clone(),
     )
     .await?;
     Ok(Json(range_action_reply(
         "recover",
-        if target.is_some() { "forwarded" } else { "local" },
+        if target.is_some() {
+            "forwarded"
+        } else {
+            "local"
+        },
         "recovered",
         "Recovery command accepted; the target leader is now authoritative or already was.",
         target,
@@ -827,9 +869,13 @@ where
     C: AclProvider + 'static,
     H: EventHook + 'static,
 {
-    let (left_range_id, right_range_id, target) = if let Some(remote) =
-        remote_range_control_client(&broker, range_runtime.clone(), range_routing.clone(), &range_id)
-            .await?
+    let (left_range_id, right_range_id, target) = if let Some(remote) = remote_range_control_client(
+        &broker,
+        range_runtime.clone(),
+        range_routing.clone(),
+        &range_id,
+    )
+    .await?
     {
         let (left, right) = remote
             .client
@@ -855,13 +901,21 @@ where
         "split",
         &range_id,
         "http",
-        if target.is_some() { "forwarded" } else { "local" },
+        if target.is_some() {
+            "forwarded"
+        } else {
+            "local"
+        },
         target.clone(),
     )
     .await?;
     Ok(Json(range_action_reply(
         "split",
-        if target.is_some() { "forwarded" } else { "local" },
+        if target.is_some() {
+            "forwarded"
+        } else {
+            "local"
+        },
         "split",
         "Range split completed; child ranges are now available.",
         target,
@@ -920,13 +974,21 @@ where
         "merge",
         &range_id,
         "http",
-        if target.is_some() { "forwarded" } else { "local" },
+        if target.is_some() {
+            "forwarded"
+        } else {
+            "local"
+        },
         target.clone(),
     )
     .await?;
     Ok(Json(range_action_reply(
         "merge",
-        if target.is_some() { "forwarded" } else { "local" },
+        if target.is_some() {
+            "forwarded"
+        } else {
+            "local"
+        },
         "merged",
         "Sibling ranges were merged into a single serving range.",
         target,
@@ -949,9 +1011,13 @@ where
     C: AclProvider + 'static,
     H: EventHook + 'static,
 {
-    let target = if let Some(remote) =
-        remote_range_control_client(&broker, range_runtime.clone(), range_routing.clone(), &range_id)
-            .await?
+    let target = if let Some(remote) = remote_range_control_client(
+        &broker,
+        range_runtime.clone(),
+        range_routing.clone(),
+        &range_id,
+    )
+    .await?
     {
         remote
             .client
@@ -977,13 +1043,21 @@ where
         "drain",
         &range_id,
         "http",
-        if target.is_some() { "forwarded" } else { "local" },
+        if target.is_some() {
+            "forwarded"
+        } else {
+            "local"
+        },
         target.clone(),
     )
     .await?;
     Ok(Json(range_action_reply(
         "drain",
-        if target.is_some() { "forwarded" } else { "local" },
+        if target.is_some() {
+            "forwarded"
+        } else {
+            "local"
+        },
         "draining",
         "Range marked draining; writes should migrate away before retirement.",
         target,
@@ -1006,9 +1080,13 @@ where
     C: AclProvider + 'static,
     H: EventHook + 'static,
 {
-    let target = if let Some(remote) =
-        remote_range_control_client(&broker, range_runtime.clone(), range_routing.clone(), &range_id)
-            .await?
+    let target = if let Some(remote) = remote_range_control_client(
+        &broker,
+        range_runtime.clone(),
+        range_routing.clone(),
+        &range_id,
+    )
+    .await?
     {
         remote
             .client
@@ -1034,13 +1112,21 @@ where
         "retire",
         &range_id,
         "http",
-        if target.is_some() { "forwarded" } else { "local" },
+        if target.is_some() {
+            "forwarded"
+        } else {
+            "local"
+        },
         target.clone(),
     )
     .await?;
     Ok(Json(range_action_reply(
         "retire",
-        if target.is_some() { "forwarded" } else { "local" },
+        if target.is_some() {
+            "forwarded"
+        } else {
+            "local"
+        },
         "retired",
         "Range retired; repeated retire requests are treated as already applied.",
         target,

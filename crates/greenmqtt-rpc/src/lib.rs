@@ -49,25 +49,25 @@ use greenmqtt_proto::internal::{
     InboxListSubscriptionsReply, InboxListSubscriptionsRequest, InboxLookupSubscriptionReply,
     InboxLookupSubscriptionRequest, InboxMaintenanceReply, InboxPurgeSessionRequest,
     InboxSendLwtReply, InboxSendLwtRequest, InboxStageInflightRequest, InboxStatsReply,
-    InboxSubscribeRequest,
-    InboxTenantGcRequest, InboxUnsubscribeReply, InboxUnsubscribeRequest, KvRangeApplyRequest,
-    KvRangeCheckpointReply, KvRangeCheckpointRequest, KvRangeGetReply, KvRangeGetRequest,
-    KvRangeScanReply, KvRangeScanRequest, KvRangeSnapshotReply, KvRangeSnapshotRequest,
-    ListRoutesReply, ListRoutesRequest, ListSessionRoutesReply, ListSessionRoutesRequest,
-    ListSessionsReply, ListSessionsRequest, LookupSessionByIdRequest, LookupSessionReply,
-    LookupSessionRequest, MatchTopicReply, MatchTopicRequest, MemberListReply, MemberLookupRequest,
-    MemberRecordReply, NamedBalancerStateRecord, PushDeliveriesReply, PushDeliveriesRequest,
-    PushDeliveryReply, PushDeliveryRequest, RaftTransportRequest, RangeBootstrapReply,
-    RangeBootstrapRequest, RangeChangeReplicasRequest, RangeDebugReply, RangeDrainRequest,
-    RangeHealthListReply, RangeHealthRecord, RangeHealthReply, RangeHealthRequest, RangeListReply,
-    RangeListRequest, RangeLookupRequest, RangeMergeReply, RangeMergeRequest,
-    RangeReconfigurationRecord, RangeRecordReply, RangeRecoverRequest, RangeRetireRequest,
-    RangeSplitReply, RangeSplitRequest, RangeTransferLeadershipRequest, RangeUpsertRequest,
-    RegisterSessionReply, RegisterSessionRequest, RemoveRouteRequest, RemoveSessionRoutesReply,
-    RemoveSessionRoutesRequest, ReplicaLagRecord, RetainExpireAllRequest, RetainMaintenanceReply,
-    RetainMatchReply, RetainMatchRequest, RetainTenantGcRequest, RetainWriteRequest, RouteRangeRequest,
-    SessionExistRecord, SessionExistReply, SessionExistRequest, ShardSnapshotChunk,
-    ShardSnapshotRequest, UnregisterSessionRequest, ZombieRangeListReply, ZombieRangeRecord,
+    InboxSubscribeRequest, InboxTenantGcRequest, InboxUnsubscribeReply, InboxUnsubscribeRequest,
+    KvRangeApplyRequest, KvRangeCheckpointReply, KvRangeCheckpointRequest, KvRangeGetReply,
+    KvRangeGetRequest, KvRangeScanReply, KvRangeScanRequest, KvRangeSnapshotReply,
+    KvRangeSnapshotRequest, ListRoutesReply, ListRoutesRequest, ListSessionRoutesReply,
+    ListSessionRoutesRequest, ListSessionsReply, ListSessionsRequest, LookupSessionByIdRequest,
+    LookupSessionReply, LookupSessionRequest, MatchTopicReply, MatchTopicRequest, MemberListReply,
+    MemberLookupRequest, MemberRecordReply, NamedBalancerStateRecord, PushDeliveriesReply,
+    PushDeliveriesRequest, PushDeliveryReply, PushDeliveryRequest, RaftTransportRequest,
+    RangeBootstrapReply, RangeBootstrapRequest, RangeChangeReplicasRequest, RangeDebugReply,
+    RangeDrainRequest, RangeHealthListReply, RangeHealthRecord, RangeHealthReply,
+    RangeHealthRequest, RangeListReply, RangeListRequest, RangeLookupRequest, RangeMergeReply,
+    RangeMergeRequest, RangeReconfigurationRecord, RangeRecordReply, RangeRecoverRequest,
+    RangeRetireRequest, RangeSplitReply, RangeSplitRequest, RangeTransferLeadershipRequest,
+    RangeUpsertRequest, RegisterSessionReply, RegisterSessionRequest, RemoveRouteRequest,
+    RemoveSessionRoutesReply, RemoveSessionRoutesRequest, ReplicaLagRecord, RetainExpireAllRequest,
+    RetainMaintenanceReply, RetainMatchReply, RetainMatchRequest, RetainTenantGcRequest,
+    RetainWriteRequest, RouteRangeRequest, SessionExistRecord, SessionExistReply,
+    SessionExistRequest, ShardSnapshotChunk, ShardSnapshotRequest, UnregisterSessionRequest,
+    ZombieRangeListReply, ZombieRangeRecord,
 };
 use greenmqtt_proto::{
     from_proto_balancer_state, from_proto_client_identity, from_proto_cluster_node_membership,
@@ -559,7 +559,12 @@ impl ServiceTrafficGovernor {
 
     pub fn snapshot(&self) -> RpcServiceLoadSnapshot {
         let last_overload_ms = self.last_overload_ms.load(Ordering::SeqCst);
-        let rules_source = if self.runtime_rules.read().expect("rpc governor poisoned").is_some() {
+        let rules_source = if self
+            .runtime_rules
+            .read()
+            .expect("rpc governor poisoned")
+            .is_some()
+        {
             "runtime"
         } else {
             "env"
@@ -634,7 +639,11 @@ impl ServiceTrafficGovernor {
         let runtime_override = self.runtime_rules();
         RpcServiceRulesSnapshot {
             service: self.service.as_str(),
-            source: if runtime_override.is_some() { "runtime" } else { "env" },
+            source: if runtime_override.is_some() {
+                "runtime"
+            } else {
+                "env"
+            },
             effective: self.effective_rules(),
             runtime_override,
         }

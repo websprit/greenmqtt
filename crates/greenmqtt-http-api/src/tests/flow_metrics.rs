@@ -704,7 +704,11 @@ async fn http_rpc_governance_rules_and_landscape_are_runtime_configurable() {
 
     let response = app
         .clone()
-        .oneshot(Request::get("/v1/rpc/services").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::get("/v1/rpc/services")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -752,7 +756,10 @@ async fn http_rpc_governance_rules_and_landscape_are_runtime_configurable() {
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let rules: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let rules = rules.as_object().unwrap();
-    assert_eq!(rules.get("source").and_then(|v| v.as_str()), Some("runtime"));
+    assert_eq!(
+        rules.get("source").and_then(|v| v.as_str()),
+        Some("runtime")
+    );
     assert_eq!(
         rules
             .get("effective")
@@ -774,7 +781,10 @@ async fn http_rpc_governance_rules_and_landscape_are_runtime_configurable() {
         serde_json::from_slice(&body).unwrap();
     let landscape = landscape.unwrap();
     assert_eq!(landscape.service, "dist");
-    assert_eq!(landscape.preferred_endpoints, vec!["http://127.0.0.1:50051"]);
+    assert_eq!(
+        landscape.preferred_endpoints,
+        vec!["http://127.0.0.1:50051"]
+    );
     assert_eq!(landscape.server_group_tags, vec!["edge"]);
     assert_eq!(landscape.endpoint_snapshots.len(), 1);
 }

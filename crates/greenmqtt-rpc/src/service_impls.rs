@@ -793,8 +793,7 @@ impl RetainService for RetainRpc {
         &self,
         request: Request<RetainTenantGcRequest>,
     ) -> Result<Response<RetainMaintenanceReply>, Status> {
-        let result =
-            retain_tenant_gc_preview(self.inner.as_ref(), &request.into_inner().tenant_id)
+        let result = retain_tenant_gc_preview(self.inner.as_ref(), &request.into_inner().tenant_id)
             .await
             .map_err(internal_status)?;
         Ok(Response::new(retain_maintenance_reply(&result)))

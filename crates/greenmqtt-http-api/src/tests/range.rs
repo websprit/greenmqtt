@@ -544,8 +544,14 @@ async fn http_control_command_surfaces_support_filter_retry_fail_and_prune() {
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let retried: Option<ControlCommandRecord> = serde_json::from_slice(&body).unwrap();
     let retried = retried.unwrap();
-    assert_eq!(retried.execution_state, ControlCommandExecutionState::Issued);
-    assert_eq!(retried.payload.get("retry_of").map(String::as_str), Some("cmd-1"));
+    assert_eq!(
+        retried.execution_state,
+        ControlCommandExecutionState::Issued
+    );
+    assert_eq!(
+        retried.payload.get("retry_of").map(String::as_str),
+        Some("cmd-1")
+    );
 
     let response = app
         .clone()
@@ -560,7 +566,10 @@ async fn http_control_command_surfaces_support_filter_retry_fail_and_prune() {
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let failed: Option<ControlCommandRecord> = serde_json::from_slice(&body).unwrap();
     let failed = failed.unwrap();
-    assert_eq!(failed.execution_state, ControlCommandExecutionState::TerminalFailed);
+    assert_eq!(
+        failed.execution_state,
+        ControlCommandExecutionState::TerminalFailed
+    );
     assert_eq!(
         failed.payload.get("parent_command_id").map(String::as_str),
         Some("cmd-1")
@@ -592,7 +601,11 @@ async fn http_range_filters_use_structured_metadata() {
             7,
             1,
             ClusterNodeLifecycle::Serving,
-            vec![ServiceEndpoint::new(ServiceKind::Retain, 7, "http://127.0.0.1:50070")],
+            vec![ServiceEndpoint::new(
+                ServiceKind::Retain,
+                7,
+                "http://127.0.0.1:50070",
+            )],
         ))
         .await
         .unwrap();
@@ -661,7 +674,8 @@ async fn http_range_filters_use_structured_metadata() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    let ranges: Vec<greenmqtt_kv_server::RangeHealthSnapshot> = serde_json::from_slice(&body).unwrap();
+    let ranges: Vec<greenmqtt_kv_server::RangeHealthSnapshot> =
+        serde_json::from_slice(&body).unwrap();
     assert_eq!(ranges.len(), 1);
     assert_eq!(ranges[0].range_id, "range-tenant-1");
 }

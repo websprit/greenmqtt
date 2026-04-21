@@ -120,9 +120,13 @@ impl InboxService for InboxHandle {
             .active_sessions
             .entry(session_id.clone())
             .or_insert(true);
-        guard
-            .delayed_lwts
-            .insert(session_id, RegisteredDelayedLwt { generation, publish });
+        guard.delayed_lwts.insert(
+            session_id,
+            RegisteredDelayedLwt {
+                generation,
+                publish,
+            },
+        );
         Ok(())
     }
 
@@ -1304,9 +1308,13 @@ impl InboxService for PersistentInboxHandle {
             .active_sessions
             .entry(session_id.clone())
             .or_insert(true);
-        guard
-            .delayed_lwts
-            .insert(session_id, RegisteredDelayedLwt { generation, publish });
+        guard.delayed_lwts.insert(
+            session_id,
+            RegisteredDelayedLwt {
+                generation,
+                publish,
+            },
+        );
         Ok(())
     }
 
