@@ -1,10 +1,11 @@
 use crate::{
-    DistGrpcClient, InboxGrpcClient, KvRangeGrpcClient, MetadataGrpcClient, MetadataPlaneLayout,
-    NoopDeliverySink, PeriodicAntiEntropyReconciler, PersistentMetadataRegistry,
-    RaftTransportGrpcClient, RangeAdminGrpcClient, RangeControlGrpcClient,
-    ReplicatedMetadataRegistry, RetainGrpcClient, RoutedRangeControlGrpcClient, RpcGovernedService,
-    RpcRuntime, RpcServiceKind, RpcTrafficGovernor, RpcTrafficGovernorConfig, RpcTrafficRules,
-    SessionDictGrpcClient, StaticPeerForwarder, StaticServiceEndpointRegistry,
+    normalize_grpc_endpoint, DistGrpcClient, InboxGrpcClient, KvRangeGrpcClient,
+    KvRangeGrpcExecutorFactory, MetadataGrpcClient, MetadataPlaneLayout, NoopDeliverySink,
+    PeriodicAntiEntropyReconciler, PersistentMetadataRegistry, RaftTransportGrpcClient,
+    RangeAdminGrpcClient, RangeControlGrpcClient, ReplicatedMetadataRegistry, RetainGrpcClient,
+    RoutedRangeControlGrpcClient, RpcGovernedService, RpcRuntime, RpcServiceKind,
+    RpcTrafficGovernor, RpcTrafficGovernorConfig, RpcTrafficRules, SessionDictGrpcClient,
+    StaticPeerForwarder, StaticServiceEndpointRegistry,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -22,7 +23,10 @@ use greenmqtt_core::{
 use greenmqtt_dist::{DistHandle, DistRouter};
 use greenmqtt_inbox::PersistentInboxHandle;
 use greenmqtt_inbox::{DelayedLwtPublish, DelayedLwtSink, InboxHandle, InboxService};
-use greenmqtt_kv_client::{KvRangeExecutor, KvRangeRouter, MemoryKvRangeRouter, RoutedRangeDataClient};
+use greenmqtt_kv_client::{
+    KvRangeExecutor, KvRangeExecutorFactory, KvRangeRouter, MemoryKvRangeRouter,
+    RoutedRangeDataClient,
+};
 use greenmqtt_kv_engine::{
     KvEngine, KvMutation, KvRangeBootstrap, KvRangeSpace, MemoryKvEngine, RocksDbKvEngine,
 };
@@ -69,6 +73,106 @@ fn tonic_status(error: &anyhow::Error) -> &tonic::Status {
     error
         .downcast_ref::<tonic::Status>()
         .expect("expected tonic status")
+}
+
+#[test]
+fn normalize_grpc_endpoint_accepts_http_variants_and_bare_hosts() {
+    assert_eq!(
+        normalize_grpc_endpoint("127.0.0.1:50051").unwrap(),
+        "http://127.0.0.1:50051"
+    );
+    assert_eq!(
+        normalize_grpc_endpoint("http://127.0.0.1:50052").unwrap(),
+        "http://127.0.0.1:50052"
+    );
+    assert_eq!(
+        normalize_grpc_endpoint("https://127.0.0.1:50053").unwrap(),
+        "https://127.0.0.1:50053"
+    );
+}
+
+#[test]
+fn normalize_grpc_endpoint_rejects_quic_scheme() {
+    let error = normalize_grpc_endpoint("quic://127.0.0.1:50054").unwrap_err();
+    assert!(error.to_string().contains("do not support quic endpoints"));
+}
+
+#[tokio::test]
+async fn dist_grpc_client_connect_rejects_quic_scheme_before_dialing() {
+    let error = match DistGrpcClient::connect("quic://127.0.0.1:50055").await {
+        Ok(_) => panic!("expected quic endpoint without config to fail"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("requires QUIC client config for quic endpoints"));
+}
+
+#[tokio::test]
+async fn range_admin_client_rejects_quic_endpoint_without_quic_client_config() {
+    let error = match RangeAdminGrpcClient::connect("quic://127.0.0.1:50056").await {
+        Ok(_) => panic!("expected quic endpoint without config to fail"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("requires QUIC client config for quic endpoints"));
+}
+
+#[tokio::test]
+async fn metadata_client_rejects_quic_endpoint_without_quic_client_config() {
+    let error = match MetadataGrpcClient::connect("quic://127.0.0.1:50057").await {
+        Ok(_) => panic!("expected quic endpoint without config to fail"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("requires QUIC client config for quic endpoints"));
+}
+
+#[tokio::test]
+async fn sessiondict_client_rejects_quic_endpoint_without_quic_client_config() {
+    let error = match SessionDictGrpcClient::connect("quic://127.0.0.1:50058").await {
+        Ok(_) => panic!("expected quic endpoint without config to fail"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("requires QUIC client config for quic endpoints"));
+}
+
+#[tokio::test]
+async fn inbox_client_rejects_quic_endpoint_without_quic_client_config() {
+    let error = match InboxGrpcClient::connect("quic://127.0.0.1:50059").await {
+        Ok(_) => panic!("expected quic endpoint without config to fail"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("requires QUIC client config for quic endpoints"));
+}
+
+#[tokio::test]
+async fn retain_client_rejects_quic_endpoint_without_quic_client_config() {
+    let error = match RetainGrpcClient::connect("quic://127.0.0.1:50060").await {
+        Ok(_) => panic!("expected quic endpoint without config to fail"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("requires QUIC client config for quic endpoints"));
+}
+
+#[tokio::test]
+async fn kvrange_executor_factory_rejects_quic_endpoint_without_quic_client_config() {
+    let factory = KvRangeGrpcExecutorFactory::default();
+    let error = match factory.connect("quic://127.0.0.1:50056").await {
+        Ok(_) => panic!("expected quic endpoint without config to fail"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("requires QUIC client config for quic endpoints"));
 }
 
 #[derive(Clone)]
@@ -869,6 +973,739 @@ async fn grpc_round_trip_for_session_online_check_surface() {
 }
 
 #[tokio::test]
+async fn session_dict_rpc_handlers_lookup_and_list_without_grpc_transport() {
+    let sessiondict = Arc::new(SessionDictHandle::default());
+    sessiondict
+        .register(SessionRecord {
+            session_id: "s-direct-1".into(),
+            node_id: 7,
+            kind: SessionKind::Persistent,
+            identity: ClientIdentity {
+                tenant_id: "t1".into(),
+                user_id: "u1".into(),
+                client_id: "c1".into(),
+            },
+            session_expiry_interval_secs: Some(60),
+            expires_at_ms: None,
+        })
+        .await
+        .unwrap();
+    sessiondict
+        .register(SessionRecord {
+            session_id: "s-direct-2".into(),
+            node_id: 9,
+            kind: SessionKind::Transient,
+            identity: ClientIdentity {
+                tenant_id: "t2".into(),
+                user_id: "u2".into(),
+                client_id: "c2".into(),
+            },
+            session_expiry_interval_secs: None,
+            expires_at_ms: None,
+        })
+        .await
+        .unwrap();
+
+    let rpc = crate::SessionDictRpc {
+        inner: sessiondict,
+        assignment_registry: None,
+    };
+    let service: &dyn crate::SessionDictTransportService = &rpc;
+
+    let looked_up = service
+        .lookup_session_record_by_identity(&ClientIdentity {
+            tenant_id: "t1".into(),
+            user_id: "u1".into(),
+            client_id: "c1".into(),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(looked_up.session_id, "s-direct-1");
+
+    let by_id = service
+        .lookup_session_record_by_id("s-direct-2")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(by_id.identity.tenant_id, "t2");
+
+    let listed = service.list_session_records(Some("t1")).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].session_id, "s-direct-1");
+}
+
+#[tokio::test]
+async fn session_dict_rpc_handlers_manage_register_and_unregister_without_grpc_transport() {
+    let sessiondict = Arc::new(SessionDictHandle::default());
+    let rpc = crate::SessionDictRpc {
+        inner: sessiondict,
+        assignment_registry: None,
+    };
+    let service: &dyn crate::SessionDictTransportService = &rpc;
+
+    let replaced = service
+        .register_session_record(SessionRecord {
+            session_id: "s-mut-1".into(),
+            node_id: 7,
+            kind: SessionKind::Persistent,
+            identity: ClientIdentity {
+                tenant_id: "t1".into(),
+                user_id: "u1".into(),
+                client_id: "c1".into(),
+            },
+            session_expiry_interval_secs: Some(60),
+            expires_at_ms: None,
+        })
+        .await
+        .unwrap();
+    assert!(replaced.is_none());
+
+    let removed = service
+        .unregister_session_record("s-mut-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(removed.identity.user_id, "u1");
+    assert!(service
+        .unregister_session_record("s-mut-1")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn grpc_round_trip_for_sessiondict_read_surface() {
+    let bind = "127.0.0.1:50127".parse().unwrap();
+    let server = tokio::spawn(state_runtime().serve(bind));
+    sleep(Duration::from_millis(50)).await;
+
+    let client = SessionDictGrpcClient::connect("http://127.0.0.1:50127")
+        .await
+        .unwrap();
+    client
+        .register(SessionRecord {
+            session_id: "s-read-1".into(),
+            node_id: 1,
+            kind: SessionKind::Persistent,
+            identity: ClientIdentity {
+                tenant_id: "t1".into(),
+                user_id: "u1".into(),
+                client_id: "c1".into(),
+            },
+            session_expiry_interval_secs: None,
+            expires_at_ms: None,
+        })
+        .await
+        .unwrap();
+    client
+        .register(SessionRecord {
+            session_id: "s-read-2".into(),
+            node_id: 2,
+            kind: SessionKind::Transient,
+            identity: ClientIdentity {
+                tenant_id: "t2".into(),
+                user_id: "u2".into(),
+                client_id: "c2".into(),
+            },
+            session_expiry_interval_secs: None,
+            expires_at_ms: None,
+        })
+        .await
+        .unwrap();
+
+    let looked_up = client
+        .lookup_identity(&ClientIdentity {
+            tenant_id: "t1".into(),
+            user_id: "u1".into(),
+            client_id: "c1".into(),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(looked_up.session_id, "s-read-1");
+
+    let by_id = client.lookup_session("s-read-2").await.unwrap().unwrap();
+    assert_eq!(by_id.identity.tenant_id, "t2");
+
+    let listed = client.list_sessions(Some("t1")).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].session_id, "s-read-1");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn grpc_round_trip_for_sessiondict_mutation_surface() {
+    let bind = "127.0.0.1:50129".parse().unwrap();
+    let server = tokio::spawn(state_runtime().serve(bind));
+    sleep(Duration::from_millis(50)).await;
+
+    let client = SessionDictGrpcClient::connect("http://127.0.0.1:50129")
+        .await
+        .unwrap();
+    let replaced = client
+        .register(SessionRecord {
+            session_id: "s-mut-2".into(),
+            node_id: 1,
+            kind: SessionKind::Persistent,
+            identity: ClientIdentity {
+                tenant_id: "t1".into(),
+                user_id: "u1".into(),
+                client_id: "c1".into(),
+            },
+            session_expiry_interval_secs: None,
+            expires_at_ms: None,
+        })
+        .await
+        .unwrap();
+    assert!(replaced.is_none());
+
+    let removed = client.unregister("s-mut-2").await.unwrap().unwrap();
+    assert_eq!(removed.identity.client_id, "c1");
+    assert!(client.unregister("s-mut-2").await.unwrap().is_none());
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn inbox_rpc_handlers_manage_attach_and_detach_without_grpc_transport() {
+    let inbox = Arc::new(InboxHandle::default());
+    let rpc = crate::InboxRpc {
+        inner: inbox.clone(),
+        assignment_registry: None,
+        lwt_sink: None,
+    };
+    let service: &dyn crate::InboxTransportService = &rpc;
+    let sink = RecordingLwtSink::default();
+
+    service.attach_session("s1").await.unwrap();
+    inbox
+        .register_delayed_lwt(
+            1,
+            DelayedLwtPublish {
+                tenant_id: "t1".into(),
+                session_id: "s1".into(),
+                publish: PublishRequest {
+                    topic: "devices/d1/lwt".into(),
+                    payload: b"bye".to_vec().into(),
+                    qos: 1,
+                    retain: false,
+                    properties: PublishProperties::default(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        inbox
+            .send_delayed_lwt(&"s1".to_string(), 1, &sink)
+            .await
+            .unwrap(),
+        greenmqtt_inbox::InboxLwtResult::NoDetach
+    );
+
+    service.detach_session("s1").await.unwrap();
+    assert_eq!(
+        inbox
+            .send_delayed_lwt(&"s1".to_string(), 1, &sink)
+            .await
+            .unwrap(),
+        greenmqtt_inbox::InboxLwtResult::Ok
+    );
+    assert_eq!(sink.publishes.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn grpc_round_trip_for_inbox_attach_detach_surface() {
+    let bind = "127.0.0.1:50131".parse().unwrap();
+    let inbox = Arc::new(InboxHandle::default());
+    let server = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: inbox.clone(),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: None,
+            range_host: None,
+            range_runtime: None,
+            inbox_lwt_sink: None,
+        }
+        .serve(bind),
+    );
+    sleep(Duration::from_millis(50)).await;
+
+    let client = InboxGrpcClient::connect("http://127.0.0.1:50131")
+        .await
+        .unwrap();
+    let sink = RecordingLwtSink::default();
+
+    client.attach(&"s1".to_string()).await.unwrap();
+    inbox
+        .register_delayed_lwt(
+            1,
+            DelayedLwtPublish {
+                tenant_id: "t1".into(),
+                session_id: "s1".into(),
+                publish: PublishRequest {
+                    topic: "devices/d1/lwt".into(),
+                    payload: b"bye".to_vec().into(),
+                    qos: 1,
+                    retain: false,
+                    properties: PublishProperties::default(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        inbox
+            .send_delayed_lwt(&"s1".to_string(), 1, &sink)
+            .await
+            .unwrap(),
+        greenmqtt_inbox::InboxLwtResult::NoDetach
+    );
+
+    client.detach(&"s1".to_string()).await.unwrap();
+    assert_eq!(
+        inbox
+            .send_delayed_lwt(&"s1".to_string(), 1, &sink)
+            .await
+            .unwrap(),
+        greenmqtt_inbox::InboxLwtResult::Ok
+    );
+    assert_eq!(sink.publishes.lock().unwrap().len(), 1);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn inbox_rpc_handlers_manage_purge_without_grpc_transport() {
+    let inbox = Arc::new(InboxHandle::default());
+    inbox
+        .subscribe(Subscription {
+            session_id: "s1".into(),
+            tenant_id: "t1".into(),
+            topic_filter: "devices/+/state".into(),
+            qos: 1,
+            subscription_identifier: Some(1),
+            no_local: false,
+            retain_as_published: false,
+            retain_handling: 0,
+            shared_group: None,
+            kind: SessionKind::Persistent,
+        })
+        .await
+        .unwrap();
+    inbox
+        .enqueue(OfflineMessage {
+            tenant_id: "t1".into(),
+            session_id: "s1".into(),
+            topic: "devices/d1/state".into(),
+            payload: b"up".to_vec().into(),
+            qos: 1,
+            retain: false,
+            from_session_id: "src".into(),
+            properties: PublishProperties::default(),
+        })
+        .await
+        .unwrap();
+    inbox
+        .stage_inflight(InflightMessage {
+            tenant_id: "t1".into(),
+            session_id: "s1".into(),
+            packet_id: 7,
+            topic: "devices/d1/state".into(),
+            payload: b"up".to_vec().into(),
+            qos: 1,
+            retain: false,
+            from_session_id: "src".into(),
+            properties: PublishProperties::default(),
+            phase: greenmqtt_core::InflightPhase::Publish,
+        })
+        .await
+        .unwrap();
+
+    let rpc = crate::InboxRpc {
+        inner: inbox.clone(),
+        assignment_registry: None,
+        lwt_sink: None,
+    };
+    let service: &dyn crate::InboxTransportService = &rpc;
+
+    assert_eq!(
+        inbox
+            .list_subscriptions(&"s1".to_string())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(inbox.peek(&"s1".to_string()).await.unwrap().len(), 1);
+    assert_eq!(
+        inbox.fetch_inflight(&"s1".to_string()).await.unwrap().len(),
+        1
+    );
+
+    service.purge_session_state("s1").await.unwrap();
+
+    assert!(inbox
+        .list_subscriptions(&"s1".to_string())
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(inbox.peek(&"s1".to_string()).await.unwrap().is_empty());
+    assert!(inbox
+        .fetch_inflight(&"s1".to_string())
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn inbox_rpc_handlers_manage_ack_inflight_without_grpc_transport() {
+    let inbox = Arc::new(InboxHandle::default());
+    inbox
+        .stage_inflight(InflightMessage {
+            tenant_id: "t1".into(),
+            session_id: "s1".into(),
+            packet_id: 7,
+            topic: "devices/d1/state".into(),
+            payload: b"up".to_vec().into(),
+            qos: 1,
+            retain: false,
+            from_session_id: "src".into(),
+            properties: PublishProperties::default(),
+            phase: greenmqtt_core::InflightPhase::Publish,
+        })
+        .await
+        .unwrap();
+
+    let rpc = crate::InboxRpc {
+        inner: inbox.clone(),
+        assignment_registry: None,
+        lwt_sink: None,
+    };
+    let service: &dyn crate::InboxTransportService = &rpc;
+
+    assert_eq!(
+        inbox.fetch_inflight(&"s1".to_string()).await.unwrap().len(),
+        1
+    );
+    service.ack_inflight_packet("s1", 7).await.unwrap();
+    assert!(inbox
+        .fetch_inflight(&"s1".to_string())
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn grpc_round_trip_for_inbox_purge_surface() {
+    let bind = "127.0.0.1:50132".parse().unwrap();
+    let inbox = Arc::new(InboxHandle::default());
+    let server = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: inbox.clone(),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: None,
+            range_host: None,
+            range_runtime: None,
+            inbox_lwt_sink: None,
+        }
+        .serve(bind),
+    );
+    sleep(Duration::from_millis(50)).await;
+
+    inbox
+        .subscribe(Subscription {
+            session_id: "s1".into(),
+            tenant_id: "t1".into(),
+            topic_filter: "devices/+/state".into(),
+            qos: 1,
+            subscription_identifier: Some(1),
+            no_local: false,
+            retain_as_published: false,
+            retain_handling: 0,
+            shared_group: None,
+            kind: SessionKind::Persistent,
+        })
+        .await
+        .unwrap();
+    inbox
+        .enqueue(OfflineMessage {
+            tenant_id: "t1".into(),
+            session_id: "s1".into(),
+            topic: "devices/d1/state".into(),
+            payload: b"up".to_vec().into(),
+            qos: 1,
+            retain: false,
+            from_session_id: "src".into(),
+            properties: PublishProperties::default(),
+        })
+        .await
+        .unwrap();
+    inbox
+        .stage_inflight(InflightMessage {
+            tenant_id: "t1".into(),
+            session_id: "s1".into(),
+            packet_id: 7,
+            topic: "devices/d1/state".into(),
+            payload: b"up".to_vec().into(),
+            qos: 1,
+            retain: false,
+            from_session_id: "src".into(),
+            properties: PublishProperties::default(),
+            phase: greenmqtt_core::InflightPhase::Publish,
+        })
+        .await
+        .unwrap();
+
+    let client = InboxGrpcClient::connect("http://127.0.0.1:50132")
+        .await
+        .unwrap();
+    client.purge_session(&"s1".to_string()).await.unwrap();
+
+    assert!(inbox
+        .list_subscriptions(&"s1".to_string())
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(inbox.peek(&"s1".to_string()).await.unwrap().is_empty());
+    assert!(inbox
+        .fetch_inflight(&"s1".to_string())
+        .await
+        .unwrap()
+        .is_empty());
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn grpc_round_trip_for_inbox_ack_inflight_surface() {
+    let bind = "127.0.0.1:50133".parse().unwrap();
+    let inbox = Arc::new(InboxHandle::default());
+    let server = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: inbox.clone(),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: None,
+            range_host: None,
+            range_runtime: None,
+            inbox_lwt_sink: None,
+        }
+        .serve(bind),
+    );
+    sleep(Duration::from_millis(50)).await;
+
+    inbox
+        .stage_inflight(InflightMessage {
+            tenant_id: "t1".into(),
+            session_id: "s1".into(),
+            packet_id: 7,
+            topic: "devices/d1/state".into(),
+            payload: b"up".to_vec().into(),
+            qos: 1,
+            retain: false,
+            from_session_id: "src".into(),
+            properties: PublishProperties::default(),
+            phase: greenmqtt_core::InflightPhase::Publish,
+        })
+        .await
+        .unwrap();
+
+    let client = InboxGrpcClient::connect("http://127.0.0.1:50133")
+        .await
+        .unwrap();
+    client.ack_inflight(&"s1".to_string(), 7).await.unwrap();
+
+    assert!(inbox
+        .fetch_inflight(&"s1".to_string())
+        .await
+        .unwrap()
+        .is_empty());
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn dist_rpc_handlers_manage_read_routes_without_grpc_transport() {
+    let dist = Arc::new(DistHandle::default());
+    dist.add_route(RouteRecord {
+        tenant_id: "t1".into(),
+        topic_filter: "devices/+/state".into(),
+        session_id: "s1".into(),
+        node_id: 7,
+        subscription_identifier: Some(1),
+        no_local: false,
+        retain_as_published: false,
+        shared_group: None,
+        kind: SessionKind::Persistent,
+    })
+    .await
+    .unwrap();
+    dist.add_route(RouteRecord {
+        tenant_id: "t2".into(),
+        topic_filter: "devices/+/status".into(),
+        session_id: "s2".into(),
+        node_id: 9,
+        subscription_identifier: None,
+        no_local: true,
+        retain_as_published: true,
+        shared_group: Some("g1".into()),
+        kind: SessionKind::Transient,
+    })
+    .await
+    .unwrap();
+
+    let rpc = crate::DistRpc {
+        inner: dist,
+        assignment_registry: None,
+    };
+    let service: &dyn crate::DistTransportService = &rpc;
+
+    let session_routes = service.list_session_route_records("s1").await.unwrap();
+    assert_eq!(session_routes.len(), 1);
+    assert_eq!(session_routes[0].tenant_id, "t1");
+
+    let matched = service
+        .match_route_records("t1", "devices/d1/state")
+        .await
+        .unwrap();
+    assert_eq!(matched.len(), 1);
+    assert_eq!(matched[0].session_id, "s1");
+
+    let listed = service.list_route_records(Some("t1")).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].topic_filter, "devices/+/state");
+}
+
+#[tokio::test]
+async fn dist_rpc_handlers_manage_add_and_remove_routes_without_grpc_transport() {
+    let dist = Arc::new(DistHandle::default());
+    let rpc = crate::DistRpc {
+        inner: dist,
+        assignment_registry: None,
+    };
+    let service: &dyn crate::DistTransportService = &rpc;
+    let route = RouteRecord {
+        tenant_id: "t1".into(),
+        topic_filter: "devices/+/state".into(),
+        session_id: "s1".into(),
+        node_id: 7,
+        subscription_identifier: Some(1),
+        no_local: false,
+        retain_as_published: false,
+        shared_group: None,
+        kind: SessionKind::Persistent,
+    };
+
+    service.add_route_record(route.clone()).await.unwrap();
+    assert_eq!(
+        service.list_route_records(Some("t1")).await.unwrap().len(),
+        1
+    );
+    service.remove_route_record(&route).await.unwrap();
+    assert!(service
+        .list_route_records(Some("t1"))
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn grpc_round_trip_for_dist_read_surface() {
+    let bind = "127.0.0.1:50128".parse().unwrap();
+    let server = tokio::spawn(state_runtime().serve(bind));
+    sleep(Duration::from_millis(50)).await;
+
+    let client = DistGrpcClient::connect("http://127.0.0.1:50128")
+        .await
+        .unwrap();
+    client
+        .add_route(RouteRecord {
+            tenant_id: "t1".into(),
+            topic_filter: "devices/+/state".into(),
+            session_id: "s1".into(),
+            node_id: 7,
+            subscription_identifier: Some(1),
+            no_local: false,
+            retain_as_published: false,
+            shared_group: None,
+            kind: SessionKind::Persistent,
+        })
+        .await
+        .unwrap();
+    client
+        .add_route(RouteRecord {
+            tenant_id: "t2".into(),
+            topic_filter: "devices/+/status".into(),
+            session_id: "s2".into(),
+            node_id: 9,
+            subscription_identifier: None,
+            no_local: true,
+            retain_as_published: true,
+            shared_group: Some("g1".into()),
+            kind: SessionKind::Transient,
+        })
+        .await
+        .unwrap();
+
+    let session_routes = client.list_session_routes("s1").await.unwrap();
+    assert_eq!(session_routes.len(), 1);
+    assert_eq!(session_routes[0].tenant_id, "t1");
+
+    let matched = client
+        .match_topic("t1", &"devices/d1/state".to_string())
+        .await
+        .unwrap();
+    assert_eq!(matched.len(), 1);
+    assert_eq!(matched[0].session_id, "s1");
+
+    let listed = client.list_routes(Some("t1")).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].topic_filter, "devices/+/state");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn grpc_round_trip_for_dist_mutation_surface() {
+    let bind = "127.0.0.1:50130".parse().unwrap();
+    let server = tokio::spawn(state_runtime().serve(bind));
+    sleep(Duration::from_millis(50)).await;
+
+    let client = DistGrpcClient::connect("http://127.0.0.1:50130")
+        .await
+        .unwrap();
+    let route = RouteRecord {
+        tenant_id: "t1".into(),
+        topic_filter: "devices/+/state".into(),
+        session_id: "s1".into(),
+        node_id: 7,
+        subscription_identifier: Some(1),
+        no_local: false,
+        retain_as_published: false,
+        shared_group: None,
+        kind: SessionKind::Persistent,
+    };
+
+    client.add_route(route.clone()).await.unwrap();
+    assert_eq!(client.list_routes(Some("t1")).await.unwrap().len(), 1);
+    client.remove_route(&route).await.unwrap();
+    assert!(client.list_routes(Some("t1")).await.unwrap().is_empty());
+
+    server.abort();
+}
+
+#[tokio::test]
 async fn grpc_round_trip_for_metadata_service() {
     let bind = "127.0.0.1:50062".parse().unwrap();
     let registry = Arc::new(StaticServiceEndpointRegistry::default());
@@ -957,6 +1794,565 @@ async fn grpc_round_trip_for_metadata_service() {
     assert_eq!(states["replica-count"].load_rules["target_voters"], "3");
 
     server.abort();
+}
+
+#[tokio::test]
+async fn metadata_client_connects_quic_endpoint_when_configured() {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert_pem = cert.cert.pem();
+    let key_pem = cert.signing_key.serialize_pem();
+    let tempdir = tempfile::tempdir().unwrap();
+    let cert_path = tempdir.path().join("server.crt");
+    let key_path = tempdir.path().join("server.key");
+    std::fs::write(&cert_path, cert_pem.as_bytes()).unwrap();
+    std::fs::write(&key_path, key_pem.as_bytes()).unwrap();
+
+    let listener = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let bind = listener.local_addr().unwrap();
+    drop(listener);
+
+    let registry = Arc::new(StaticServiceEndpointRegistry::default());
+    registry
+        .upsert_member(ClusterNodeMembership::new(
+            7,
+            1,
+            ClusterNodeLifecycle::Serving,
+            vec![ServiceEndpoint::new(
+                ServiceKind::Retain,
+                7,
+                "http://127.0.0.1:50062",
+            )],
+        ))
+        .await
+        .unwrap();
+    let shard = ServiceShardKey::retain("t1");
+    registry
+        .upsert_range(ReplicatedRangeDescriptor::new(
+            "range-meta-quic",
+            shard.clone(),
+            RangeBoundary::new(Some(b"a".to_vec()), Some(b"z".to_vec())),
+            1,
+            2,
+            Some(7),
+            vec![
+                RangeReplica::new(7, ReplicaRole::Voter, ReplicaSyncState::Replicating),
+                RangeReplica::new(9, ReplicaRole::Learner, ReplicaSyncState::Snapshotting),
+            ],
+            11,
+            10,
+            ServiceShardLifecycle::Serving,
+        ))
+        .await
+        .unwrap();
+    let service: Arc<dyn crate::MetadataTransportService> = Arc::new(crate::MetadataRpc {
+        inner: Some(registry),
+    });
+    let server =
+        crate::quic_metadata::spawn_metadata_quic_server(service, bind, &cert_path, &key_path)
+            .unwrap();
+    sleep(Duration::from_millis(50)).await;
+
+    let mut roots = quinn::rustls::RootCertStore::empty();
+    roots.add(cert.cert.der().clone()).unwrap();
+    let client_config = quinn::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+    let client = MetadataGrpcClient::connect_with_optional_quic_config(
+        format!("quic://{}", server.local_addr()),
+        Some(crate::MetadataQuicClientConfig {
+            server_name: "localhost".into(),
+            client_config,
+        }),
+    )
+    .await
+    .unwrap();
+
+    let members = client.list_members().await.unwrap();
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].node_id, 7);
+    let looked_up = client.lookup_member(7).await.unwrap().unwrap();
+    assert_eq!(looked_up.endpoints[0].kind, ServiceKind::Retain);
+    let ranges = client
+        .list_ranges(Some(ServiceShardKind::Retain), Some("t1"), None)
+        .await
+        .unwrap();
+    assert_eq!(ranges.len(), 1);
+    let routed = client.route_range(&shard, b"pear").await.unwrap().unwrap();
+    assert_eq!(routed.id, "range-meta-quic");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn sessiondict_client_connects_quic_endpoint_when_configured() {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert_pem = cert.cert.pem();
+    let key_pem = cert.signing_key.serialize_pem();
+    let tempdir = tempfile::tempdir().unwrap();
+    let cert_path = tempdir.path().join("server.crt");
+    let key_path = tempdir.path().join("server.key");
+    std::fs::write(&cert_path, cert_pem.as_bytes()).unwrap();
+    std::fs::write(&key_path, key_pem.as_bytes()).unwrap();
+
+    let listener = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let bind = listener.local_addr().unwrap();
+    drop(listener);
+
+    let sessiondict = Arc::new(SessionDictHandle::default());
+    let service: Arc<dyn crate::SessionDictTransportService> = Arc::new(crate::SessionDictRpc {
+        inner: sessiondict,
+        assignment_registry: None,
+    });
+    let server = crate::quic_sessiondict::spawn_sessiondict_quic_server(
+        service, bind, &cert_path, &key_path,
+    )
+    .unwrap();
+    sleep(Duration::from_millis(50)).await;
+
+    let mut roots = quinn::rustls::RootCertStore::empty();
+    roots.add(cert.cert.der().clone()).unwrap();
+    let client_config = quinn::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+    let client = SessionDictGrpcClient::connect_with_optional_quic_config(
+        format!("quic://{}", server.local_addr()),
+        Some(crate::SessionDictQuicClientConfig {
+            server_name: "localhost".into(),
+            client_config,
+        }),
+    )
+    .await
+    .unwrap();
+
+    let replaced = client
+        .register(SessionRecord {
+            session_id: "s-quic-facade".into(),
+            node_id: 7,
+            kind: SessionKind::Persistent,
+            identity: ClientIdentity {
+                tenant_id: "t1".into(),
+                user_id: "u1".into(),
+                client_id: "c1".into(),
+            },
+            session_expiry_interval_secs: Some(60),
+            expires_at_ms: None,
+        })
+        .await
+        .unwrap();
+    assert!(replaced.is_none());
+    assert_eq!(client.session_count().await.unwrap(), 1);
+    assert_eq!(
+        client
+            .lookup_session("s-quic-facade")
+            .await
+            .unwrap()
+            .unwrap()
+            .node_id,
+        7
+    );
+    assert_eq!(
+        client
+            .lookup_identity(&ClientIdentity {
+                tenant_id: "t1".into(),
+                user_id: "u1".into(),
+                client_id: "c1".into(),
+            })
+            .await
+            .unwrap()
+            .unwrap()
+            .session_id,
+        "s-quic-facade"
+    );
+    assert_eq!(client.list_sessions(Some("t1")).await.unwrap().len(), 1);
+    assert_eq!(
+        client
+            .session_exists(&["s-quic-facade".into(), "missing".into()])
+            .await
+            .unwrap()["s-quic-facade"],
+        true
+    );
+    assert_eq!(
+        client
+            .identity_exists(&[ClientIdentity {
+                tenant_id: "t1".into(),
+                user_id: "u1".into(),
+                client_id: "c1".into(),
+            }])
+            .await
+            .unwrap()[&("t1".into(), "u1".into(), "c1".into())],
+        true
+    );
+    let removed = client.unregister("s-quic-facade").await.unwrap().unwrap();
+    assert_eq!(removed.session_id, "s-quic-facade");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn inbox_client_connects_quic_endpoint_when_configured() {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert_pem = cert.cert.pem();
+    let key_pem = cert.signing_key.serialize_pem();
+    let tempdir = tempfile::tempdir().unwrap();
+    let cert_path = tempdir.path().join("server.crt");
+    let key_path = tempdir.path().join("server.key");
+    std::fs::write(&cert_path, cert_pem.as_bytes()).unwrap();
+    std::fs::write(&key_path, key_pem.as_bytes()).unwrap();
+
+    let listener = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let bind = listener.local_addr().unwrap();
+    drop(listener);
+
+    let inbox = Arc::new(InboxHandle::default());
+    let service: Arc<dyn crate::InboxTransportService> = Arc::new(crate::InboxRpc {
+        inner: inbox.clone(),
+        assignment_registry: None,
+        lwt_sink: None,
+    });
+    let server =
+        crate::quic_inbox::spawn_inbox_quic_server(service, bind, &cert_path, &key_path).unwrap();
+    sleep(Duration::from_millis(50)).await;
+
+    let mut roots = quinn::rustls::RootCertStore::empty();
+    roots.add(cert.cert.der().clone()).unwrap();
+    let client_config = quinn::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+    let client = InboxGrpcClient::connect_with_optional_quic_config(
+        format!("quic://{}", server.local_addr()),
+        Some(crate::InboxQuicClientConfig {
+            server_name: "localhost".into(),
+            client_config,
+        }),
+    )
+    .await
+    .unwrap();
+
+    client.attach(&"s1".to_string()).await.unwrap();
+    inbox
+        .register_delayed_lwt(
+            1,
+            DelayedLwtPublish {
+                tenant_id: "t1".into(),
+                session_id: "s1".into(),
+                publish: PublishRequest {
+                    topic: "devices/d1/lwt".into(),
+                    payload: b"bye".to_vec().into(),
+                    qos: 1,
+                    retain: false,
+                    properties: PublishProperties::default(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let sink = RecordingLwtSink::default();
+    assert_eq!(
+        inbox
+            .send_delayed_lwt(&"s1".to_string(), 1, &sink)
+            .await
+            .unwrap(),
+        greenmqtt_inbox::InboxLwtResult::NoDetach
+    );
+
+    client.detach(&"s1".to_string()).await.unwrap();
+    assert_eq!(
+        inbox
+            .send_delayed_lwt(&"s1".to_string(), 1, &sink)
+            .await
+            .unwrap(),
+        greenmqtt_inbox::InboxLwtResult::Ok
+    );
+
+    inbox
+        .stage_inflight(InflightMessage {
+            tenant_id: "t1".into(),
+            session_id: "s1".into(),
+            packet_id: 7,
+            topic: "devices/d1/state".into(),
+            payload: b"up".to_vec().into(),
+            qos: 1,
+            retain: false,
+            from_session_id: "src".into(),
+            properties: PublishProperties::default(),
+            phase: greenmqtt_core::InflightPhase::Publish,
+        })
+        .await
+        .unwrap();
+    client.ack_inflight(&"s1".to_string(), 7).await.unwrap();
+    assert!(inbox
+        .fetch_inflight(&"s1".to_string())
+        .await
+        .unwrap()
+        .is_empty());
+
+    inbox
+        .subscribe(Subscription {
+            session_id: "s1".into(),
+            tenant_id: "t1".into(),
+            topic_filter: "devices/+/state".into(),
+            qos: 1,
+            subscription_identifier: Some(1),
+            no_local: false,
+            retain_as_published: false,
+            retain_handling: 0,
+            shared_group: None,
+            kind: SessionKind::Persistent,
+        })
+        .await
+        .unwrap();
+    client.purge_session(&"s1".to_string()).await.unwrap();
+    assert!(inbox
+        .list_subscriptions(&"s1".to_string())
+        .await
+        .unwrap()
+        .is_empty());
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn retain_client_connects_quic_endpoint_when_configured() {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert_pem = cert.cert.pem();
+    let key_pem = cert.signing_key.serialize_pem();
+    let tempdir = tempfile::tempdir().unwrap();
+    let cert_path = tempdir.path().join("server.crt");
+    let key_path = tempdir.path().join("server.key");
+    std::fs::write(&cert_path, cert_pem.as_bytes()).unwrap();
+    std::fs::write(&key_path, key_pem.as_bytes()).unwrap();
+
+    let listener = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let bind = listener.local_addr().unwrap();
+    drop(listener);
+
+    let retain = Arc::new(RetainHandle::default());
+    let service: Arc<dyn crate::RetainTransportService> =
+        Arc::new(crate::RetainRpc { inner: retain });
+    let server =
+        crate::quic_retain::spawn_retain_quic_server(service, bind, &cert_path, &key_path).unwrap();
+    sleep(Duration::from_millis(50)).await;
+
+    let mut roots = quinn::rustls::RootCertStore::empty();
+    roots.add(cert.cert.der().clone()).unwrap();
+    let client_config = quinn::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+    let client = RetainGrpcClient::connect_with_optional_quic_config(
+        format!("quic://{}", server.local_addr()),
+        Some(crate::RetainQuicClientConfig {
+            server_name: "localhost".into(),
+            client_config,
+        }),
+    )
+    .await
+    .unwrap();
+
+    client
+        .retain(RetainedMessage {
+            tenant_id: "demo".into(),
+            topic: "devices/d1/state".into(),
+            payload: b"retained".to_vec().into(),
+            qos: 1,
+        })
+        .await
+        .unwrap();
+
+    let messages = client.match_topic("demo", "#").await.unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].topic, "devices/d1/state");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn retain_rpc_handlers_manage_write_and_match_without_grpc_transport() {
+    let retain = Arc::new(RetainHandle::default());
+    let rpc = crate::RetainRpc {
+        inner: retain.clone(),
+    };
+    let service: &dyn crate::RetainTransportService = &rpc;
+
+    service
+        .retain_message(RetainedMessage {
+            tenant_id: "demo".into(),
+            topic: "devices/d1/state".into(),
+            payload: b"retained".to_vec().into(),
+            qos: 1,
+        })
+        .await
+        .unwrap();
+
+    let messages = service.match_retained("demo", "#").await.unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].topic, "devices/d1/state");
+}
+
+#[tokio::test]
+async fn grpc_round_trip_for_retain_service() {
+    let bind = "127.0.0.1:50126".parse().unwrap();
+    let retain = Arc::new(RetainHandle::default());
+    let server = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: retain.clone(),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: None,
+            range_host: None,
+            range_runtime: None,
+            inbox_lwt_sink: None,
+        }
+        .serve(bind),
+    );
+    sleep(Duration::from_millis(50)).await;
+
+    let client = RetainGrpcClient::connect("http://127.0.0.1:50126")
+        .await
+        .unwrap();
+    client
+        .retain(RetainedMessage {
+            tenant_id: "demo".into(),
+            topic: "devices/d1/state".into(),
+            payload: b"retained".to_vec().into(),
+            qos: 1,
+        })
+        .await
+        .unwrap();
+
+    let messages = client.match_topic("demo", "#").await.unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].topic, "devices/d1/state");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn metadata_rpc_handlers_manage_members_and_balancer_state_without_grpc_transport() {
+    let registry = Arc::new(StaticServiceEndpointRegistry::default());
+    let rpc = crate::MetadataRpc {
+        inner: Some(registry.clone()),
+    };
+    let service: &dyn crate::MetadataTransportService = &rpc;
+
+    let previous = service
+        .upsert_member_record(ClusterNodeMembership::new(
+            7,
+            1,
+            ClusterNodeLifecycle::Serving,
+            vec![ServiceEndpoint::new(
+                ServiceKind::Retain,
+                7,
+                "http://127.0.0.1:50062",
+            )],
+        ))
+        .await
+        .unwrap();
+    assert!(previous.is_none());
+
+    let member = service.lookup_member_record(7).await.unwrap().unwrap();
+    assert_eq!(member.node_id, 7);
+    assert_eq!(member.endpoints[0].kind, ServiceKind::Retain);
+
+    let members = service.list_member_records().await.unwrap();
+    assert_eq!(members.len(), 1);
+
+    let previous_state = service
+        .upsert_balancer_state_record(
+            "replica-count",
+            BalancerState {
+                disabled: false,
+                load_rules: BTreeMap::from([("target_voters".into(), "3".into())]),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(previous_state.is_none());
+
+    let state = service
+        .lookup_balancer_state_record("replica-count")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.load_rules["target_voters"], "3");
+
+    let states = service.list_balancer_state_records().await.unwrap();
+    assert_eq!(states.len(), 1);
+    assert_eq!(states["replica-count"].load_rules["target_voters"], "3");
+
+    let removed_state = service
+        .remove_balancer_state_record("replica-count")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(removed_state.load_rules["target_voters"], "3");
+    assert!(service
+        .lookup_balancer_state_record("replica-count")
+        .await
+        .unwrap()
+        .is_none());
+
+    let removed_member = service.remove_member_record(7).await.unwrap().unwrap();
+    assert_eq!(removed_member.node_id, 7);
+    assert!(service.lookup_member_record(7).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn metadata_rpc_handlers_manage_ranges_without_grpc_transport() {
+    let registry = Arc::new(StaticServiceEndpointRegistry::default());
+    let rpc = crate::MetadataRpc {
+        inner: Some(registry.clone()),
+    };
+    let service: &dyn crate::MetadataTransportService = &rpc;
+
+    let shard = ServiceShardKey::retain("t1");
+    let previous = service
+        .upsert_range_record(ReplicatedRangeDescriptor::new(
+            "range-direct",
+            shard.clone(),
+            RangeBoundary::new(Some(b"a".to_vec()), Some(b"z".to_vec())),
+            1,
+            2,
+            Some(7),
+            vec![
+                RangeReplica::new(7, ReplicaRole::Voter, ReplicaSyncState::Replicating),
+                RangeReplica::new(9, ReplicaRole::Learner, ReplicaSyncState::Snapshotting),
+            ],
+            11,
+            10,
+            ServiceShardLifecycle::Serving,
+        ))
+        .await
+        .unwrap();
+    assert!(previous.is_none());
+
+    let looked_up = service
+        .lookup_range_record("range-direct")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(looked_up.id, "range-direct");
+    assert_eq!(looked_up.config_version, 2);
+
+    let listed = service
+        .list_range_records(Some(ServiceShardKind::Retain), Some("t1"), None)
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, "range-direct");
+
+    let routed = service
+        .route_range_record(&shard, b"pear")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(routed.id, "range-direct");
+    assert_eq!(routed.leader_node_id, Some(7));
+
+    let removed = service
+        .remove_range_record("range-direct")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(removed.id, "range-direct");
+    assert!(service
+        .lookup_range_record("range-direct")
+        .await
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]
@@ -1351,6 +2747,754 @@ async fn metadata_service_restores_members_and_ranges_after_restart() {
     assert_eq!(routed.leader_node_id, Some(7));
 
     restarted.abort();
+}
+
+#[tokio::test]
+async fn kvrange_rpc_handlers_get_without_grpc_transport() {
+    let engine = MemoryKvEngine::default();
+    engine
+        .bootstrap(KvRangeBootstrap {
+            range_id: "range-get-direct".into(),
+            boundary: RangeBoundary::new(Some(b"a".to_vec()), Some(b"z".to_vec())),
+        })
+        .await
+        .unwrap();
+    let host = Arc::new(MemoryKvRangeHost::default());
+    let range = engine.open_range("range-get-direct").await.unwrap();
+    range
+        .writer()
+        .apply(vec![KvMutation {
+            key: b"mango".as_slice().into(),
+            value: Some(b"yellow".as_slice().into()),
+        }])
+        .await
+        .unwrap();
+    let raft_impl = Arc::new(MemoryRaftNode::single_node(1, "range-get-direct"));
+    raft_impl.recover().await.unwrap();
+    let raft: Arc<dyn RaftNode> = raft_impl;
+    host.add_range(HostedRange {
+        descriptor: ReplicatedRangeDescriptor::new(
+            "range-get-direct",
+            ServiceShardKey::retain("t1"),
+            RangeBoundary::new(Some(b"a".to_vec()), Some(b"z".to_vec())),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ),
+        raft,
+        space: Arc::from(range),
+    })
+    .await
+    .unwrap();
+
+    let rpc = crate::KvRangeRpc { inner: Some(host) };
+    let service: &dyn crate::KvRangeTransportService = &rpc;
+
+    let mango = service
+        .get_value("range-get-direct", b"mango", 0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&mango[..], b"yellow");
+    assert!(service
+        .get_value("range-get-direct", b"missing", 0)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn grpc_round_trip_for_kv_range_get_surface() {
+    let bind = "127.0.0.1:50134".parse().unwrap();
+    let engine = MemoryKvEngine::default();
+    engine
+        .bootstrap(KvRangeBootstrap {
+            range_id: "range-get".into(),
+            boundary: RangeBoundary::new(Some(b"a".to_vec()), Some(b"z".to_vec())),
+        })
+        .await
+        .unwrap();
+    let host = Arc::new(MemoryKvRangeHost::default());
+    let range = engine.open_range("range-get").await.unwrap();
+    range
+        .writer()
+        .apply(vec![KvMutation {
+            key: b"mango".as_slice().into(),
+            value: Some(b"yellow".as_slice().into()),
+        }])
+        .await
+        .unwrap();
+    let raft_impl = Arc::new(MemoryRaftNode::single_node(1, "range-get"));
+    raft_impl.recover().await.unwrap();
+    let raft: Arc<dyn RaftNode> = raft_impl;
+    host.add_range(HostedRange {
+        descriptor: ReplicatedRangeDescriptor::new(
+            "range-get",
+            ServiceShardKey::retain("t1"),
+            RangeBoundary::new(Some(b"a".to_vec()), Some(b"z".to_vec())),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ),
+        raft,
+        space: Arc::from(range),
+    })
+    .await
+    .unwrap();
+    let server = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: None,
+            range_host: Some(host),
+            range_runtime: None,
+            inbox_lwt_sink: None,
+        }
+        .serve(bind),
+    );
+    sleep(Duration::from_millis(50)).await;
+
+    let client = KvRangeGrpcClient::connect("http://127.0.0.1:50134")
+        .await
+        .unwrap();
+    let mango = client.get("range-get", b"mango").await.unwrap().unwrap();
+    assert_eq!(&mango[..], b"yellow");
+    assert!(client.get("range-get", b"missing").await.unwrap().is_none());
+    let missing_range = client.get("missing-range", b"mango").await.unwrap_err();
+    assert_eq!(tonic_status(&missing_range).code(), tonic::Code::NotFound);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn kvrange_rpc_handlers_scan_without_grpc_transport() {
+    let engine = MemoryKvEngine::default();
+    engine
+        .bootstrap(KvRangeBootstrap {
+            range_id: "range-scan-direct".into(),
+            boundary: RangeBoundary::new(Some(b"a".to_vec()), Some(b"z".to_vec())),
+        })
+        .await
+        .unwrap();
+    let host = Arc::new(MemoryKvRangeHost::default());
+    let range = engine.open_range("range-scan-direct").await.unwrap();
+    range
+        .writer()
+        .apply(vec![
+            KvMutation {
+                key: b"mango".as_slice().into(),
+                value: Some(b"yellow".as_slice().into()),
+            },
+            KvMutation {
+                key: b"pear".as_slice().into(),
+                value: Some(b"green".as_slice().into()),
+            },
+            KvMutation {
+                key: b"plum".as_slice().into(),
+                value: Some(b"purple".as_slice().into()),
+            },
+        ])
+        .await
+        .unwrap();
+    let raft_impl = Arc::new(MemoryRaftNode::single_node(1, "range-scan-direct"));
+    raft_impl.recover().await.unwrap();
+    let raft: Arc<dyn RaftNode> = raft_impl;
+    host.add_range(HostedRange {
+        descriptor: ReplicatedRangeDescriptor::new(
+            "range-scan-direct",
+            ServiceShardKey::retain("t1"),
+            RangeBoundary::new(Some(b"a".to_vec()), Some(b"z".to_vec())),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ),
+        raft,
+        space: Arc::from(range),
+    })
+    .await
+    .unwrap();
+
+    let rpc = crate::KvRangeRpc { inner: Some(host) };
+    let service: &dyn crate::KvRangeTransportService = &rpc;
+
+    let scanned = service
+        .scan_entries(
+            "range-scan-direct",
+            Some(RangeBoundary::new(Some(b"m".to_vec()), Some(b"z".to_vec()))),
+            2,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(scanned.len(), 2);
+    assert_eq!(&scanned[0].0[..], b"mango");
+    assert_eq!(&scanned[1].0[..], b"pear");
+}
+
+#[tokio::test]
+async fn grpc_round_trip_for_kv_range_scan_surface() {
+    let bind = "127.0.0.1:50135".parse().unwrap();
+    let engine = MemoryKvEngine::default();
+    engine
+        .bootstrap(KvRangeBootstrap {
+            range_id: "range-scan".into(),
+            boundary: RangeBoundary::new(Some(b"a".to_vec()), Some(b"z".to_vec())),
+        })
+        .await
+        .unwrap();
+    let host = Arc::new(MemoryKvRangeHost::default());
+    let range = engine.open_range("range-scan").await.unwrap();
+    range
+        .writer()
+        .apply(vec![
+            KvMutation {
+                key: b"mango".as_slice().into(),
+                value: Some(b"yellow".as_slice().into()),
+            },
+            KvMutation {
+                key: b"pear".as_slice().into(),
+                value: Some(b"green".as_slice().into()),
+            },
+            KvMutation {
+                key: b"plum".as_slice().into(),
+                value: Some(b"purple".as_slice().into()),
+            },
+        ])
+        .await
+        .unwrap();
+    let raft_impl = Arc::new(MemoryRaftNode::single_node(1, "range-scan"));
+    raft_impl.recover().await.unwrap();
+    let raft: Arc<dyn RaftNode> = raft_impl;
+    host.add_range(HostedRange {
+        descriptor: ReplicatedRangeDescriptor::new(
+            "range-scan",
+            ServiceShardKey::retain("t1"),
+            RangeBoundary::new(Some(b"a".to_vec()), Some(b"z".to_vec())),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ),
+        raft,
+        space: Arc::from(range),
+    })
+    .await
+    .unwrap();
+    let server = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: None,
+            range_host: Some(host),
+            range_runtime: None,
+            inbox_lwt_sink: None,
+        }
+        .serve(bind),
+    );
+    sleep(Duration::from_millis(50)).await;
+
+    let client = KvRangeGrpcClient::connect("http://127.0.0.1:50135")
+        .await
+        .unwrap();
+    let scanned = client
+        .scan(
+            "range-scan",
+            Some(RangeBoundary::new(Some(b"m".to_vec()), Some(b"z".to_vec()))),
+            2,
+        )
+        .await
+        .unwrap();
+    assert_eq!(scanned.len(), 2);
+    assert_eq!(&scanned[0].0[..], b"mango");
+    assert_eq!(&scanned[1].0[..], b"pear");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn kvrange_rpc_handlers_apply_without_grpc_transport() {
+    let engine = MemoryKvEngine::default();
+    engine
+        .bootstrap(KvRangeBootstrap {
+            range_id: "range-apply-direct".into(),
+            boundary: RangeBoundary::new(Some(b"a".to_vec()), Some(b"z".to_vec())),
+        })
+        .await
+        .unwrap();
+    let host = Arc::new(MemoryKvRangeHost::default());
+    let range = engine.open_range("range-apply-direct").await.unwrap();
+    let raft_impl = Arc::new(MemoryRaftNode::single_node(1, "range-apply-direct"));
+    raft_impl.recover().await.unwrap();
+    let raft: Arc<dyn RaftNode> = raft_impl;
+    host.add_range(HostedRange {
+        descriptor: ReplicatedRangeDescriptor::new(
+            "range-apply-direct",
+            ServiceShardKey::retain("t1"),
+            RangeBoundary::new(Some(b"a".to_vec()), Some(b"z".to_vec())),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ),
+        raft,
+        space: Arc::from(range),
+    })
+    .await
+    .unwrap();
+
+    let rpc = crate::KvRangeRpc { inner: Some(host) };
+    let service: &dyn crate::KvRangeTransportService = &rpc;
+
+    service
+        .apply_mutations(
+            "range-apply-direct",
+            vec![KvMutation {
+                key: b"mango".as_slice().into(),
+                value: Some(b"yellow".as_slice().into()),
+            }],
+            0,
+        )
+        .await
+        .unwrap();
+
+    let mango = service
+        .get_value("range-apply-direct", b"mango", 0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&mango[..], b"yellow");
+}
+
+#[tokio::test]
+async fn grpc_round_trip_for_kv_range_apply_surface() {
+    let bind = "127.0.0.1:50136".parse().unwrap();
+    let engine = MemoryKvEngine::default();
+    engine
+        .bootstrap(KvRangeBootstrap {
+            range_id: "range-apply".into(),
+            boundary: RangeBoundary::new(Some(b"a".to_vec()), Some(b"z".to_vec())),
+        })
+        .await
+        .unwrap();
+    let host = Arc::new(MemoryKvRangeHost::default());
+    let range = engine.open_range("range-apply").await.unwrap();
+    let raft_impl = Arc::new(MemoryRaftNode::single_node(1, "range-apply"));
+    raft_impl.recover().await.unwrap();
+    let raft: Arc<dyn RaftNode> = raft_impl;
+    host.add_range(HostedRange {
+        descriptor: ReplicatedRangeDescriptor::new(
+            "range-apply",
+            ServiceShardKey::retain("t1"),
+            RangeBoundary::new(Some(b"a".to_vec()), Some(b"z".to_vec())),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ),
+        raft,
+        space: Arc::from(range),
+    })
+    .await
+    .unwrap();
+    let server = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: None,
+            range_host: Some(host),
+            range_runtime: None,
+            inbox_lwt_sink: None,
+        }
+        .serve(bind),
+    );
+    sleep(Duration::from_millis(50)).await;
+
+    let client = KvRangeGrpcClient::connect("http://127.0.0.1:50136")
+        .await
+        .unwrap();
+    client
+        .apply(
+            "range-apply",
+            vec![KvMutation {
+                key: b"mango".as_slice().into(),
+                value: Some(b"yellow".as_slice().into()),
+            }],
+        )
+        .await
+        .unwrap();
+    let mango = client.get("range-apply", b"mango").await.unwrap().unwrap();
+    assert_eq!(&mango[..], b"yellow");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn kvrange_rpc_handlers_checkpoint_without_grpc_transport() {
+    let engine = MemoryKvEngine::default();
+    engine
+        .bootstrap(KvRangeBootstrap {
+            range_id: "range-checkpoint-direct".into(),
+            boundary: RangeBoundary::new(Some(b"a".to_vec()), Some(b"z".to_vec())),
+        })
+        .await
+        .unwrap();
+    let host = Arc::new(MemoryKvRangeHost::default());
+    let range = engine.open_range("range-checkpoint-direct").await.unwrap();
+    let raft_impl = Arc::new(MemoryRaftNode::single_node(1, "range-checkpoint-direct"));
+    raft_impl.recover().await.unwrap();
+    let raft: Arc<dyn RaftNode> = raft_impl;
+    host.add_range(HostedRange {
+        descriptor: ReplicatedRangeDescriptor::new(
+            "range-checkpoint-direct",
+            ServiceShardKey::retain("t1"),
+            RangeBoundary::new(Some(b"a".to_vec()), Some(b"z".to_vec())),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ),
+        raft,
+        space: Arc::from(range),
+    })
+    .await
+    .unwrap();
+
+    let rpc = crate::KvRangeRpc { inner: Some(host) };
+    let service: &dyn crate::KvRangeTransportService = &rpc;
+
+    let checkpoint = service
+        .checkpoint_range("range-checkpoint-direct", "cp-1", 0)
+        .await
+        .unwrap();
+    assert_eq!(checkpoint.range_id, "range-checkpoint-direct");
+    assert_eq!(checkpoint.checkpoint_id, "cp-1");
+    assert!(checkpoint.path.contains("cp-1"));
+}
+
+#[tokio::test]
+async fn grpc_round_trip_for_kv_range_checkpoint_surface() {
+    let bind = "127.0.0.1:50137".parse().unwrap();
+    let engine = MemoryKvEngine::default();
+    engine
+        .bootstrap(KvRangeBootstrap {
+            range_id: "range-checkpoint".into(),
+            boundary: RangeBoundary::new(Some(b"a".to_vec()), Some(b"z".to_vec())),
+        })
+        .await
+        .unwrap();
+    let host = Arc::new(MemoryKvRangeHost::default());
+    let range = engine.open_range("range-checkpoint").await.unwrap();
+    let raft_impl = Arc::new(MemoryRaftNode::single_node(1, "range-checkpoint"));
+    raft_impl.recover().await.unwrap();
+    let raft: Arc<dyn RaftNode> = raft_impl;
+    host.add_range(HostedRange {
+        descriptor: ReplicatedRangeDescriptor::new(
+            "range-checkpoint",
+            ServiceShardKey::retain("t1"),
+            RangeBoundary::new(Some(b"a".to_vec()), Some(b"z".to_vec())),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ),
+        raft,
+        space: Arc::from(range),
+    })
+    .await
+    .unwrap();
+    let server = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: None,
+            range_host: Some(host),
+            range_runtime: None,
+            inbox_lwt_sink: None,
+        }
+        .serve(bind),
+    );
+    sleep(Duration::from_millis(50)).await;
+
+    let client = KvRangeGrpcClient::connect("http://127.0.0.1:50137")
+        .await
+        .unwrap();
+    let checkpoint = client.checkpoint("range-checkpoint", "cp-1").await.unwrap();
+    assert_eq!(checkpoint.range_id, "range-checkpoint");
+    assert_eq!(checkpoint.checkpoint_id, "cp-1");
+    assert!(checkpoint.path.contains("cp-1"));
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn kvrange_rpc_handlers_snapshot_without_grpc_transport() {
+    let engine = MemoryKvEngine::default();
+    engine
+        .bootstrap(KvRangeBootstrap {
+            range_id: "range-snapshot-direct".into(),
+            boundary: RangeBoundary::new(Some(b"a".to_vec()), Some(b"z".to_vec())),
+        })
+        .await
+        .unwrap();
+    let host = Arc::new(MemoryKvRangeHost::default());
+    let range = engine.open_range("range-snapshot-direct").await.unwrap();
+    let raft_impl = Arc::new(MemoryRaftNode::single_node(1, "range-snapshot-direct"));
+    raft_impl.recover().await.unwrap();
+    let raft: Arc<dyn RaftNode> = raft_impl;
+    host.add_range(HostedRange {
+        descriptor: ReplicatedRangeDescriptor::new(
+            "range-snapshot-direct",
+            ServiceShardKey::retain("t1"),
+            RangeBoundary::new(Some(b"a".to_vec()), Some(b"z".to_vec())),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ),
+        raft,
+        space: Arc::from(range),
+    })
+    .await
+    .unwrap();
+
+    let rpc = crate::KvRangeRpc { inner: Some(host) };
+    let service: &dyn crate::KvRangeTransportService = &rpc;
+
+    let snapshot = service
+        .snapshot_metadata("range-snapshot-direct", 0)
+        .await
+        .unwrap();
+    assert_eq!(snapshot.range_id, "range-snapshot-direct");
+    assert_eq!(snapshot.boundary.start_key.as_deref(), Some(&b"a"[..]));
+    assert_eq!(snapshot.boundary.end_key.as_deref(), Some(&b"z"[..]));
+}
+
+#[tokio::test]
+async fn grpc_round_trip_for_kv_range_snapshot_surface() {
+    let bind = "127.0.0.1:50138".parse().unwrap();
+    let engine = MemoryKvEngine::default();
+    engine
+        .bootstrap(KvRangeBootstrap {
+            range_id: "range-snapshot".into(),
+            boundary: RangeBoundary::new(Some(b"a".to_vec()), Some(b"z".to_vec())),
+        })
+        .await
+        .unwrap();
+    let host = Arc::new(MemoryKvRangeHost::default());
+    let range = engine.open_range("range-snapshot").await.unwrap();
+    let raft_impl = Arc::new(MemoryRaftNode::single_node(1, "range-snapshot"));
+    raft_impl.recover().await.unwrap();
+    let raft: Arc<dyn RaftNode> = raft_impl;
+    host.add_range(HostedRange {
+        descriptor: ReplicatedRangeDescriptor::new(
+            "range-snapshot",
+            ServiceShardKey::retain("t1"),
+            RangeBoundary::new(Some(b"a".to_vec()), Some(b"z".to_vec())),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ),
+        raft,
+        space: Arc::from(range),
+    })
+    .await
+    .unwrap();
+    let server = tokio::spawn(
+        RpcRuntime {
+            sessiondict: Arc::new(SessionDictHandle::default()),
+            dist: Arc::new(DistHandle::default()),
+            inbox: Arc::new(InboxHandle::default()),
+            retain: Arc::new(RetainHandle::default()),
+            peer_sink: Arc::new(NoopDeliverySink),
+            assignment_registry: None,
+            range_host: Some(host),
+            range_runtime: None,
+            inbox_lwt_sink: None,
+        }
+        .serve(bind),
+    );
+    sleep(Duration::from_millis(50)).await;
+
+    let client = KvRangeGrpcClient::connect("http://127.0.0.1:50138")
+        .await
+        .unwrap();
+    let snapshot = client.snapshot("range-snapshot").await.unwrap();
+    assert_eq!(snapshot.range_id, "range-snapshot");
+    assert_eq!(snapshot.boundary.start_key.as_deref(), Some(&b"a"[..]));
+    assert_eq!(snapshot.boundary.end_key.as_deref(), Some(&b"z"[..]));
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn kvrange_executor_factory_connects_quic_endpoint_when_configured() {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert_pem = cert.cert.pem();
+    let key_pem = cert.signing_key.serialize_pem();
+    let tempdir = tempfile::tempdir().unwrap();
+    let cert_path = tempdir.path().join("server.crt");
+    let key_path = tempdir.path().join("server.key");
+    std::fs::write(&cert_path, cert_pem.as_bytes()).unwrap();
+    std::fs::write(&key_path, key_pem.as_bytes()).unwrap();
+
+    let listener = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let bind = listener.local_addr().unwrap();
+    drop(listener);
+
+    let engine = MemoryKvEngine::default();
+    engine
+        .bootstrap(KvRangeBootstrap {
+            range_id: "range-factory-quic".into(),
+            boundary: RangeBoundary::new(Some(b"a".to_vec()), Some(b"z".to_vec())),
+        })
+        .await
+        .unwrap();
+    let host = Arc::new(MemoryKvRangeHost::default());
+    let range = engine.open_range("range-factory-quic").await.unwrap();
+    range
+        .writer()
+        .apply(vec![KvMutation {
+            key: b"mango".as_slice().into(),
+            value: Some(b"yellow".as_slice().into()),
+        }])
+        .await
+        .unwrap();
+    let raft_impl = Arc::new(MemoryRaftNode::single_node(1, "range-factory-quic"));
+    raft_impl.recover().await.unwrap();
+    let raft: Arc<dyn RaftNode> = raft_impl;
+    host.add_range(HostedRange {
+        descriptor: ReplicatedRangeDescriptor::new(
+            "range-factory-quic",
+            ServiceShardKey::retain("t1"),
+            RangeBoundary::new(Some(b"a".to_vec()), Some(b"z".to_vec())),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ),
+        raft,
+        space: Arc::from(range),
+    })
+    .await
+    .unwrap();
+
+    let service: Arc<dyn crate::KvRangeTransportService> =
+        Arc::new(crate::KvRangeRpc { inner: Some(host) });
+    let server =
+        crate::quic_kvrange::spawn_kvrange_quic_server(service, bind, &cert_path, &key_path)
+            .unwrap();
+    sleep(Duration::from_millis(50)).await;
+
+    let mut roots = quinn::rustls::RootCertStore::empty();
+    roots.add(cert.cert.der().clone()).unwrap();
+    let client_config = quinn::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+    let factory = KvRangeGrpcExecutorFactory::with_quic_client_config("localhost", client_config);
+    let executor = factory
+        .connect(&format!("quic://{}", server.local_addr()))
+        .await
+        .unwrap();
+
+    let mango = executor
+        .get("range-factory-quic", b"mango")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&mango[..], b"yellow");
+
+    server.abort();
 }
 
 #[tokio::test]
@@ -2137,6 +4281,241 @@ async fn range_admin_service_reports_health_and_debug_dump() {
 }
 
 #[tokio::test]
+async fn range_admin_client_connects_quic_endpoint_when_configured() {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert_pem = cert.cert.pem();
+    let key_pem = cert.signing_key.serialize_pem();
+    let tempdir = tempfile::tempdir().unwrap();
+    let cert_path = tempdir.path().join("server.crt");
+    let key_path = tempdir.path().join("server.key");
+    std::fs::write(&cert_path, cert_pem.as_bytes()).unwrap();
+    std::fs::write(&key_path, key_pem.as_bytes()).unwrap();
+
+    let listener = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let bind = listener.local_addr().unwrap();
+    drop(listener);
+
+    let engine = MemoryKvEngine::default();
+    engine
+        .bootstrap(KvRangeBootstrap {
+            range_id: "range-admin-client-quic".into(),
+            boundary: RangeBoundary::full(),
+        })
+        .await
+        .unwrap();
+    let range = engine.open_range("range-admin-client-quic").await.unwrap();
+    let host = Arc::new(MemoryKvRangeHost::default());
+    let raft_impl = Arc::new(MemoryRaftNode::single_node(1, "range-admin-client-quic"));
+    raft_impl.recover().await.unwrap();
+    let raft: Arc<dyn RaftNode> = raft_impl;
+    host.add_range(HostedRange {
+        descriptor: ReplicatedRangeDescriptor::new(
+            "range-admin-client-quic",
+            ServiceShardKey::retain("t1"),
+            RangeBoundary::full(),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ),
+        raft,
+        space: Arc::from(range),
+    })
+    .await
+    .unwrap();
+
+    let service: Arc<dyn crate::RangeAdminTransportService> = Arc::new(crate::RangeAdminRpc {
+        host: Some(host),
+        runtime: None,
+    });
+    let server = crate::quic_range_admin::spawn_range_admin_quic_server(
+        service, bind, &cert_path, &key_path,
+    )
+    .unwrap();
+    sleep(Duration::from_millis(50)).await;
+
+    let mut roots = quinn::rustls::RootCertStore::empty();
+    roots.add(cert.cert.der().clone()).unwrap();
+    let client_config = quinn::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+    let client = RangeAdminGrpcClient::connect_with_optional_quic_config(
+        format!("quic://{}", server.local_addr()),
+        Some(crate::RangeAdminQuicClientConfig {
+            server_name: "localhost".into(),
+            client_config,
+        }),
+    )
+    .await
+    .unwrap();
+
+    let listed = client.list_range_health().await.unwrap();
+    assert_eq!(listed.entries.len(), 1);
+    assert_eq!(listed.entries[0].range_id, "range-admin-client-quic");
+    let fetched = client
+        .get_range_health("range-admin-client-quic")
+        .await
+        .unwrap();
+    assert_eq!(fetched.health.unwrap().range_id, "range-admin-client-quic");
+    let dump = client.debug_dump().await.unwrap();
+    assert!(dump.contains("range=range-admin-client-quic"));
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn dist_client_connects_quic_endpoint_when_configured() {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert_pem = cert.cert.pem();
+    let key_pem = cert.signing_key.serialize_pem();
+    let tempdir = tempfile::tempdir().unwrap();
+    let cert_path = tempdir.path().join("server.crt");
+    let key_path = tempdir.path().join("server.key");
+    std::fs::write(&cert_path, cert_pem.as_bytes()).unwrap();
+    std::fs::write(&key_path, key_pem.as_bytes()).unwrap();
+
+    let listener = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let bind = listener.local_addr().unwrap();
+    drop(listener);
+
+    let dist = Arc::new(DistHandle::default());
+    let service: Arc<dyn crate::DistTransportService> = Arc::new(crate::DistRpc {
+        inner: dist,
+        assignment_registry: None,
+    });
+    let server =
+        crate::quic_dist::spawn_dist_quic_server(service, bind, &cert_path, &key_path).unwrap();
+    sleep(Duration::from_millis(50)).await;
+
+    let mut roots = quinn::rustls::RootCertStore::empty();
+    roots.add(cert.cert.der().clone()).unwrap();
+    let client_config = quinn::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+    let client = DistGrpcClient::connect_with_optional_quic_config(
+        format!("quic://{}", server.local_addr()),
+        Some(crate::DistQuicClientConfig {
+            server_name: "localhost".into(),
+            client_config,
+        }),
+    )
+    .await
+    .unwrap();
+
+    client
+        .add_route(RouteRecord {
+            tenant_id: "t1".into(),
+            topic_filter: "devices/+/state".into(),
+            session_id: "s1".into(),
+            node_id: 7,
+            subscription_identifier: Some(1),
+            no_local: false,
+            retain_as_published: false,
+            shared_group: None,
+            kind: SessionKind::Persistent,
+        })
+        .await
+        .unwrap();
+    client
+        .add_route(RouteRecord {
+            tenant_id: "t1".into(),
+            topic_filter: "devices/+/status".into(),
+            session_id: "s1".into(),
+            node_id: 7,
+            subscription_identifier: None,
+            no_local: true,
+            retain_as_published: true,
+            shared_group: Some("g1".into()),
+            kind: SessionKind::Transient,
+        })
+        .await
+        .unwrap();
+
+    let routes = client.list_session_routes("s1").await.unwrap();
+    assert_eq!(routes.len(), 2);
+    let matched = client
+        .match_topic("t1", &"devices/d1/state".to_string())
+        .await
+        .unwrap();
+    assert_eq!(matched.len(), 1);
+    assert_eq!(client.route_count().await.unwrap(), 2);
+    assert_eq!(client.remove_session_routes("s1").await.unwrap(), 2);
+    assert_eq!(client.route_count().await.unwrap(), 0);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn range_admin_rpc_handlers_report_health_without_grpc_transport() {
+    let engine = MemoryKvEngine::default();
+    engine
+        .bootstrap(KvRangeBootstrap {
+            range_id: "range-admin-direct".into(),
+            boundary: RangeBoundary::full(),
+        })
+        .await
+        .unwrap();
+    let range = engine.open_range("range-admin-direct").await.unwrap();
+    let host = Arc::new(MemoryKvRangeHost::default());
+    let raft_impl = Arc::new(MemoryRaftNode::single_node(1, "range-admin-direct"));
+    raft_impl.recover().await.unwrap();
+    let raft: Arc<dyn RaftNode> = raft_impl;
+    host.add_range(HostedRange {
+        descriptor: ReplicatedRangeDescriptor::new(
+            "range-admin-direct",
+            ServiceShardKey::retain("t1"),
+            RangeBoundary::full(),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Serving,
+        ),
+        raft,
+        space: Arc::from(range),
+    })
+    .await
+    .unwrap();
+
+    let rpc = crate::RangeAdminRpc {
+        host: Some(host),
+        runtime: None,
+    };
+    let service: &dyn crate::RangeAdminTransportService = &rpc;
+    let listed = service.list_range_health_snapshots().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].range_id, "range-admin-direct");
+    assert_eq!(listed[0].reconfiguration.current_voters, vec![1]);
+
+    let fetched = service
+        .get_range_health_snapshot("range-admin-direct")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fetched.range_id, "range-admin-direct");
+    assert_eq!(fetched.reconfiguration.current_voters, vec![1]);
+
+    let missing = service
+        .get_range_health_snapshot("missing-range")
+        .await
+        .unwrap();
+    assert!(missing.is_none());
+
+    let dump = service.debug_dump_text().await.unwrap();
+    assert!(dump.contains("range=range-admin-direct"));
+    assert!(dump.contains("current_voters=[1]"));
+}
+
+#[tokio::test]
 async fn grpc_round_trip_for_range_control_service() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let bind = listener.local_addr().unwrap();
@@ -2206,7 +4585,10 @@ async fn grpc_round_trip_for_range_control_service() {
         .change_replicas("range-control", vec![1, 2], Vec::new())
         .await
         .unwrap();
-    client.transfer_leadership("range-control", 1).await.unwrap();
+    client
+        .transfer_leadership("range-control", 1)
+        .await
+        .unwrap();
     client.recover_range("range-control", 1).await.unwrap();
 
     let (left, right) = client
@@ -2221,6 +4603,150 @@ async fn grpc_round_trip_for_range_control_service() {
     client.retire_range(&merged).await.unwrap();
 
     server.abort();
+}
+
+#[tokio::test]
+async fn range_control_rpc_handlers_manage_basic_actions_without_grpc_transport() {
+    let engine = MemoryKvEngine::default();
+    let host = Arc::new(MemoryKvRangeHost::default());
+    let runtime = Arc::new(ReplicaRuntime::with_config(
+        host.clone(),
+        Arc::new(crate::NoopReplicaTransport),
+        Some(Arc::new(TestRangeLifecycleManager {
+            engine: engine.clone(),
+        })),
+        Duration::from_secs(1),
+        64,
+        64,
+        64,
+    ));
+    let rpc = crate::RangeControlRpc {
+        inner: Some(runtime.clone()),
+        registry: None,
+    };
+    let service: &dyn crate::RangeControlTransportService = &rpc;
+
+    let range_id = service
+        .bootstrap_range_action(ReplicatedRangeDescriptor::new(
+            "range-control-direct",
+            ServiceShardKey::retain("t1"),
+            RangeBoundary::full(),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Bootstrapping,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(range_id, "range-control-direct");
+
+    service
+        .change_replicas_action("range-control-direct", vec![1, 2], Vec::new())
+        .await
+        .unwrap();
+    let status_after_change = runtime
+        .health_snapshot()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.range_id == "range-control-direct")
+        .unwrap();
+    assert_eq!(status_after_change.reconfiguration.current_voters, vec![1]);
+    assert!(
+        status_after_change.reconfiguration.pending_voters == vec![1, 2]
+            || status_after_change.reconfiguration.phase.is_some()
+    );
+
+    service
+        .transfer_leadership_action("range-control-direct", 1)
+        .await
+        .unwrap();
+    let status_after_transfer = runtime
+        .health_snapshot()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.range_id == "range-control-direct")
+        .unwrap();
+    assert_eq!(status_after_transfer.leader_node_id, Some(1));
+
+    service
+        .recover_range_action("range-control-direct", 1)
+        .await
+        .unwrap();
+    let status_after_recover = runtime
+        .health_snapshot()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.range_id == "range-control-direct")
+        .unwrap();
+    assert_eq!(status_after_recover.leader_node_id, Some(1));
+}
+
+#[tokio::test]
+async fn range_control_rpc_handlers_manage_split_merge_and_retirement_without_grpc_transport() {
+    let engine = MemoryKvEngine::default();
+    let host = Arc::new(MemoryKvRangeHost::default());
+    let runtime = Arc::new(ReplicaRuntime::with_config(
+        host.clone(),
+        Arc::new(crate::NoopReplicaTransport),
+        Some(Arc::new(TestRangeLifecycleManager {
+            engine: engine.clone(),
+        })),
+        Duration::from_secs(1),
+        64,
+        64,
+        64,
+    ));
+    let rpc = crate::RangeControlRpc {
+        inner: Some(runtime.clone()),
+        registry: None,
+    };
+    let service: &dyn crate::RangeControlTransportService = &rpc;
+
+    let range_id = service
+        .bootstrap_range_action(ReplicatedRangeDescriptor::new(
+            "range-control-split",
+            ServiceShardKey::retain("t1"),
+            RangeBoundary::full(),
+            1,
+            1,
+            Some(1),
+            vec![RangeReplica::new(
+                1,
+                ReplicaRole::Voter,
+                ReplicaSyncState::Replicating,
+            )],
+            0,
+            0,
+            ServiceShardLifecycle::Bootstrapping,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(range_id, "range-control-split");
+
+    let (left, right) = service
+        .split_range_action("range-control-split", b"m".to_vec())
+        .await
+        .unwrap();
+    assert_ne!(left, right);
+
+    let merged = service.merge_ranges_action(&left, &right).await.unwrap();
+    assert!(merged.contains(&left));
+
+    service.drain_range_action(&merged).await.unwrap();
+    let zombies = service.list_zombie_range_snapshots().await.unwrap();
+    assert!(zombies.iter().any(|entry| entry.range_id == merged));
+
+    service.retire_range_action(&merged).await.unwrap();
 }
 
 #[tokio::test]
@@ -2909,9 +5435,8 @@ async fn replicated_retain_can_use_kv_range_grpc_executor() {
             .await
             .unwrap(),
     );
-    let retain = ReplicatedRetainHandle::new(Arc::new(RoutedRangeDataClient::new(
-        router, executor,
-    )));
+    let retain =
+        ReplicatedRetainHandle::new(Arc::new(RoutedRangeDataClient::new(router, executor)));
 
     retain
         .retain(RetainedMessage {

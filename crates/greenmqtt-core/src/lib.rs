@@ -130,6 +130,73 @@ pub enum ServiceShardLifecycle {
     Offline,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ServiceEndpointTransport {
+    GrpcHttp,
+    GrpcHttps,
+    Quic,
+}
+
+impl ServiceEndpointTransport {
+    pub fn scheme(self) -> &'static str {
+        match self {
+            Self::GrpcHttp => "http",
+            Self::GrpcHttps => "https",
+            Self::Quic => "quic",
+        }
+    }
+
+    fn parse_scheme(raw: &str) -> anyhow::Result<Self> {
+        match raw {
+            "http" => Ok(Self::GrpcHttp),
+            "https" => Ok(Self::GrpcHttps),
+            "quic" => Ok(Self::Quic),
+            _ => anyhow::bail!("unsupported service endpoint scheme: {raw}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedServiceEndpoint {
+    pub transport: ServiceEndpointTransport,
+    pub authority: String,
+}
+
+impl ParsedServiceEndpoint {
+    pub fn parse(raw: &str) -> anyhow::Result<Self> {
+        let raw = raw.trim();
+        anyhow::ensure!(!raw.is_empty(), "service endpoint cannot be empty");
+        let (scheme, authority) = raw
+            .split_once("://")
+            .ok_or_else(|| anyhow::anyhow!("service endpoint missing scheme: {raw}"))?;
+        anyhow::ensure!(
+            !authority.is_empty(),
+            "service endpoint missing authority: {raw}"
+        );
+        Ok(Self {
+            transport: ServiceEndpointTransport::parse_scheme(scheme)?,
+            authority: authority.to_string(),
+        })
+    }
+
+    pub fn format(&self) -> String {
+        format!("{}://{}", self.transport.scheme(), self.authority)
+    }
+}
+
+pub fn normalize_service_endpoint(
+    raw: &str,
+    default_transport: ServiceEndpointTransport,
+) -> anyhow::Result<String> {
+    let raw = raw.trim();
+    anyhow::ensure!(!raw.is_empty(), "service endpoint cannot be empty");
+    if raw.contains("://") {
+        Ok(ParsedServiceEndpoint::parse(raw)?.format())
+    } else {
+        Ok(format!("{}://{raw}", default_transport.scheme()))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ServiceEndpoint {
     pub kind: ServiceKind,
@@ -144,6 +211,14 @@ impl ServiceEndpoint {
             node_id,
             endpoint: endpoint.into(),
         }
+    }
+
+    pub fn parsed(&self) -> anyhow::Result<ParsedServiceEndpoint> {
+        ParsedServiceEndpoint::parse(&self.endpoint)
+    }
+
+    pub fn transport(&self) -> anyhow::Result<ServiceEndpointTransport> {
+        Ok(self.parsed()?.transport)
     }
 }
 
@@ -1125,6 +1200,48 @@ mod tests {
         assert_eq!(assignment.fencing_token, 19);
         assert_eq!(assignment.lifecycle, ServiceShardLifecycle::Serving);
         assert_eq!(assignment.owner_node_id(), 7);
+        assert_eq!(
+            endpoint.transport().unwrap(),
+            crate::ServiceEndpointTransport::GrpcHttp
+        );
+    }
+
+    #[test]
+    fn service_endpoint_parsing_supports_grpc_and_quic_schemes() {
+        let grpc = crate::ParsedServiceEndpoint::parse("http://127.0.0.1:50070").unwrap();
+        assert_eq!(grpc.transport, crate::ServiceEndpointTransport::GrpcHttp);
+        assert_eq!(grpc.authority, "127.0.0.1:50070");
+        assert_eq!(grpc.format(), "http://127.0.0.1:50070");
+
+        let quic = crate::ParsedServiceEndpoint::parse("quic://node-1:50071").unwrap();
+        assert_eq!(quic.transport, crate::ServiceEndpointTransport::Quic);
+        assert_eq!(quic.authority, "node-1:50071");
+        assert_eq!(quic.format(), "quic://node-1:50071");
+    }
+
+    #[test]
+    fn normalize_service_endpoint_adds_default_scheme_and_rejects_unknown_scheme() {
+        assert_eq!(
+            crate::normalize_service_endpoint(
+                "127.0.0.1:50070",
+                crate::ServiceEndpointTransport::GrpcHttp
+            )
+            .unwrap(),
+            "http://127.0.0.1:50070"
+        );
+        assert_eq!(
+            crate::normalize_service_endpoint(
+                "quic://127.0.0.1:50071",
+                crate::ServiceEndpointTransport::GrpcHttp
+            )
+            .unwrap(),
+            "quic://127.0.0.1:50071"
+        );
+        assert!(crate::normalize_service_endpoint(
+            "grpc://127.0.0.1:50072",
+            crate::ServiceEndpointTransport::GrpcHttp
+        )
+        .is_err());
     }
 
     #[test]

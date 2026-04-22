@@ -2,11 +2,42 @@ use super::*;
 
 impl SessionDictGrpcClient {
     pub async fn connect(endpoint: impl Into<String>) -> anyhow::Result<Self> {
-        Ok(Self {
-            inner: Arc::new(Mutex::new(
-                SessionDictServiceClient::connect(endpoint.into()).await?,
-            )),
-        })
+        Self::connect_with_optional_quic_config(endpoint, None).await
+    }
+
+    pub async fn connect_with_optional_quic_config(
+        endpoint: impl Into<String>,
+        quic: Option<crate::SessionDictQuicClientConfig>,
+    ) -> anyhow::Result<Self> {
+        let raw = endpoint.into();
+        let normalized = normalize_service_endpoint(&raw, ServiceEndpointTransport::GrpcHttp)?;
+        match ParsedServiceEndpoint::parse(&normalized)?.transport {
+            ServiceEndpointTransport::GrpcHttp | ServiceEndpointTransport::GrpcHttps => {
+                let endpoint = normalize_grpc_endpoint(normalized)?;
+                Ok(Self {
+                    inner: crate::SessionDictClientTransport::Grpc(Arc::new(Mutex::new(
+                        SessionDictServiceClient::connect(endpoint).await?,
+                    ))),
+                })
+            }
+            ServiceEndpointTransport::Quic => {
+                let quic = quic.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "SessionDictGrpcClient requires QUIC client config for quic endpoints"
+                    )
+                })?;
+                Ok(Self {
+                    inner: crate::SessionDictClientTransport::Quic(Arc::new(
+                        crate::quic_sessiondict::QuicSessionDictClient::connect_with_client_config(
+                            normalized,
+                            &quic.server_name,
+                            quic.client_config,
+                        )
+                        .await?,
+                    )),
+                })
+            }
+        }
     }
 
     pub async fn connect_via_registry(
@@ -41,35 +72,42 @@ impl SessionDictGrpcClient {
         &self,
         assignment: &ServiceShardAssignment,
     ) -> anyhow::Result<SessionDictShardSnapshot> {
-        let mut client = self.inner.lock().await;
-        let mut stream = client
-            .stream_shard_snapshot(shard_snapshot_request_for_assignment(assignment))
-            .await?
-            .into_inner();
-        let mut bytes = Vec::new();
-        let mut expected_checksum = None;
-        while let Some(chunk) = stream.message().await? {
-            if let Some(checksum) = expected_checksum {
-                anyhow::ensure!(
-                    checksum == chunk.checksum,
-                    "sessiondict stream checksum drift"
-                );
-            } else {
-                expected_checksum = Some(chunk.checksum);
+        match &self.inner {
+            crate::SessionDictClientTransport::Grpc(inner) => {
+                let mut client = inner.lock().await;
+                let mut stream = client
+                    .stream_shard_snapshot(shard_snapshot_request_for_assignment(assignment))
+                    .await?
+                    .into_inner();
+                let mut bytes = Vec::new();
+                let mut expected_checksum = None;
+                while let Some(chunk) = stream.message().await? {
+                    if let Some(checksum) = expected_checksum {
+                        anyhow::ensure!(
+                            checksum == chunk.checksum,
+                            "sessiondict stream checksum drift"
+                        );
+                    } else {
+                        expected_checksum = Some(chunk.checksum);
+                    }
+                    bytes.extend_from_slice(&chunk.data);
+                    if chunk.done {
+                        break;
+                    }
+                }
+                let snapshot = SessionDictShardSnapshot::decode(&bytes)?;
+                if let Some(checksum) = expected_checksum {
+                    anyhow::ensure!(
+                        snapshot.checksum()? == checksum,
+                        "sessiondict stream checksum mismatch"
+                    );
+                }
+                Ok(snapshot)
             }
-            bytes.extend_from_slice(&chunk.data);
-            if chunk.done {
-                break;
+            crate::SessionDictClientTransport::Quic(_) => {
+                anyhow::bail!("sessiondict shard snapshot streaming is not supported over QUIC yet")
             }
         }
-        let snapshot = SessionDictShardSnapshot::decode(&bytes)?;
-        if let Some(checksum) = expected_checksum {
-            anyhow::ensure!(
-                snapshot.checksum()? == checksum,
-                "sessiondict stream checksum mismatch"
-            );
-        }
-        Ok(snapshot)
     }
 
     pub async fn import_shard_snapshot(
@@ -189,11 +227,40 @@ impl SessionDictGrpcClient {
 
 impl DistGrpcClient {
     pub async fn connect(endpoint: impl Into<String>) -> anyhow::Result<Self> {
-        Ok(Self {
-            inner: Arc::new(Mutex::new(
-                DistServiceClient::connect(endpoint.into()).await?,
-            )),
-        })
+        Self::connect_with_optional_quic_config(endpoint, None).await
+    }
+
+    pub async fn connect_with_optional_quic_config(
+        endpoint: impl Into<String>,
+        quic: Option<crate::DistQuicClientConfig>,
+    ) -> anyhow::Result<Self> {
+        let raw = endpoint.into();
+        let normalized = normalize_service_endpoint(&raw, ServiceEndpointTransport::GrpcHttp)?;
+        match ParsedServiceEndpoint::parse(&normalized)?.transport {
+            ServiceEndpointTransport::GrpcHttp | ServiceEndpointTransport::GrpcHttps => {
+                let endpoint = normalize_grpc_endpoint(normalized)?;
+                Ok(Self {
+                    inner: crate::DistClientTransport::Grpc(Arc::new(Mutex::new(
+                        DistServiceClient::connect(endpoint).await?,
+                    ))),
+                })
+            }
+            ServiceEndpointTransport::Quic => {
+                let quic = quic.ok_or_else(|| {
+                    anyhow::anyhow!("DistGrpcClient requires QUIC client config for quic endpoints")
+                })?;
+                Ok(Self {
+                    inner: crate::DistClientTransport::Quic(Arc::new(
+                        crate::quic_dist::QuicDistClient::connect_with_client_config(
+                            normalized,
+                            &quic.server_name,
+                            quic.client_config,
+                        )
+                        .await?,
+                    )),
+                })
+            }
+        }
     }
 
     pub async fn connect_via_registry(
@@ -221,32 +288,39 @@ impl DistGrpcClient {
         &self,
         assignment: &ServiceShardAssignment,
     ) -> anyhow::Result<DistShardSnapshot> {
-        let mut client = self.inner.lock().await;
-        let mut stream = client
-            .stream_shard_snapshot(shard_snapshot_request_for_assignment(assignment))
-            .await?
-            .into_inner();
-        let mut bytes = Vec::new();
-        let mut expected_checksum = None;
-        while let Some(chunk) = stream.message().await? {
-            if let Some(checksum) = expected_checksum {
-                anyhow::ensure!(checksum == chunk.checksum, "dist stream checksum drift");
-            } else {
-                expected_checksum = Some(chunk.checksum);
+        match &self.inner {
+            crate::DistClientTransport::Grpc(inner) => {
+                let mut client = inner.lock().await;
+                let mut stream = client
+                    .stream_shard_snapshot(shard_snapshot_request_for_assignment(assignment))
+                    .await?
+                    .into_inner();
+                let mut bytes = Vec::new();
+                let mut expected_checksum = None;
+                while let Some(chunk) = stream.message().await? {
+                    if let Some(checksum) = expected_checksum {
+                        anyhow::ensure!(checksum == chunk.checksum, "dist stream checksum drift");
+                    } else {
+                        expected_checksum = Some(chunk.checksum);
+                    }
+                    bytes.extend_from_slice(&chunk.data);
+                    if chunk.done {
+                        break;
+                    }
+                }
+                let snapshot = DistShardSnapshot::decode(&bytes)?;
+                if let Some(checksum) = expected_checksum {
+                    anyhow::ensure!(
+                        snapshot.checksum()? == checksum,
+                        "dist stream checksum mismatch"
+                    );
+                }
+                Ok(snapshot)
             }
-            bytes.extend_from_slice(&chunk.data);
-            if chunk.done {
-                break;
+            crate::DistClientTransport::Quic(_) => {
+                anyhow::bail!("dist shard snapshot streaming is not supported over QUIC yet")
             }
         }
-        let snapshot = DistShardSnapshot::decode(&bytes)?;
-        if let Some(checksum) = expected_checksum {
-            anyhow::ensure!(
-                snapshot.checksum()? == checksum,
-                "dist stream checksum mismatch"
-            );
-        }
-        Ok(snapshot)
     }
 
     pub async fn import_shard_snapshot(
@@ -562,11 +636,42 @@ impl PeriodicAntiEntropyReconciler {
 
 impl InboxGrpcClient {
     pub async fn connect(endpoint: impl Into<String>) -> anyhow::Result<Self> {
-        Ok(Self {
-            inner: Arc::new(Mutex::new(
-                InboxServiceClient::connect(endpoint.into()).await?,
-            )),
-        })
+        Self::connect_with_optional_quic_config(endpoint, None).await
+    }
+
+    pub async fn connect_with_optional_quic_config(
+        endpoint: impl Into<String>,
+        quic: Option<crate::InboxQuicClientConfig>,
+    ) -> anyhow::Result<Self> {
+        let raw = endpoint.into();
+        let normalized = normalize_service_endpoint(&raw, ServiceEndpointTransport::GrpcHttp)?;
+        match ParsedServiceEndpoint::parse(&normalized)?.transport {
+            ServiceEndpointTransport::GrpcHttp | ServiceEndpointTransport::GrpcHttps => {
+                let endpoint = normalize_grpc_endpoint(normalized)?;
+                Ok(Self {
+                    inner: crate::InboxClientTransport::Grpc(Arc::new(Mutex::new(
+                        InboxServiceClient::connect(endpoint).await?,
+                    ))),
+                })
+            }
+            ServiceEndpointTransport::Quic => {
+                let quic = quic.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "InboxGrpcClient requires QUIC client config for quic endpoints"
+                    )
+                })?;
+                Ok(Self {
+                    inner: crate::InboxClientTransport::Quic(Arc::new(
+                        crate::quic_inbox::QuicInboxClient::connect_with_client_config(
+                            normalized,
+                            &quic.server_name,
+                            quic.client_config,
+                        )
+                        .await?,
+                    )),
+                })
+            }
+        }
     }
 
     pub async fn connect_via_registry(
@@ -638,32 +743,39 @@ impl InboxGrpcClient {
         &self,
         assignment: &ServiceShardAssignment,
     ) -> anyhow::Result<InboxShardSnapshot> {
-        let mut client = self.inner.lock().await;
-        let mut stream = client
-            .stream_shard_snapshot(shard_snapshot_request_for_assignment(assignment))
-            .await?
-            .into_inner();
-        let mut bytes = Vec::new();
-        let mut expected_checksum = None;
-        while let Some(chunk) = stream.message().await? {
-            if let Some(checksum) = expected_checksum {
-                anyhow::ensure!(checksum == chunk.checksum, "inbox stream checksum drift");
-            } else {
-                expected_checksum = Some(chunk.checksum);
+        match &self.inner {
+            crate::InboxClientTransport::Grpc(inner) => {
+                let mut client = inner.lock().await;
+                let mut stream = client
+                    .stream_shard_snapshot(shard_snapshot_request_for_assignment(assignment))
+                    .await?
+                    .into_inner();
+                let mut bytes = Vec::new();
+                let mut expected_checksum = None;
+                while let Some(chunk) = stream.message().await? {
+                    if let Some(checksum) = expected_checksum {
+                        anyhow::ensure!(checksum == chunk.checksum, "inbox stream checksum drift");
+                    } else {
+                        expected_checksum = Some(chunk.checksum);
+                    }
+                    bytes.extend_from_slice(&chunk.data);
+                    if chunk.done {
+                        break;
+                    }
+                }
+                let snapshot = InboxShardSnapshot::decode(&bytes)?;
+                if let Some(checksum) = expected_checksum {
+                    anyhow::ensure!(
+                        snapshot.checksum()? == checksum,
+                        "inbox stream checksum mismatch"
+                    );
+                }
+                Ok(snapshot)
             }
-            bytes.extend_from_slice(&chunk.data);
-            if chunk.done {
-                break;
+            crate::InboxClientTransport::Quic(_) => {
+                anyhow::bail!("inbox shard snapshot streaming is not supported over QUIC yet")
             }
         }
-        let snapshot = InboxShardSnapshot::decode(&bytes)?;
-        if let Some(checksum) = expected_checksum {
-            anyhow::ensure!(
-                snapshot.checksum()? == checksum,
-                "inbox stream checksum mismatch"
-            );
-        }
-        Ok(snapshot)
     }
 
     pub async fn import_shard_snapshot(
@@ -689,22 +801,29 @@ impl InboxGrpcClient {
         generation: u64,
         publish: DelayedLwtPublish,
     ) -> anyhow::Result<InboxSendLwtReply> {
-        let mut client = self.inner.lock().await;
-        Ok(client
-            .send_lwt(InboxSendLwtRequest {
-                tenant_id: publish.tenant_id,
-                session_id: publish.session_id,
-                generation,
-                topic: publish.publish.topic,
-                payload: publish.publish.payload.to_vec(),
-                qos: publish.publish.qos as u32,
-                retain: publish.publish.retain,
-                properties: Some(greenmqtt_proto::to_proto_publish_properties(
-                    &publish.publish.properties,
-                )),
-            })
-            .await?
-            .into_inner())
+        match &self.inner {
+            crate::InboxClientTransport::Grpc(inner) => {
+                let mut client = inner.lock().await;
+                Ok(client
+                    .send_lwt(InboxSendLwtRequest {
+                        tenant_id: publish.tenant_id,
+                        session_id: publish.session_id,
+                        generation,
+                        topic: publish.publish.topic,
+                        payload: publish.publish.payload.to_vec(),
+                        qos: publish.publish.qos as u32,
+                        retain: publish.publish.retain,
+                        properties: Some(greenmqtt_proto::to_proto_publish_properties(
+                            &publish.publish.properties,
+                        )),
+                    })
+                    .await?
+                    .into_inner())
+            }
+            crate::InboxClientTransport::Quic(_) => {
+                anyhow::bail!("Inbox QUIC facade does not support send_lwt yet")
+            }
+        }
     }
 
     pub async fn expire_all(
@@ -712,28 +831,42 @@ impl InboxGrpcClient {
         tenant_id: &str,
         now_ms: u64,
     ) -> anyhow::Result<InboxMaintenanceReply> {
-        let mut client = self.inner.lock().await;
-        Ok(client
-            .expire_all(InboxExpireAllRequest {
-                tenant_id: tenant_id.to_string(),
-                now_ms,
-            })
-            .await?
-            .into_inner())
+        match &self.inner {
+            crate::InboxClientTransport::Grpc(inner) => {
+                let mut client = inner.lock().await;
+                Ok(client
+                    .expire_all(InboxExpireAllRequest {
+                        tenant_id: tenant_id.to_string(),
+                        now_ms,
+                    })
+                    .await?
+                    .into_inner())
+            }
+            crate::InboxClientTransport::Quic(_) => {
+                anyhow::bail!("Inbox QUIC facade does not support expire_all yet")
+            }
+        }
     }
 
     pub async fn tenant_gc_preview(
         &self,
         tenant_id: &str,
     ) -> anyhow::Result<InboxMaintenanceReply> {
-        let mut client = self.inner.lock().await;
-        Ok(client
-            .tenant_gc_preview(InboxTenantGcRequest {
-                tenant_id: tenant_id.to_string(),
-                now_ms: 0,
-            })
-            .await?
-            .into_inner())
+        match &self.inner {
+            crate::InboxClientTransport::Grpc(inner) => {
+                let mut client = inner.lock().await;
+                Ok(client
+                    .tenant_gc_preview(InboxTenantGcRequest {
+                        tenant_id: tenant_id.to_string(),
+                        now_ms: 0,
+                    })
+                    .await?
+                    .into_inner())
+            }
+            crate::InboxClientTransport::Quic(_) => {
+                anyhow::bail!("Inbox QUIC facade does not support tenant GC preview yet")
+            }
+        }
     }
 
     pub async fn tenant_gc_run(
@@ -741,14 +874,21 @@ impl InboxGrpcClient {
         tenant_id: &str,
         now_ms: u64,
     ) -> anyhow::Result<InboxMaintenanceReply> {
-        let mut client = self.inner.lock().await;
-        Ok(client
-            .tenant_gc_run(InboxTenantGcRequest {
-                tenant_id: tenant_id.to_string(),
-                now_ms,
-            })
-            .await?
-            .into_inner())
+        match &self.inner {
+            crate::InboxClientTransport::Grpc(inner) => {
+                let mut client = inner.lock().await;
+                Ok(client
+                    .tenant_gc_run(InboxTenantGcRequest {
+                        tenant_id: tenant_id.to_string(),
+                        now_ms,
+                    })
+                    .await?
+                    .into_inner())
+            }
+            crate::InboxClientTransport::Quic(_) => {
+                anyhow::bail!("Inbox QUIC facade does not support tenant GC run yet")
+            }
+        }
     }
 
     pub async fn move_shard_via_registry(
@@ -943,11 +1083,42 @@ impl InboxGrpcClient {
 
 impl RetainGrpcClient {
     pub async fn connect(endpoint: impl Into<String>) -> anyhow::Result<Self> {
-        Ok(Self {
-            inner: Arc::new(Mutex::new(
-                RetainServiceClient::connect(endpoint.into()).await?,
-            )),
-        })
+        Self::connect_with_optional_quic_config(endpoint, None).await
+    }
+
+    pub async fn connect_with_optional_quic_config(
+        endpoint: impl Into<String>,
+        quic: Option<crate::RetainQuicClientConfig>,
+    ) -> anyhow::Result<Self> {
+        let raw = endpoint.into();
+        let normalized = normalize_service_endpoint(&raw, ServiceEndpointTransport::GrpcHttp)?;
+        match ParsedServiceEndpoint::parse(&normalized)?.transport {
+            ServiceEndpointTransport::GrpcHttp | ServiceEndpointTransport::GrpcHttps => {
+                let endpoint = normalize_grpc_endpoint(normalized)?;
+                Ok(Self {
+                    inner: crate::RetainClientTransport::Grpc(Arc::new(Mutex::new(
+                        RetainServiceClient::connect(endpoint).await?,
+                    ))),
+                })
+            }
+            ServiceEndpointTransport::Quic => {
+                let quic = quic.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "RetainGrpcClient requires QUIC client config for quic endpoints"
+                    )
+                })?;
+                Ok(Self {
+                    inner: crate::RetainClientTransport::Quic(Arc::new(
+                        crate::quic_retain::QuicRetainClient::connect_with_client_config(
+                            normalized,
+                            &quic.server_name,
+                            quic.client_config,
+                        )
+                        .await?,
+                    )),
+                })
+            }
+        }
     }
 
     pub async fn connect_via_registry(
@@ -1018,136 +1189,231 @@ impl RetainGrpcClient {
     }
 
     pub async fn expire_all(&self, tenant_id: &str) -> anyhow::Result<RetainMaintenanceReply> {
-        let mut client = self.inner.lock().await;
-        Ok(client
-            .expire_all(RetainExpireAllRequest {
-                tenant_id: tenant_id.to_string(),
-            })
-            .await?
-            .into_inner())
+        match &self.inner {
+            crate::RetainClientTransport::Grpc(inner) => {
+                let mut client = inner.lock().await;
+                Ok(client
+                    .expire_all(RetainExpireAllRequest {
+                        tenant_id: tenant_id.to_string(),
+                    })
+                    .await?
+                    .into_inner())
+            }
+            crate::RetainClientTransport::Quic(_) => {
+                anyhow::bail!("Retain QUIC facade does not support expire_all yet")
+            }
+        }
     }
 
     pub async fn tenant_gc_preview(
         &self,
         tenant_id: &str,
     ) -> anyhow::Result<RetainMaintenanceReply> {
-        let mut client = self.inner.lock().await;
-        Ok(client
-            .tenant_gc_preview(RetainTenantGcRequest {
-                tenant_id: tenant_id.to_string(),
-            })
-            .await?
-            .into_inner())
+        match &self.inner {
+            crate::RetainClientTransport::Grpc(inner) => {
+                let mut client = inner.lock().await;
+                Ok(client
+                    .tenant_gc_preview(RetainTenantGcRequest {
+                        tenant_id: tenant_id.to_string(),
+                    })
+                    .await?
+                    .into_inner())
+            }
+            crate::RetainClientTransport::Quic(_) => {
+                anyhow::bail!("Retain QUIC facade does not support tenant GC preview yet")
+            }
+        }
     }
 
     pub async fn tenant_gc_run(&self, tenant_id: &str) -> anyhow::Result<RetainMaintenanceReply> {
-        let mut client = self.inner.lock().await;
-        Ok(client
-            .tenant_gc_run(RetainTenantGcRequest {
-                tenant_id: tenant_id.to_string(),
-            })
-            .await?
-            .into_inner())
+        match &self.inner {
+            crate::RetainClientTransport::Grpc(inner) => {
+                let mut client = inner.lock().await;
+                Ok(client
+                    .tenant_gc_run(RetainTenantGcRequest {
+                        tenant_id: tenant_id.to_string(),
+                    })
+                    .await?
+                    .into_inner())
+            }
+            crate::RetainClientTransport::Quic(_) => {
+                anyhow::bail!("Retain QUIC facade does not support tenant GC run yet")
+            }
+        }
     }
 }
 
 impl MetadataGrpcClient {
     pub async fn connect(endpoint: impl Into<String>) -> anyhow::Result<Self> {
-        Ok(Self {
-            inner: Arc::new(Mutex::new(
-                MetadataServiceClient::connect(endpoint.into()).await?,
-            )),
-        })
+        Self::connect_with_optional_quic_config(endpoint, None).await
+    }
+
+    pub async fn connect_with_optional_quic_config(
+        endpoint: impl Into<String>,
+        quic: Option<crate::MetadataQuicClientConfig>,
+    ) -> anyhow::Result<Self> {
+        let raw = endpoint.into();
+        let normalized = normalize_service_endpoint(&raw, ServiceEndpointTransport::GrpcHttp)?;
+        match ParsedServiceEndpoint::parse(&normalized)?.transport {
+            ServiceEndpointTransport::GrpcHttp | ServiceEndpointTransport::GrpcHttps => {
+                let endpoint = normalize_grpc_endpoint(normalized)?;
+                Ok(Self {
+                    inner: crate::MetadataClientTransport::Grpc(Arc::new(Mutex::new(
+                        MetadataServiceClient::connect(endpoint).await?,
+                    ))),
+                })
+            }
+            ServiceEndpointTransport::Quic => {
+                let quic = quic.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "MetadataGrpcClient requires QUIC client config for quic endpoints"
+                    )
+                })?;
+                Ok(Self {
+                    inner: crate::MetadataClientTransport::Quic(Arc::new(
+                        crate::quic_metadata::QuicMetadataClient::connect_with_client_config(
+                            normalized,
+                            &quic.server_name,
+                            quic.client_config,
+                        )
+                        .await?,
+                    )),
+                })
+            }
+        }
     }
 
     pub async fn upsert_member(
         &self,
         member: ClusterNodeMembership,
     ) -> anyhow::Result<Option<ClusterNodeMembership>> {
-        let mut client = self.inner.lock().await;
-        let reply = client
-            .upsert_member(MemberRecordReply {
-                member: Some(to_proto_cluster_node_membership(&member)),
-            })
-            .await?
-            .into_inner();
-        Ok(reply.member.map(from_proto_cluster_node_membership))
+        match &self.inner {
+            crate::MetadataClientTransport::Grpc(inner) => {
+                let mut client = inner.lock().await;
+                let reply = client
+                    .upsert_member(MemberRecordReply {
+                        member: Some(to_proto_cluster_node_membership(&member)),
+                    })
+                    .await?
+                    .into_inner();
+                Ok(reply.member.map(from_proto_cluster_node_membership))
+            }
+            crate::MetadataClientTransport::Quic(_) => {
+                anyhow::bail!("Metadata QUIC facade does not support member mutations yet")
+            }
+        }
     }
 
     pub async fn lookup_member(
         &self,
         node_id: NodeId,
     ) -> anyhow::Result<Option<ClusterNodeMembership>> {
-        let mut client = self.inner.lock().await;
-        let reply = client
-            .lookup_member(MemberLookupRequest { node_id })
-            .await?
-            .into_inner();
-        Ok(reply.member.map(from_proto_cluster_node_membership))
+        match &self.inner {
+            crate::MetadataClientTransport::Grpc(inner) => {
+                let mut client = inner.lock().await;
+                let reply = client
+                    .lookup_member(MemberLookupRequest { node_id })
+                    .await?
+                    .into_inner();
+                Ok(reply.member.map(from_proto_cluster_node_membership))
+            }
+            crate::MetadataClientTransport::Quic(inner) => inner.lookup_member(node_id).await,
+        }
     }
 
     pub async fn remove_member(
         &self,
         node_id: NodeId,
     ) -> anyhow::Result<Option<ClusterNodeMembership>> {
-        let mut client = self.inner.lock().await;
-        let reply = client
-            .remove_member(MemberLookupRequest { node_id })
-            .await?
-            .into_inner();
-        Ok(reply.member.map(from_proto_cluster_node_membership))
+        match &self.inner {
+            crate::MetadataClientTransport::Grpc(inner) => {
+                let mut client = inner.lock().await;
+                let reply = client
+                    .remove_member(MemberLookupRequest { node_id })
+                    .await?
+                    .into_inner();
+                Ok(reply.member.map(from_proto_cluster_node_membership))
+            }
+            crate::MetadataClientTransport::Quic(_) => {
+                anyhow::bail!("Metadata QUIC facade does not support member mutations yet")
+            }
+        }
     }
 
     pub async fn list_members(&self) -> anyhow::Result<Vec<ClusterNodeMembership>> {
-        let mut client = self.inner.lock().await;
-        let reply = client.list_members(()).await?.into_inner();
-        Ok(reply
-            .members
-            .into_iter()
-            .map(from_proto_cluster_node_membership)
-            .collect())
+        match &self.inner {
+            crate::MetadataClientTransport::Grpc(inner) => {
+                let mut client = inner.lock().await;
+                let reply = client.list_members(()).await?.into_inner();
+                Ok(reply
+                    .members
+                    .into_iter()
+                    .map(from_proto_cluster_node_membership)
+                    .collect())
+            }
+            crate::MetadataClientTransport::Quic(inner) => inner.list_members().await,
+        }
     }
 
     pub async fn upsert_range(
         &self,
         descriptor: ReplicatedRangeDescriptor,
     ) -> anyhow::Result<Option<ReplicatedRangeDescriptor>> {
-        let mut client = self.inner.lock().await;
-        let reply = client
-            .upsert_range(RangeUpsertRequest {
-                descriptor: Some(to_proto_replicated_range(&descriptor)),
-            })
-            .await?
-            .into_inner();
-        Ok(reply.descriptor.map(from_proto_replicated_range))
+        match &self.inner {
+            crate::MetadataClientTransport::Grpc(inner) => {
+                let mut client = inner.lock().await;
+                let reply = client
+                    .upsert_range(RangeUpsertRequest {
+                        descriptor: Some(to_proto_replicated_range(&descriptor)),
+                    })
+                    .await?
+                    .into_inner();
+                Ok(reply.descriptor.map(from_proto_replicated_range))
+            }
+            crate::MetadataClientTransport::Quic(_) => {
+                anyhow::bail!("Metadata QUIC facade does not support range mutations yet")
+            }
+        }
     }
 
     pub async fn lookup_range(
         &self,
         range_id: &str,
     ) -> anyhow::Result<Option<ReplicatedRangeDescriptor>> {
-        let mut client = self.inner.lock().await;
-        let reply = client
-            .lookup_range(RangeLookupRequest {
-                range_id: range_id.to_string(),
-            })
-            .await?
-            .into_inner();
-        Ok(reply.descriptor.map(from_proto_replicated_range))
+        match &self.inner {
+            crate::MetadataClientTransport::Grpc(inner) => {
+                let mut client = inner.lock().await;
+                let reply = client
+                    .lookup_range(RangeLookupRequest {
+                        range_id: range_id.to_string(),
+                    })
+                    .await?
+                    .into_inner();
+                Ok(reply.descriptor.map(from_proto_replicated_range))
+            }
+            crate::MetadataClientTransport::Quic(inner) => inner.lookup_range(range_id).await,
+        }
     }
 
     pub async fn remove_range(
         &self,
         range_id: &str,
     ) -> anyhow::Result<Option<ReplicatedRangeDescriptor>> {
-        let mut client = self.inner.lock().await;
-        let reply = client
-            .remove_range(RangeLookupRequest {
-                range_id: range_id.to_string(),
-            })
-            .await?
-            .into_inner();
-        Ok(reply.descriptor.map(from_proto_replicated_range))
+        match &self.inner {
+            crate::MetadataClientTransport::Grpc(inner) => {
+                let mut client = inner.lock().await;
+                let reply = client
+                    .remove_range(RangeLookupRequest {
+                        range_id: range_id.to_string(),
+                    })
+                    .await?
+                    .into_inner();
+                Ok(reply.descriptor.map(from_proto_replicated_range))
+            }
+            crate::MetadataClientTransport::Quic(_) => {
+                anyhow::bail!("Metadata QUIC facade does not support range mutations yet")
+            }
+        }
     }
 
     pub async fn list_ranges(
@@ -1156,23 +1422,30 @@ impl MetadataGrpcClient {
         tenant_id: Option<&str>,
         scope: Option<&str>,
     ) -> anyhow::Result<Vec<ReplicatedRangeDescriptor>> {
-        let mut client = self.inner.lock().await;
-        let reply = client
-            .list_ranges(RangeListRequest {
-                shard_kind: shard_kind
-                    .as_ref()
-                    .map(to_proto_shard_kind)
-                    .unwrap_or_default(),
-                tenant_id: tenant_id.unwrap_or_default().to_string(),
-                scope: scope.unwrap_or_default().to_string(),
-            })
-            .await?
-            .into_inner();
-        Ok(reply
-            .descriptors
-            .into_iter()
-            .map(from_proto_replicated_range)
-            .collect())
+        match &self.inner {
+            crate::MetadataClientTransport::Grpc(inner) => {
+                let mut client = inner.lock().await;
+                let reply = client
+                    .list_ranges(RangeListRequest {
+                        shard_kind: shard_kind
+                            .as_ref()
+                            .map(to_proto_shard_kind)
+                            .unwrap_or_default(),
+                        tenant_id: tenant_id.unwrap_or_default().to_string(),
+                        scope: scope.unwrap_or_default().to_string(),
+                    })
+                    .await?
+                    .into_inner();
+                Ok(reply
+                    .descriptors
+                    .into_iter()
+                    .map(from_proto_replicated_range)
+                    .collect())
+            }
+            crate::MetadataClientTransport::Quic(inner) => {
+                inner.list_ranges(shard_kind, tenant_id, scope).await
+            }
+        }
     }
 
     pub async fn route_range(
@@ -1180,17 +1453,22 @@ impl MetadataGrpcClient {
         shard: &ServiceShardKey,
         key: &[u8],
     ) -> anyhow::Result<Option<ReplicatedRangeDescriptor>> {
-        let mut client = self.inner.lock().await;
-        let reply = client
-            .route_range(RouteRangeRequest {
-                shard_kind: to_proto_shard_kind(&shard.kind),
-                tenant_id: shard.tenant_id.clone(),
-                scope: shard.scope.clone(),
-                key: key.to_vec(),
-            })
-            .await?
-            .into_inner();
-        Ok(reply.descriptor.map(from_proto_replicated_range))
+        match &self.inner {
+            crate::MetadataClientTransport::Grpc(inner) => {
+                let mut client = inner.lock().await;
+                let reply = client
+                    .route_range(RouteRangeRequest {
+                        shard_kind: to_proto_shard_kind(&shard.kind),
+                        tenant_id: shard.tenant_id.clone(),
+                        scope: shard.scope.clone(),
+                        key: key.to_vec(),
+                    })
+                    .await?
+                    .into_inner();
+                Ok(reply.descriptor.map(from_proto_replicated_range))
+            }
+            crate::MetadataClientTransport::Quic(inner) => inner.route_range(shard, key).await,
+        }
     }
 
     pub async fn upsert_balancer_state(
@@ -1198,60 +1476,87 @@ impl MetadataGrpcClient {
         name: &str,
         state: BalancerState,
     ) -> anyhow::Result<Option<BalancerState>> {
-        let mut client = self.inner.lock().await;
-        let reply = client
-            .upsert_balancer_state(BalancerStateUpsertRequest {
-                name: name.to_string(),
-                state: Some(to_proto_balancer_state(&state)),
-            })
-            .await?
-            .into_inner();
-        Ok(reply.previous.map(from_proto_balancer_state))
+        match &self.inner {
+            crate::MetadataClientTransport::Grpc(inner) => {
+                let mut client = inner.lock().await;
+                let reply = client
+                    .upsert_balancer_state(BalancerStateUpsertRequest {
+                        name: name.to_string(),
+                        state: Some(to_proto_balancer_state(&state)),
+                    })
+                    .await?
+                    .into_inner();
+                Ok(reply.previous.map(from_proto_balancer_state))
+            }
+            crate::MetadataClientTransport::Quic(_) => {
+                anyhow::bail!("Metadata QUIC facade does not support balancer mutations yet")
+            }
+        }
     }
 
     pub async fn lookup_balancer_state(&self, name: &str) -> anyhow::Result<Option<BalancerState>> {
-        let mut client = self.inner.lock().await;
-        let reply = client
-            .lookup_balancer_state(BalancerStateRequest {
-                name: name.to_string(),
-            })
-            .await?
-            .into_inner();
-        Ok(reply.state.map(from_proto_balancer_state))
+        match &self.inner {
+            crate::MetadataClientTransport::Grpc(inner) => {
+                let mut client = inner.lock().await;
+                let reply = client
+                    .lookup_balancer_state(BalancerStateRequest {
+                        name: name.to_string(),
+                    })
+                    .await?
+                    .into_inner();
+                Ok(reply.state.map(from_proto_balancer_state))
+            }
+            crate::MetadataClientTransport::Quic(_) => {
+                anyhow::bail!("Metadata QUIC facade does not support balancer lookups yet")
+            }
+        }
     }
 
     pub async fn remove_balancer_state(&self, name: &str) -> anyhow::Result<Option<BalancerState>> {
-        let mut client = self.inner.lock().await;
-        let reply = client
-            .remove_balancer_state(BalancerStateRequest {
-                name: name.to_string(),
-            })
-            .await?
-            .into_inner();
-        Ok(reply.state.map(from_proto_balancer_state))
+        match &self.inner {
+            crate::MetadataClientTransport::Grpc(inner) => {
+                let mut client = inner.lock().await;
+                let reply = client
+                    .remove_balancer_state(BalancerStateRequest {
+                        name: name.to_string(),
+                    })
+                    .await?
+                    .into_inner();
+                Ok(reply.state.map(from_proto_balancer_state))
+            }
+            crate::MetadataClientTransport::Quic(_) => {
+                anyhow::bail!("Metadata QUIC facade does not support balancer mutations yet")
+            }
+        }
     }
 
     pub async fn list_balancer_states(&self) -> anyhow::Result<BTreeMap<String, BalancerState>> {
-        let mut client = self.inner.lock().await;
-        let reply = client.list_balancer_states(()).await?.into_inner();
-        Ok(reply
-            .entries
-            .into_iter()
-            .filter_map(|entry| {
-                entry
-                    .state
-                    .map(|state| (entry.name, from_proto_balancer_state(state)))
-            })
-            .collect())
+        match &self.inner {
+            crate::MetadataClientTransport::Grpc(inner) => {
+                let mut client = inner.lock().await;
+                let reply = client.list_balancer_states(()).await?.into_inner();
+                Ok(reply
+                    .entries
+                    .into_iter()
+                    .filter_map(|entry| {
+                        entry
+                            .state
+                            .map(|state| (entry.name, from_proto_balancer_state(state)))
+                    })
+                    .collect())
+            }
+            crate::MetadataClientTransport::Quic(_) => {
+                anyhow::bail!("Metadata QUIC facade does not support balancer listing yet")
+            }
+        }
     }
 }
 
 impl KvRangeGrpcClient {
     pub async fn connect(endpoint: impl Into<String>) -> anyhow::Result<Self> {
+        let endpoint = normalize_grpc_endpoint(endpoint)?;
         Ok(Self {
-            inner: Arc::new(Mutex::new(
-                KvRangeServiceClient::connect(endpoint.into()).await?,
-            )),
+            inner: Arc::new(Mutex::new(KvRangeServiceClient::connect(endpoint).await?)),
         })
     }
 
@@ -1383,11 +1688,31 @@ impl KvRangeGrpcClient {
     }
 }
 
+impl KvRangeGrpcExecutorFactory {
+    pub fn with_quic_client_config(
+        server_name: impl Into<String>,
+        client_config: quinn::ClientConfig,
+    ) -> Self {
+        Self {
+            quic: Some(crate::KvRangeQuicClientConfig {
+                server_name: server_name.into(),
+                client_config,
+            }),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct KvRangeQuicExecutor {
+    inner: Arc<crate::quic_kvrange::QuicKvRangeClient>,
+}
+
 impl RaftTransportGrpcClient {
     pub async fn connect(endpoint: impl Into<String>) -> anyhow::Result<Self> {
+        let endpoint = normalize_grpc_endpoint(endpoint)?;
         Ok(Self {
             inner: Arc::new(Mutex::new(
-                RaftTransportServiceClient::connect(endpoint.into()).await?,
+                RaftTransportServiceClient::connect(endpoint).await?,
             )),
         })
     }
@@ -1416,16 +1741,59 @@ impl RaftTransportGrpcClient {
 
 impl RangeAdminGrpcClient {
     pub async fn connect(endpoint: impl Into<String>) -> anyhow::Result<Self> {
-        Ok(Self {
-            inner: Arc::new(Mutex::new(
-                RangeAdminServiceClient::connect(endpoint.into()).await?,
-            )),
-        })
+        Self::connect_with_optional_quic_config(endpoint, None).await
+    }
+
+    pub async fn connect_with_optional_quic_config(
+        endpoint: impl Into<String>,
+        quic: Option<crate::RangeAdminQuicClientConfig>,
+    ) -> anyhow::Result<Self> {
+        let raw = endpoint.into();
+        let normalized = normalize_service_endpoint(&raw, ServiceEndpointTransport::GrpcHttp)?;
+        match ParsedServiceEndpoint::parse(&normalized)?.transport {
+            ServiceEndpointTransport::GrpcHttp | ServiceEndpointTransport::GrpcHttps => {
+                let endpoint = normalize_grpc_endpoint(normalized)?;
+                Ok(Self {
+                    inner: crate::RangeAdminClientTransport::Grpc(Arc::new(Mutex::new(
+                        RangeAdminServiceClient::connect(endpoint).await?,
+                    ))),
+                })
+            }
+            ServiceEndpointTransport::Quic => {
+                let quic = quic.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "RangeAdminGrpcClient requires QUIC client config for quic endpoints"
+                    )
+                })?;
+                Ok(Self {
+                    inner: crate::RangeAdminClientTransport::Quic(Arc::new(
+                        crate::quic_range_admin::QuicRangeAdminClient::connect_with_client_config(
+                            normalized,
+                            &quic.server_name,
+                            quic.client_config,
+                        )
+                        .await?,
+                    )),
+                })
+            }
+        }
     }
 
     pub async fn list_range_health(&self) -> anyhow::Result<RangeHealthListReply> {
-        let mut client = self.inner.lock().await;
-        Ok(client.list_range_health(()).await?.into_inner())
+        match &self.inner {
+            crate::RangeAdminClientTransport::Grpc(inner) => {
+                let mut client = inner.lock().await;
+                Ok(client.list_range_health(()).await?.into_inner())
+            }
+            crate::RangeAdminClientTransport::Quic(inner) => Ok(RangeHealthListReply {
+                entries: inner
+                    .list_range_health_snapshots()
+                    .await?
+                    .iter()
+                    .map(crate::to_proto_range_health)
+                    .collect(),
+            }),
+        }
     }
 
     pub async fn list_range_health_snapshots(&self) -> anyhow::Result<Vec<RangeHealthSnapshot>> {
@@ -1439,13 +1807,28 @@ impl RangeAdminGrpcClient {
     }
 
     pub async fn get_range_health(&self, range_id: &str) -> anyhow::Result<RangeHealthReply> {
-        let mut client = self.inner.lock().await;
-        Ok(client
-            .get_range_health(RangeHealthRequest {
-                range_id: range_id.to_string(),
-            })
-            .await?
-            .into_inner())
+        match &self.inner {
+            crate::RangeAdminClientTransport::Grpc(inner) => {
+                let mut client = inner.lock().await;
+                Ok(client
+                    .get_range_health(RangeHealthRequest {
+                        range_id: range_id.to_string(),
+                    })
+                    .await?
+                    .into_inner())
+            }
+            crate::RangeAdminClientTransport::Quic(inner) => {
+                let health = inner.get_range_health_snapshot(range_id).await?;
+                let Some(health) = health else {
+                    return Err(anyhow::Error::from(tonic::Status::not_found(
+                        "range not found",
+                    )));
+                };
+                Ok(RangeHealthReply {
+                    health: Some(crate::to_proto_range_health(&health)),
+                })
+            }
+        }
     }
 
     pub async fn get_range_health_snapshot(
@@ -1460,8 +1843,13 @@ impl RangeAdminGrpcClient {
     }
 
     pub async fn debug_dump(&self) -> anyhow::Result<String> {
-        let mut client = self.inner.lock().await;
-        Ok(client.debug_dump(()).await?.into_inner().text)
+        match &self.inner {
+            crate::RangeAdminClientTransport::Grpc(inner) => {
+                let mut client = inner.lock().await;
+                Ok(client.debug_dump(()).await?.into_inner().text)
+            }
+            crate::RangeAdminClientTransport::Quic(inner) => inner.debug_dump().await,
+        }
     }
 }
 
@@ -1541,9 +1929,10 @@ fn from_proto_range_health_record(
 
 impl RangeControlGrpcClient {
     pub async fn connect(endpoint: impl Into<String>) -> anyhow::Result<Self> {
+        let endpoint = normalize_grpc_endpoint(endpoint)?;
         Ok(Self {
             inner: Arc::new(Mutex::new(
-                RangeControlServiceClient::connect(endpoint.into()).await?,
+                RangeControlServiceClient::connect(endpoint).await?,
             )),
         })
     }
@@ -1704,9 +2093,11 @@ impl RoutedRangeControlGrpcClient {
         overload_backoff: Duration,
         service_governor: Option<Arc<ServiceTrafficGovernor>>,
     ) -> anyhow::Result<Self> {
+        let metadata_endpoint = normalize_grpc_endpoint(metadata_endpoint)?;
+        let fallback_endpoint = normalize_grpc_endpoint(fallback_endpoint)?;
         Ok(Self {
-            metadata: MetadataGrpcClient::connect(metadata_endpoint.into()).await?,
-            fallback_endpoint: fallback_endpoint.into(),
+            metadata: MetadataGrpcClient::connect(metadata_endpoint).await?,
+            fallback_endpoint,
             endpoint_backoff: Arc::new(Mutex::new(HashMap::new())),
             overload_backoff,
             service_governor,
@@ -2053,11 +2444,124 @@ impl KvRangeExecutor for KvRangeGrpcClient {
 }
 
 #[async_trait]
+impl KvRangeExecutor for KvRangeQuicExecutor {
+    async fn get(&self, range_id: &str, key: &[u8]) -> anyhow::Result<Option<Bytes>> {
+        self.inner.get(range_id, key).await
+    }
+
+    async fn get_fenced(
+        &self,
+        range_id: &str,
+        key: &[u8],
+        expected_epoch: Option<u64>,
+    ) -> anyhow::Result<Option<Bytes>> {
+        self.inner
+            .get_fenced(range_id, key, expected_epoch.unwrap_or_default())
+            .await
+    }
+
+    async fn scan(
+        &self,
+        range_id: &str,
+        boundary: Option<greenmqtt_core::RangeBoundary>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
+        self.inner.scan(range_id, boundary, limit).await
+    }
+
+    async fn scan_fenced(
+        &self,
+        range_id: &str,
+        boundary: Option<greenmqtt_core::RangeBoundary>,
+        limit: usize,
+        expected_epoch: Option<u64>,
+    ) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
+        self.inner
+            .scan_fenced(
+                range_id,
+                boundary,
+                limit,
+                expected_epoch.unwrap_or_default(),
+            )
+            .await
+    }
+
+    async fn apply(&self, range_id: &str, mutations: Vec<KvMutation>) -> anyhow::Result<()> {
+        self.inner.apply(range_id, mutations).await
+    }
+
+    async fn apply_fenced(
+        &self,
+        range_id: &str,
+        mutations: Vec<KvMutation>,
+        expected_epoch: Option<u64>,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .apply_fenced(range_id, mutations, expected_epoch.unwrap_or_default())
+            .await
+    }
+
+    async fn checkpoint(
+        &self,
+        range_id: &str,
+        checkpoint_id: &str,
+    ) -> anyhow::Result<KvRangeCheckpoint> {
+        self.inner.checkpoint(range_id, checkpoint_id).await
+    }
+
+    async fn checkpoint_fenced(
+        &self,
+        range_id: &str,
+        checkpoint_id: &str,
+        expected_epoch: Option<u64>,
+    ) -> anyhow::Result<KvRangeCheckpoint> {
+        self.inner
+            .checkpoint_fenced(range_id, checkpoint_id, expected_epoch.unwrap_or_default())
+            .await
+    }
+
+    async fn snapshot(&self, range_id: &str) -> anyhow::Result<KvRangeSnapshot> {
+        self.inner.snapshot(range_id).await
+    }
+
+    async fn snapshot_fenced(
+        &self,
+        range_id: &str,
+        expected_epoch: Option<u64>,
+    ) -> anyhow::Result<KvRangeSnapshot> {
+        self.inner
+            .snapshot_fenced(range_id, expected_epoch.unwrap_or_default())
+            .await
+    }
+}
+
+#[async_trait]
 impl KvRangeExecutorFactory for KvRangeGrpcExecutorFactory {
     async fn connect(&self, endpoint: &str) -> anyhow::Result<Arc<dyn KvRangeExecutor>> {
-        Ok(Arc::new(
-            KvRangeGrpcClient::connect(endpoint.to_string()).await?,
-        ))
+        let normalized = normalize_service_endpoint(endpoint, ServiceEndpointTransport::GrpcHttp)?;
+        let parsed = ParsedServiceEndpoint::parse(&normalized)?;
+        match parsed.transport {
+            ServiceEndpointTransport::GrpcHttp | ServiceEndpointTransport::GrpcHttps => {
+                Ok(Arc::new(KvRangeGrpcClient::connect(normalized).await?))
+            }
+            ServiceEndpointTransport::Quic => {
+                let quic = self.quic.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "KvRangeGrpcExecutorFactory requires QUIC client config for quic endpoints"
+                    )
+                })?;
+                Ok(Arc::new(KvRangeQuicExecutor {
+                    inner: Arc::new(
+                        crate::quic_kvrange::QuicKvRangeClient::connect_with_client_config(
+                            normalized,
+                            &quic.server_name,
+                            quic.client_config.clone(),
+                        )
+                        .await?,
+                    ),
+                }))
+            }
+        }
     }
 }
 
@@ -2142,7 +2646,7 @@ impl StaticPeerForwarder {
         node_id: NodeId,
         endpoint: impl Into<String>,
     ) -> anyhow::Result<()> {
-        let endpoint = endpoint.into();
+        let endpoint = normalize_grpc_endpoint(endpoint)?;
         let client = BrokerPeerServiceClient::connect(endpoint.clone()).await?;
         self.peers.write().expect("peer forwarder poisoned").insert(
             node_id,

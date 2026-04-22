@@ -280,6 +280,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "capnp"
+version = "0.25.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63da65e5e9ffc3b8f993d4ad222a548152549351a643f6b850a7773cb6ff2809"
+dependencies = [
+ "embedded-io",
+]
+
+[[package]]
+name = "capnpc"
+version = "0.25.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fca02be865c8c5a78bfc24b9819006ab6b59bef238467203928e26459557af93"
+dependencies = [
+ "capnp",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.59"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -495,6 +513,12 @@ name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
+
+[[package]]
+name = "embedded-io"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9eb1aa714776b75c7e67e1da744b81a129b3ff919c8712b5e1b32252c1f07cc7"
 
 [[package]]
 name = "equivalent"
@@ -763,6 +787,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "greenmqtt-capnp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "bytes",
+ "capnp",
+ "capnpc",
+ "greenmqtt-core",
+ "greenmqtt-kv-raft",
+]
+
+[[package]]
 name = "greenmqtt-cli"
 version = "0.1.0"
 dependencies = [
@@ -1016,6 +1053,7 @@ dependencies = [
  "bincode",
  "bytes",
  "greenmqtt-broker",
+ "greenmqtt-capnp",
  "greenmqtt-core",
  "greenmqtt-dist",
  "greenmqtt-inbox",
@@ -1029,6 +1067,9 @@ dependencies = [
  "greenmqtt-sessiondict",
  "greenmqtt-storage",
  "metrics",
+ "quinn",
+ "rcgen",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "tempfile",

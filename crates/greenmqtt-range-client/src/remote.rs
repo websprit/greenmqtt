@@ -3,8 +3,7 @@ use bytes::Bytes;
 use greenmqtt_core::{RangeBoundary, ServiceShardKey};
 use greenmqtt_kv_client::{
     CachedKvRangeRouter, KvRangeExecutor, KvRangeExecutorFactory, KvRangeRouter,
-    LeaderRoutedKvRangeExecutor, RangeDataClient, RangeReadOptions, RangeRoute,
-    RouteCacheConfig,
+    LeaderRoutedKvRangeExecutor, RangeDataClient, RangeReadOptions, RangeRoute, RouteCacheConfig,
 };
 use greenmqtt_kv_engine::{KvMutation, KvRangeCheckpoint, KvRangeSnapshot};
 use greenmqtt_rpc::{KvRangeGrpcClient, KvRangeGrpcExecutorFactory, MetadataGrpcClient};
@@ -34,10 +33,13 @@ impl RemoteRangeDataClient {
         route_cache_config: RouteCacheConfig,
     ) -> anyhow::Result<Self> {
         let metadata = Arc::new(MetadataGrpcClient::connect(metadata_endpoint.into()).await?);
-        let router: Arc<dyn KvRangeRouter> =
-            Arc::new(CachedKvRangeRouter::new(metadata.clone(), route_cache_config));
+        let router: Arc<dyn KvRangeRouter> = Arc::new(CachedKvRangeRouter::new(
+            metadata.clone(),
+            route_cache_config,
+        ));
         let fallback = Arc::new(KvRangeGrpcClient::connect(range_endpoint.into()).await?);
-        let factory: Arc<dyn KvRangeExecutorFactory> = Arc::new(KvRangeGrpcExecutorFactory);
+        let factory: Arc<dyn KvRangeExecutorFactory> =
+            Arc::new(KvRangeGrpcExecutorFactory::default());
         let inner = Arc::new(LeaderRoutedKvRangeExecutor::new(
             router,
             metadata,
@@ -58,9 +60,7 @@ impl RemoteRangeDataClient {
 
 #[async_trait]
 impl RangeDataClient for RemoteRangeDataClient {
-    async fn list_ranges(
-        &self,
-    ) -> anyhow::Result<Vec<greenmqtt_core::ReplicatedRangeDescriptor>> {
+    async fn list_ranges(&self) -> anyhow::Result<Vec<greenmqtt_core::ReplicatedRangeDescriptor>> {
         self.inner.list_ranges().await
     }
 
@@ -76,10 +76,7 @@ impl RangeDataClient for RemoteRangeDataClient {
         RangeDataClient::route_key(&*self.inner, shard, key).await
     }
 
-    async fn route_shard(
-        &self,
-        shard: &ServiceShardKey,
-    ) -> anyhow::Result<Vec<RangeRoute>> {
+    async fn route_shard(&self, shard: &ServiceShardKey) -> anyhow::Result<Vec<RangeRoute>> {
         RangeDataClient::route_shard(&*self.inner, shard).await
     }
 

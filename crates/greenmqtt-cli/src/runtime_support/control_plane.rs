@@ -152,7 +152,9 @@ pub(crate) async fn replicated_dist_runtime_handle(
     }
     let (_metadata_endpoint, range_endpoint) =
         resolved_replicated_endpoints(state_endpoint, "dist")?;
-    Ok(Some(Arc::new(DistGrpcClient::connect(range_endpoint).await?)))
+    Ok(Some(Arc::new(
+        DistGrpcClient::connect(range_endpoint).await?,
+    )))
 }
 
 pub(crate) async fn run_dist_maintenance_tick(
@@ -304,7 +306,9 @@ pub(crate) async fn replicated_inbox_runtime_handle(
     }
     let (_metadata_endpoint, range_endpoint) =
         resolved_replicated_endpoints(state_endpoint, "inbox")?;
-    Ok(Some(Arc::new(InboxGrpcClient::connect(range_endpoint).await?)))
+    Ok(Some(Arc::new(
+        InboxGrpcClient::connect(range_endpoint).await?,
+    )))
 }
 
 pub(crate) async fn run_inbox_maintenance_tick(
@@ -374,7 +378,9 @@ pub(crate) async fn replicated_retain_runtime_handle(
     }
     let (_metadata_endpoint, range_endpoint) =
         resolved_replicated_endpoints(state_endpoint, "retain")?;
-    Ok(Some(Arc::new(RetainGrpcClient::connect(range_endpoint).await?)))
+    Ok(Some(Arc::new(
+        RetainGrpcClient::connect(range_endpoint).await?,
+    )))
 }
 
 pub(crate) async fn run_retain_maintenance_tick(
@@ -550,5 +556,8 @@ pub(crate) fn resolved_replicated_endpoints(
                 "replicated {service_name} mode requires GREENMQTT_RANGE_ENDPOINT or GREENMQTT_STATE_ENDPOINT"
             )
         })?;
-    Ok((metadata_endpoint, range_endpoint))
+    Ok((
+        normalize_service_endpoint(&metadata_endpoint, ServiceEndpointTransport::GrpcHttp)?,
+        normalize_service_endpoint(&range_endpoint, ServiceEndpointTransport::GrpcHttp)?,
+    ))
 }

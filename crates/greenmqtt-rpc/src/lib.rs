@@ -2,14 +2,15 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use greenmqtt_broker::{DeliverySink, PeerRegistry};
 use greenmqtt_core::{
-    BalancerState, BalancerStateRegistry, ClientIdentity, ClusterMembershipRegistry,
-    ClusterNodeMembership, ControlCommandRecord, ControlCommandRegistry, Delivery, InflightMessage,
-    MetadataRegistry, NodeId, OfflineMessage, RangeReconfigurationRegistry,
-    RangeReconfigurationState, ReconfigurationPhase, ReplicatedRangeDescriptor,
-    ReplicatedRangeRegistry, RetainedMessage, RouteRecord, ServiceEndpoint,
-    ServiceEndpointRegistry, ServiceKind, ServiceShardAssignment, ServiceShardKey,
-    ServiceShardKind, ServiceShardLifecycle, ServiceShardRecoveryControl, ServiceShardTransition,
-    ServiceShardTransitionKind, Subscription,
+    normalize_service_endpoint, BalancerState, BalancerStateRegistry, ClientIdentity,
+    ClusterMembershipRegistry, ClusterNodeMembership, ControlCommandRecord, ControlCommandRegistry,
+    Delivery, InflightMessage, MetadataRegistry, NodeId, OfflineMessage, ParsedServiceEndpoint,
+    RangeBoundary, RangeReconfigurationRegistry, RangeReconfigurationState, ReconfigurationPhase,
+    ReplicatedRangeDescriptor, ReplicatedRangeRegistry, RetainedMessage, RouteRecord,
+    ServiceEndpoint, ServiceEndpointRegistry, ServiceEndpointTransport, ServiceKind,
+    ServiceShardAssignment, ServiceShardKey, ServiceShardKind, ServiceShardLifecycle,
+    ServiceShardRecoveryControl, ServiceShardTransition, ServiceShardTransitionKind, SessionRecord,
+    Subscription,
 };
 use greenmqtt_dist::{dist_tenant_shard, DistRouter};
 use greenmqtt_inbox::{
@@ -121,6 +122,17 @@ fn env_override_limit(key: &str, default: usize) -> anyhow::Result<usize> {
             value.parse().map_err(|_| anyhow::anyhow!("invalid {key}"))
         }
         _ => Ok(default),
+    }
+}
+
+pub(crate) fn normalize_grpc_endpoint(endpoint: impl Into<String>) -> anyhow::Result<String> {
+    let raw = endpoint.into();
+    let normalized = normalize_service_endpoint(&raw, ServiceEndpointTransport::GrpcHttp)?;
+    match ParsedServiceEndpoint::parse(&normalized)?.transport {
+        ServiceEndpointTransport::GrpcHttp | ServiceEndpointTransport::GrpcHttps => Ok(normalized),
+        ServiceEndpointTransport::Quic => {
+            anyhow::bail!("gRPC clients do not support quic endpoints: {normalized}")
+        }
     }
 }
 
@@ -664,27 +676,27 @@ impl Drop for ServiceTrafficPermit {
 
 #[derive(Clone)]
 pub struct SessionDictGrpcClient {
-    inner: Arc<Mutex<SessionDictServiceClient<Channel>>>,
+    inner: SessionDictClientTransport,
 }
 
 #[derive(Clone)]
 pub struct DistGrpcClient {
-    inner: Arc<Mutex<DistServiceClient<Channel>>>,
+    inner: DistClientTransport,
 }
 
 #[derive(Clone)]
 pub struct InboxGrpcClient {
-    inner: Arc<Mutex<InboxServiceClient<Channel>>>,
+    inner: InboxClientTransport,
 }
 
 #[derive(Clone)]
 pub struct RetainGrpcClient {
-    inner: Arc<Mutex<RetainServiceClient<Channel>>>,
+    inner: RetainClientTransport,
 }
 
 #[derive(Clone)]
 pub struct MetadataGrpcClient {
-    inner: Arc<Mutex<MetadataServiceClient<Channel>>>,
+    inner: MetadataClientTransport,
 }
 
 #[derive(Clone)]
@@ -699,7 +711,7 @@ pub struct RaftTransportGrpcClient {
 
 #[derive(Clone)]
 pub struct RangeAdminGrpcClient {
-    inner: Arc<Mutex<RangeAdminServiceClient<Channel>>>,
+    inner: RangeAdminClientTransport,
 }
 
 #[derive(Clone)]
@@ -723,8 +735,88 @@ pub struct RoutedRangeControlGrpcClient {
     service_governor: Option<Arc<ServiceTrafficGovernor>>,
 }
 
+#[derive(Clone)]
+pub struct KvRangeQuicClientConfig {
+    pub server_name: String,
+    pub client_config: quinn::ClientConfig,
+}
+
+#[derive(Clone)]
+pub struct MetadataQuicClientConfig {
+    pub server_name: String,
+    pub client_config: quinn::ClientConfig,
+}
+
+#[derive(Clone)]
+pub struct DistQuicClientConfig {
+    pub server_name: String,
+    pub client_config: quinn::ClientConfig,
+}
+
+#[derive(Clone)]
+pub struct SessionDictQuicClientConfig {
+    pub server_name: String,
+    pub client_config: quinn::ClientConfig,
+}
+
+#[derive(Clone)]
+pub struct InboxQuicClientConfig {
+    pub server_name: String,
+    pub client_config: quinn::ClientConfig,
+}
+
+#[derive(Clone)]
+pub struct RetainQuicClientConfig {
+    pub server_name: String,
+    pub client_config: quinn::ClientConfig,
+}
+
 #[derive(Clone, Default)]
-pub struct KvRangeGrpcExecutorFactory;
+pub struct KvRangeGrpcExecutorFactory {
+    quic: Option<KvRangeQuicClientConfig>,
+}
+
+#[derive(Clone)]
+pub struct RangeAdminQuicClientConfig {
+    pub server_name: String,
+    pub client_config: quinn::ClientConfig,
+}
+
+#[derive(Clone)]
+enum RangeAdminClientTransport {
+    Grpc(Arc<Mutex<RangeAdminServiceClient<Channel>>>),
+    Quic(Arc<crate::quic_range_admin::QuicRangeAdminClient>),
+}
+
+#[derive(Clone)]
+enum MetadataClientTransport {
+    Grpc(Arc<Mutex<MetadataServiceClient<Channel>>>),
+    Quic(Arc<crate::quic_metadata::QuicMetadataClient>),
+}
+
+#[derive(Clone)]
+enum DistClientTransport {
+    Grpc(Arc<Mutex<DistServiceClient<Channel>>>),
+    Quic(Arc<crate::quic_dist::QuicDistClient>),
+}
+
+#[derive(Clone)]
+enum SessionDictClientTransport {
+    Grpc(Arc<Mutex<SessionDictServiceClient<Channel>>>),
+    Quic(Arc<crate::quic_sessiondict::QuicSessionDictClient>),
+}
+
+#[derive(Clone)]
+enum InboxClientTransport {
+    Grpc(Arc<Mutex<InboxServiceClient<Channel>>>),
+    Quic(Arc<crate::quic_inbox::QuicInboxClient>),
+}
+
+#[derive(Clone)]
+enum RetainClientTransport {
+    Grpc(Arc<Mutex<RetainServiceClient<Channel>>>),
+    Quic(Arc<crate::quic_retain::QuicRetainClient>),
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct SessionDictShardSnapshot {
@@ -902,6 +994,221 @@ struct RangeAdminRpc {
 struct RangeControlRpc {
     inner: Option<Arc<greenmqtt_kv_server::ReplicaRuntime>>,
     registry: Option<Arc<dyn MetadataRegistry>>,
+}
+
+#[async_trait]
+pub(crate) trait SessionDictTransportService: Send + Sync {
+    async fn register_session_record(
+        &self,
+        record: SessionRecord,
+    ) -> anyhow::Result<Option<SessionRecord>>;
+    async fn unregister_session_record(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Option<SessionRecord>>;
+    async fn lookup_session_record_by_identity(
+        &self,
+        identity: &ClientIdentity,
+    ) -> anyhow::Result<Option<SessionRecord>>;
+    async fn lookup_session_record_by_id(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Option<SessionRecord>>;
+    async fn list_session_records(
+        &self,
+        tenant_id: Option<&str>,
+    ) -> anyhow::Result<Vec<SessionRecord>>;
+}
+
+#[async_trait]
+pub(crate) trait DistTransportService: Send + Sync {
+    async fn add_route_record(&self, route: RouteRecord) -> anyhow::Result<()>;
+    async fn remove_route_record(&self, route: &RouteRecord) -> anyhow::Result<()>;
+    async fn list_session_route_records(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Vec<RouteRecord>>;
+    async fn match_route_records(
+        &self,
+        tenant_id: &str,
+        topic: &str,
+    ) -> anyhow::Result<Vec<RouteRecord>>;
+    async fn list_route_records(&self, tenant_id: Option<&str>)
+        -> anyhow::Result<Vec<RouteRecord>>;
+}
+
+#[async_trait]
+pub(crate) trait InboxTransportService: Send + Sync {
+    async fn attach_session(&self, session_id: &str) -> anyhow::Result<()>;
+    async fn detach_session(&self, session_id: &str) -> anyhow::Result<()>;
+    async fn purge_session_state(&self, session_id: &str) -> anyhow::Result<()>;
+    async fn ack_inflight_packet(&self, session_id: &str, packet_id: u16) -> anyhow::Result<()>;
+}
+
+#[derive(Debug)]
+pub(crate) enum KvRangeTransportError {
+    Unavailable(String),
+    NotFound(String),
+    DeadlineExceeded(String),
+    Internal(anyhow::Error),
+}
+
+impl std::fmt::Display for KvRangeTransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(message) => write!(f, "{message}"),
+            Self::NotFound(message) => write!(f, "{message}"),
+            Self::DeadlineExceeded(message) => write!(f, "{message}"),
+            Self::Internal(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for KvRangeTransportError {}
+
+#[async_trait]
+pub(crate) trait KvRangeTransportService: Send + Sync {
+    async fn get_value(
+        &self,
+        range_id: &str,
+        key: &[u8],
+        expected_epoch: u64,
+    ) -> Result<Option<Bytes>, KvRangeTransportError>;
+    async fn scan_entries(
+        &self,
+        range_id: &str,
+        boundary: Option<RangeBoundary>,
+        limit: usize,
+        expected_epoch: u64,
+    ) -> Result<Vec<(Bytes, Bytes)>, KvRangeTransportError>;
+    async fn apply_mutations(
+        &self,
+        range_id: &str,
+        mutations: Vec<KvMutation>,
+        expected_epoch: u64,
+    ) -> Result<(), KvRangeTransportError>;
+    async fn checkpoint_range(
+        &self,
+        range_id: &str,
+        checkpoint_id: &str,
+        expected_epoch: u64,
+    ) -> Result<KvRangeCheckpoint, KvRangeTransportError>;
+    async fn snapshot_metadata(
+        &self,
+        range_id: &str,
+        expected_epoch: u64,
+    ) -> Result<KvRangeSnapshot, KvRangeTransportError>;
+}
+
+#[async_trait]
+pub(crate) trait RangeAdminTransportService: Send + Sync {
+    async fn list_range_health_snapshots(&self) -> anyhow::Result<Vec<RangeHealthSnapshot>>;
+    async fn get_range_health_snapshot(
+        &self,
+        range_id: &str,
+    ) -> anyhow::Result<Option<RangeHealthSnapshot>>;
+    async fn debug_dump_text(&self) -> anyhow::Result<String>;
+}
+
+#[async_trait]
+pub(crate) trait MetadataTransportService: Send + Sync {
+    async fn upsert_member_record(
+        &self,
+        member: ClusterNodeMembership,
+    ) -> anyhow::Result<Option<ClusterNodeMembership>>;
+    async fn lookup_member_record(
+        &self,
+        node_id: NodeId,
+    ) -> anyhow::Result<Option<ClusterNodeMembership>>;
+    async fn remove_member_record(
+        &self,
+        node_id: NodeId,
+    ) -> anyhow::Result<Option<ClusterNodeMembership>>;
+    async fn list_member_records(&self) -> anyhow::Result<Vec<ClusterNodeMembership>>;
+    async fn upsert_balancer_state_record(
+        &self,
+        name: &str,
+        state: BalancerState,
+    ) -> anyhow::Result<Option<BalancerState>>;
+    async fn lookup_balancer_state_record(
+        &self,
+        name: &str,
+    ) -> anyhow::Result<Option<BalancerState>>;
+    async fn remove_balancer_state_record(
+        &self,
+        name: &str,
+    ) -> anyhow::Result<Option<BalancerState>>;
+    async fn list_balancer_state_records(&self) -> anyhow::Result<BTreeMap<String, BalancerState>>;
+    async fn upsert_range_record(
+        &self,
+        descriptor: ReplicatedRangeDescriptor,
+    ) -> anyhow::Result<Option<ReplicatedRangeDescriptor>>;
+    async fn lookup_range_record(
+        &self,
+        range_id: &str,
+    ) -> anyhow::Result<Option<ReplicatedRangeDescriptor>>;
+    async fn remove_range_record(
+        &self,
+        range_id: &str,
+    ) -> anyhow::Result<Option<ReplicatedRangeDescriptor>>;
+    async fn list_range_records(
+        &self,
+        shard_kind: Option<ServiceShardKind>,
+        tenant_id: Option<&str>,
+        scope: Option<&str>,
+    ) -> anyhow::Result<Vec<ReplicatedRangeDescriptor>>;
+    async fn route_range_record(
+        &self,
+        shard: &ServiceShardKey,
+        key: &[u8],
+    ) -> anyhow::Result<Option<ReplicatedRangeDescriptor>>;
+}
+
+#[async_trait]
+pub(crate) trait RangeControlTransportService: Send + Sync {
+    async fn bootstrap_range_action(
+        &self,
+        descriptor: ReplicatedRangeDescriptor,
+    ) -> anyhow::Result<String>;
+    async fn change_replicas_action(
+        &self,
+        range_id: &str,
+        voters: Vec<NodeId>,
+        learners: Vec<NodeId>,
+    ) -> anyhow::Result<()>;
+    async fn transfer_leadership_action(
+        &self,
+        range_id: &str,
+        target_node_id: NodeId,
+    ) -> anyhow::Result<()>;
+    async fn recover_range_action(
+        &self,
+        range_id: &str,
+        new_leader_node_id: NodeId,
+    ) -> anyhow::Result<()>;
+    async fn split_range_action(
+        &self,
+        range_id: &str,
+        split_key: Vec<u8>,
+    ) -> anyhow::Result<(String, String)>;
+    async fn merge_ranges_action(
+        &self,
+        left_range_id: &str,
+        right_range_id: &str,
+    ) -> anyhow::Result<String>;
+    async fn drain_range_action(&self, range_id: &str) -> anyhow::Result<()>;
+    async fn retire_range_action(&self, range_id: &str) -> anyhow::Result<()>;
+    async fn list_zombie_range_snapshots(&self) -> anyhow::Result<Vec<ZombieRangeSnapshot>>;
+}
+
+#[async_trait]
+pub(crate) trait RetainTransportService: Send + Sync {
+    async fn retain_message(&self, message: RetainedMessage) -> anyhow::Result<()>;
+    async fn match_retained(
+        &self,
+        tenant_id: &str,
+        topic_filter: &str,
+    ) -> anyhow::Result<Vec<RetainedMessage>>;
 }
 
 async fn apply_committed_entries_for_range(
@@ -1228,6 +1535,15 @@ fn validate_kv_request_fence(
     Ok(())
 }
 
+fn kv_range_transport_status(error: KvRangeTransportError) -> Status {
+    match error {
+        KvRangeTransportError::Unavailable(message) => Status::unavailable(message),
+        KvRangeTransportError::NotFound(message) => Status::not_found(message),
+        KvRangeTransportError::DeadlineExceeded(message) => Status::deadline_exceeded(message),
+        KvRangeTransportError::Internal(error) => internal_status(error),
+    }
+}
+
 async fn validate_snapshot_assignment(
     registry: &Option<Arc<dyn MetadataRegistry>>,
     expected: Option<ServiceShardAssignment>,
@@ -1254,6 +1570,14 @@ async fn validate_snapshot_assignment(
 
 mod client_traits;
 mod clients;
+mod quic_dist;
+mod quic_inbox;
+mod quic_kvrange;
+mod quic_metadata;
+mod quic_range_admin;
+mod quic_range_control;
+mod quic_retain;
+mod quic_sessiondict;
 mod registry_impls;
 mod runtime;
 mod service_impls;

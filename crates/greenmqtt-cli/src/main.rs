@@ -5,16 +5,16 @@ use greenmqtt_broker::mqtt::{
 };
 use greenmqtt_broker::{BrokerConfig, BrokerRuntime};
 use greenmqtt_core::{
-    ClientIdentity, ClusterMembershipRegistry, ClusterNodeLifecycle, ClusterNodeMembership,
-    ConnectRequest, ControlPlaneRegistry, Lifecycle, MetadataRegistry, PublishProperties,
-    PublishRequest, RangeBoundary, RangeReplica, ReplicaRole, ReplicaSyncState,
-    ReplicatedRangeDescriptor, ServiceEndpoint, ServiceKind, ServiceShardKey, ServiceShardKind,
-    ServiceShardLifecycle, SessionKind, ShardControlRegistry,
+    normalize_service_endpoint, ClientIdentity, ClusterMembershipRegistry, ClusterNodeLifecycle,
+    ClusterNodeMembership, ConnectRequest, ControlPlaneRegistry, Lifecycle, MetadataRegistry,
+    PublishProperties, PublishRequest, RangeBoundary, RangeReplica, ReplicaRole, ReplicaSyncState,
+    ReplicatedRangeDescriptor, ServiceEndpoint, ServiceEndpointTransport, ServiceKind,
+    ServiceShardKey, ServiceShardKind, ServiceShardLifecycle, SessionKind, ShardControlRegistry,
 };
 use greenmqtt_dist::{
     DistBalanceAction, DistBalancePolicy, DistHandle, DistMaintenanceWorker, DistRouter,
-    DistRuntime,
-    DistTenantStats, PersistentDistHandle, ReplicatedDistHandle, ThresholdDistBalancePolicy,
+    DistRuntime, DistTenantStats, PersistentDistHandle, ReplicatedDistHandle,
+    ThresholdDistBalancePolicy,
 };
 use greenmqtt_http_api::HttpApi;
 use greenmqtt_inbox::{
@@ -219,16 +219,18 @@ fn advertised_rpc_endpoint(rpc_bind: SocketAddr) -> String {
     } else {
         format!("http://{rpc_bind}")
     };
-    std::env::var("GREENMQTT_ADVERTISE_RPC_ENDPOINT")
+    let raw = std::env::var("GREENMQTT_ADVERTISE_RPC_ENDPOINT")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or(local_fallback)
+        .unwrap_or(local_fallback);
+    normalize_service_endpoint(&raw, ServiceEndpointTransport::GrpcHttp)
+        .expect("rpc endpoint should normalize")
 }
 
 fn resolved_control_plane_endpoints(
     rpc_bind: SocketAddr,
     state_endpoint: Option<&str>,
-) -> (String, String) {
+) -> anyhow::Result<(String, String)> {
     let local_endpoint = advertised_rpc_endpoint(rpc_bind);
     let metadata_endpoint = std::env::var("GREENMQTT_METADATA_ENDPOINT")
         .ok()
@@ -240,7 +242,10 @@ fn resolved_control_plane_endpoints(
         .filter(|value| !value.trim().is_empty())
         .or_else(|| state_endpoint.map(str::to_string))
         .unwrap_or_else(|| local_endpoint.clone());
-    (metadata_endpoint, range_endpoint)
+    Ok((
+        normalize_service_endpoint(&metadata_endpoint, ServiceEndpointTransport::GrpcHttp)?,
+        normalize_service_endpoint(&range_endpoint, ServiceEndpointTransport::GrpcHttp)?,
+    ))
 }
 
 #[tokio::main]
@@ -325,7 +330,8 @@ async fn main() -> anyhow::Result<()> {
         let _replica_runtime_handle = local_range_runtime
             .clone()
             .map(|runtime| runtime.spawn(Duration::from_millis(50)));
-        if let (Some(registry), Some(host)) = (assignment_registry.clone(), local_range_host.clone())
+        if let (Some(registry), Some(host)) =
+            (assignment_registry.clone(), local_range_host.clone())
         {
             upsert_member_with_startup_retry(
                 registry.clone(),
@@ -641,11 +647,7 @@ async fn main() -> anyhow::Result<()> {
                 1,
                 ClusterNodeLifecycle::Serving,
                 vec![
-                    ServiceEndpoint::new(
-                        ServiceKind::SessionDict,
-                        node_id,
-                        rpc_endpoint.clone(),
-                    ),
+                    ServiceEndpoint::new(ServiceKind::SessionDict, node_id, rpc_endpoint.clone()),
                     ServiceEndpoint::new(ServiceKind::Dist, node_id, rpc_endpoint.clone()),
                     ServiceEndpoint::new(ServiceKind::Inbox, node_id, rpc_endpoint.clone()),
                     ServiceEndpoint::new(ServiceKind::Retain, node_id, rpc_endpoint.clone()),
@@ -700,7 +702,7 @@ async fn main() -> anyhow::Result<()> {
             configured_dist_maintenance()?,
         ) {
             let (metadata_endpoint, range_endpoint) =
-                resolved_control_plane_endpoints(rpc_bind, state_endpoint.as_deref());
+                resolved_control_plane_endpoints(rpc_bind, state_endpoint.as_deref())?;
             spawn_dist_maintenance_task(
                 &mut tasks,
                 dist_runtime,
@@ -722,7 +724,7 @@ async fn main() -> anyhow::Result<()> {
             spawn_retain_maintenance_task(&mut tasks, retain_runtime, retain_maintenance);
         }
         let (control_plane_metadata_endpoint, control_plane_range_endpoint) =
-            resolved_control_plane_endpoints(rpc_bind, state_endpoint.as_deref());
+            resolved_control_plane_endpoints(rpc_bind, state_endpoint.as_deref())?;
         if let Some(control_plane_runtime) = configured_control_plane_runtime(
             node_id,
             control_plane_registry.clone(),
@@ -1204,7 +1206,9 @@ async fn configured_sessiondict_service(
         StateMode::Replicated => {
             let (_metadata_endpoint, range_endpoint) =
                 resolved_replicated_endpoints(state_endpoint, "sessiondict")?;
-            Ok(Arc::new(SessionDictGrpcClient::connect(range_endpoint).await?))
+            Ok(Arc::new(
+                SessionDictGrpcClient::connect(range_endpoint).await?,
+            ))
         }
     }
 }

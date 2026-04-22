@@ -436,13 +436,7 @@ pub(crate) fn range_control_endpoint() -> anyhow::Result<String> {
                 .filter(|value| !value.trim().is_empty())
         })
         .unwrap_or_else(|| "127.0.0.1:50051".to_string());
-    Ok(
-        if raw.starts_with("http://") || raw.starts_with("https://") {
-            raw
-        } else {
-            format!("http://{raw}")
-        },
-    )
+    normalize_service_endpoint(&raw, ServiceEndpointTransport::GrpcHttp)
 }
 
 pub(crate) fn range_metadata_endpoint(default_endpoint: &str) -> anyhow::Result<String> {
@@ -450,13 +444,7 @@ pub(crate) fn range_metadata_endpoint(default_endpoint: &str) -> anyhow::Result<
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| default_endpoint.to_string());
-    Ok(
-        if raw.starts_with("http://") || raw.starts_with("https://") {
-            raw
-        } else {
-            format!("http://{raw}")
-        },
-    )
+    normalize_service_endpoint(&raw, ServiceEndpointTransport::GrpcHttp)
 }
 
 fn finish_range_target(
@@ -1359,4 +1347,73 @@ pub(crate) fn http_request_body(
         .nth(1)
         .ok_or_else(|| anyhow::anyhow!("invalid http response"))?;
     Ok(body.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_env_var<T>(key: &str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let previous = std::env::var(key).ok();
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+        let result = f();
+        match previous {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+        result
+    }
+
+    #[test]
+    fn range_control_endpoint_defaults_bare_host_to_http() {
+        with_env_var(
+            "GREENMQTT_RANGE_CONTROL_ENDPOINT",
+            Some("127.0.0.1:50061"),
+            || {
+                assert_eq!(range_control_endpoint().unwrap(), "http://127.0.0.1:50061");
+            },
+        );
+    }
+
+    #[test]
+    fn range_control_endpoint_preserves_quic_scheme() {
+        with_env_var(
+            "GREENMQTT_RANGE_CONTROL_ENDPOINT",
+            Some("quic://127.0.0.1:50061"),
+            || {
+                assert_eq!(range_control_endpoint().unwrap(), "quic://127.0.0.1:50061");
+            },
+        );
+    }
+
+    #[test]
+    fn range_metadata_endpoint_defaults_bare_host_to_http() {
+        with_env_var(
+            "GREENMQTT_METADATA_ENDPOINT",
+            Some("127.0.0.1:50062"),
+            || {
+                assert_eq!(
+                    range_metadata_endpoint("http://127.0.0.1:50051").unwrap(),
+                    "http://127.0.0.1:50062"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn range_metadata_endpoint_preserves_quic_scheme() {
+        with_env_var(
+            "GREENMQTT_METADATA_ENDPOINT",
+            Some("quic://127.0.0.1:50062"),
+            || {
+                assert_eq!(
+                    range_metadata_endpoint("http://127.0.0.1:50051").unwrap(),
+                    "quic://127.0.0.1:50062"
+                );
+            },
+        );
+    }
 }

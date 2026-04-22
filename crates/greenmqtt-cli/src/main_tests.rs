@@ -7,12 +7,12 @@ use super::{
     listener_specs_from_env, parse_acl_rules, parse_bench_scenario, parse_bench_scenarios,
     parse_bridge_rules, parse_compare_backends, parse_identity_matchers, parse_listener_specs,
     parse_topic_rewrite_rules, range_command_request, redis_services, render_range_lookup_text,
-    render_shard_response_text, resolved_state_mode, run_bench,
-    run_compare_bench, run_compare_soak, run_dist_maintenance_tick, run_inbox_maintenance_tick,
-    run_profile_bench, run_retain_maintenance_tick, run_shard_command, run_soak,
-    shard_command_request, validate_bench_report, validate_soak_report, BenchConfig, BenchReport,
-    BenchScenario, BenchThresholds, DistMaintenanceConfig, InboxMaintenanceConfig, ListenerSpec,
-    OutputMode, RetainMaintenanceConfig, SoakConfig, SoakReport, SoakThresholds, StateMode,
+    render_shard_response_text, resolved_state_mode, run_bench, run_compare_bench,
+    run_compare_soak, run_dist_maintenance_tick, run_inbox_maintenance_tick, run_profile_bench,
+    run_retain_maintenance_tick, run_shard_command, run_soak, shard_command_request,
+    validate_bench_report, validate_soak_report, BenchConfig, BenchReport, BenchScenario,
+    BenchThresholds, DistMaintenanceConfig, InboxMaintenanceConfig, ListenerSpec, OutputMode,
+    RetainMaintenanceConfig, SoakConfig, SoakReport, SoakThresholds, StateMode,
 };
 use async_trait::async_trait;
 use greenmqtt_broker::{BrokerConfig, BrokerRuntime};
@@ -4447,4 +4447,104 @@ fn render_range_lookup_text_distinguishes_metadata_fallback() {
     .unwrap();
     assert!(text.contains("source=metadata_fallback"));
     assert!(text.contains("range_id=range-a"));
+}
+
+#[test]
+fn advertised_rpc_endpoint_defaults_bare_bind_to_http() {
+    with_env_var("GREENMQTT_ADVERTISE_RPC_ENDPOINT", None, || {
+        assert_eq!(
+            super::advertised_rpc_endpoint("0.0.0.0:50051".parse().unwrap()),
+            "http://127.0.0.1:50051"
+        );
+        assert_eq!(
+            super::advertised_rpc_endpoint("127.0.0.1:50051".parse().unwrap()),
+            "http://127.0.0.1:50051"
+        );
+    });
+}
+
+#[test]
+fn advertised_rpc_endpoint_preserves_explicit_quic_endpoint() {
+    with_env_var(
+        "GREENMQTT_ADVERTISE_RPC_ENDPOINT",
+        Some("quic://node-1.internal:60051"),
+        || {
+            assert_eq!(
+                super::advertised_rpc_endpoint("0.0.0.0:50051".parse().unwrap()),
+                "quic://node-1.internal:60051"
+            );
+        },
+    );
+}
+
+#[test]
+fn resolved_control_plane_endpoints_normalize_bare_state_endpoint() {
+    with_env_var("GREENMQTT_METADATA_ENDPOINT", None, || {
+        with_env_var("GREENMQTT_RANGE_ENDPOINT", None, || {
+            let (metadata_endpoint, range_endpoint) = super::resolved_control_plane_endpoints(
+                "0.0.0.0:50051".parse().unwrap(),
+                Some("127.0.0.1:50081"),
+            )
+            .unwrap();
+            assert_eq!(metadata_endpoint, "http://127.0.0.1:50081");
+            assert_eq!(range_endpoint, "http://127.0.0.1:50081");
+        });
+    });
+}
+
+#[test]
+fn resolved_control_plane_endpoints_preserve_quic_overrides() {
+    with_env_var(
+        "GREENMQTT_METADATA_ENDPOINT",
+        Some("quic://meta.internal:50082"),
+        || {
+            with_env_var(
+                "GREENMQTT_RANGE_ENDPOINT",
+                Some("quic://range.internal:50083"),
+                || {
+                    let (metadata_endpoint, range_endpoint) =
+                        super::resolved_control_plane_endpoints(
+                            "0.0.0.0:50051".parse().unwrap(),
+                            Some("127.0.0.1:50081"),
+                        )
+                        .unwrap();
+                    assert_eq!(metadata_endpoint, "quic://meta.internal:50082");
+                    assert_eq!(range_endpoint, "quic://range.internal:50083");
+                },
+            );
+        },
+    );
+}
+
+#[test]
+fn resolved_replicated_endpoints_normalize_bare_state_endpoint() {
+    with_env_var("GREENMQTT_METADATA_ENDPOINT", None, || {
+        with_env_var("GREENMQTT_RANGE_ENDPOINT", None, || {
+            let (metadata_endpoint, range_endpoint) =
+                super::resolved_replicated_endpoints(Some("127.0.0.1:50084"), "retain").unwrap();
+            assert_eq!(metadata_endpoint, "http://127.0.0.1:50084");
+            assert_eq!(range_endpoint, "http://127.0.0.1:50084");
+        });
+    });
+}
+
+#[test]
+fn resolved_replicated_endpoints_preserve_quic_overrides() {
+    with_env_var(
+        "GREENMQTT_METADATA_ENDPOINT",
+        Some("quic://meta.internal:50085"),
+        || {
+            with_env_var(
+                "GREENMQTT_RANGE_ENDPOINT",
+                Some("quic://range.internal:50086"),
+                || {
+                    let (metadata_endpoint, range_endpoint) =
+                        super::resolved_replicated_endpoints(Some("127.0.0.1:50084"), "retain")
+                            .unwrap();
+                    assert_eq!(metadata_endpoint, "quic://meta.internal:50085");
+                    assert_eq!(range_endpoint, "quic://range.internal:50086");
+                },
+            );
+        },
+    );
 }

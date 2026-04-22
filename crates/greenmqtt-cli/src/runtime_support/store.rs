@@ -304,7 +304,7 @@ pub(crate) async fn range_scoped_rocksdb_stack(
             router.clone(),
             membership,
             Arc::new(HostedKvRangeExecutor { host: host.clone() }),
-            Arc::new(KvRangeGrpcExecutorFactory),
+            Arc::new(KvRangeGrpcExecutorFactory::default()),
         ))
     } else {
         Arc::new(HostedKvRangeExecutor { host: host.clone() })
@@ -330,14 +330,12 @@ pub(crate) async fn range_scoped_rocksdb_stack(
         sessiondict: Arc::new(ReplicatedSessionDictHandle::new(Arc::new(
             RoutedRangeDataClient::new(router.clone(), executor.clone()),
         ))),
-        dist: Arc::new(ReplicatedDistHandle::new(Arc::new(RoutedRangeDataClient::new(
-            router.clone(),
-            executor.clone(),
-        )))),
-        inbox: Arc::new(ReplicatedInboxHandle::new(Arc::new(RoutedRangeDataClient::new(
-            router.clone(),
-            executor.clone(),
-        )))),
+        dist: Arc::new(ReplicatedDistHandle::new(Arc::new(
+            RoutedRangeDataClient::new(router.clone(), executor.clone()),
+        ))),
+        inbox: Arc::new(ReplicatedInboxHandle::new(Arc::new(
+            RoutedRangeDataClient::new(router.clone(), executor.clone()),
+        ))),
         retain: Arc::new(ReplicatedRetainHandle::new(Arc::new(
             RoutedRangeDataClient::new(router, executor),
         ))),

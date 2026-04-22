@@ -22,11 +22,12 @@ impl SessionDictService for SessionDictRpc {
             .into_inner()
             .record
             .ok_or_else(|| Status::invalid_argument("missing session record"))?;
-        let replaced = self
-            .inner
-            .register(from_proto_session(record))
-            .await
-            .map_err(internal_status)?;
+        let replaced = <Self as crate::SessionDictTransportService>::register_session_record(
+            self,
+            from_proto_session(record),
+        )
+        .await
+        .map_err(internal_status)?;
         Ok(Response::new(RegisterSessionReply {
             replaced: replaced.as_ref().map(to_proto_session),
         }))
@@ -36,11 +37,12 @@ impl SessionDictService for SessionDictRpc {
         &self,
         request: Request<UnregisterSessionRequest>,
     ) -> Result<Response<RegisterSessionReply>, Status> {
-        let replaced = self
-            .inner
-            .unregister(&request.into_inner().session_id)
-            .await
-            .map_err(internal_status)?;
+        let replaced = <Self as crate::SessionDictTransportService>::unregister_session_record(
+            self,
+            &request.into_inner().session_id,
+        )
+        .await
+        .map_err(internal_status)?;
         Ok(Response::new(RegisterSessionReply {
             replaced: replaced.as_ref().map(to_proto_session),
         }))
@@ -54,9 +56,11 @@ impl SessionDictService for SessionDictRpc {
             .into_inner()
             .identity
             .ok_or_else(|| Status::invalid_argument("missing client identity"))?;
-        let record = self
-            .inner
-            .lookup_identity(&from_proto_client_identity(identity))
+        let record =
+            <Self as crate::SessionDictTransportService>::lookup_session_record_by_identity(
+                self,
+                &from_proto_client_identity(identity),
+            )
             .await
             .map_err(internal_status)?;
         Ok(Response::new(LookupSessionReply {
@@ -68,11 +72,12 @@ impl SessionDictService for SessionDictRpc {
         &self,
         request: Request<LookupSessionByIdRequest>,
     ) -> Result<Response<LookupSessionReply>, Status> {
-        let record = self
-            .inner
-            .lookup_session(&request.into_inner().session_id)
-            .await
-            .map_err(internal_status)?;
+        let record = <Self as crate::SessionDictTransportService>::lookup_session_record_by_id(
+            self,
+            &request.into_inner().session_id,
+        )
+        .await
+        .map_err(internal_status)?;
         Ok(Response::new(LookupSessionReply {
             record: record.as_ref().map(to_proto_session),
         }))
@@ -90,16 +95,16 @@ impl SessionDictService for SessionDictRpc {
         request: Request<ListSessionsRequest>,
     ) -> Result<Response<ListSessionsReply>, Status> {
         let request = request.into_inner();
-        let tenant_id = if request.tenant_id.is_empty() {
-            None
-        } else {
-            Some(request.tenant_id.as_str())
-        };
-        let records = self
-            .inner
-            .list_sessions(tenant_id)
-            .await
-            .map_err(internal_status)?;
+        let records = <Self as crate::SessionDictTransportService>::list_session_records(
+            self,
+            if request.tenant_id.is_empty() {
+                None
+            } else {
+                Some(request.tenant_id.as_str())
+            },
+        )
+        .await
+        .map_err(internal_status)?;
         Ok(Response::new(ListSessionsReply {
             records: records.iter().map(to_proto_session).collect(),
         }))
@@ -197,8 +202,7 @@ impl DistService for DistRpc {
             .into_inner()
             .route
             .ok_or_else(|| Status::invalid_argument("missing route"))?;
-        self.inner
-            .add_route(from_proto_route(route))
+        <Self as crate::DistTransportService>::add_route_record(self, from_proto_route(route))
             .await
             .map_err(internal_status)?;
         Ok(Response::new(()))
@@ -212,8 +216,7 @@ impl DistService for DistRpc {
             .into_inner()
             .route
             .ok_or_else(|| Status::invalid_argument("missing route"))?;
-        self.inner
-            .remove_route(&from_proto_route(route))
+        <Self as crate::DistTransportService>::remove_route_record(self, &from_proto_route(route))
             .await
             .map_err(internal_status)?;
         Ok(Response::new(()))
@@ -237,11 +240,12 @@ impl DistService for DistRpc {
         &self,
         request: Request<ListSessionRoutesRequest>,
     ) -> Result<Response<ListSessionRoutesReply>, Status> {
-        let routes = self
-            .inner
-            .list_session_routes(&request.into_inner().session_id)
-            .await
-            .map_err(internal_status)?;
+        let routes = <Self as crate::DistTransportService>::list_session_route_records(
+            self,
+            &request.into_inner().session_id,
+        )
+        .await
+        .map_err(internal_status)?;
         Ok(Response::new(ListSessionRoutesReply {
             routes: routes.iter().map(to_proto_route).collect(),
         }))
@@ -252,11 +256,13 @@ impl DistService for DistRpc {
         request: Request<MatchTopicRequest>,
     ) -> Result<Response<MatchTopicReply>, Status> {
         let request = request.into_inner();
-        let routes = self
-            .inner
-            .match_topic(&request.tenant_id, &request.topic)
-            .await
-            .map_err(internal_status)?;
+        let routes = <Self as crate::DistTransportService>::match_route_records(
+            self,
+            &request.tenant_id,
+            &request.topic,
+        )
+        .await
+        .map_err(internal_status)?;
         Ok(Response::new(MatchTopicReply {
             routes: routes.iter().map(to_proto_route).collect(),
         }))
@@ -267,16 +273,16 @@ impl DistService for DistRpc {
         request: Request<ListRoutesRequest>,
     ) -> Result<Response<ListRoutesReply>, Status> {
         let request = request.into_inner();
-        let tenant_id = if request.tenant_id.is_empty() {
-            None
-        } else {
-            Some(request.tenant_id.as_str())
-        };
-        let routes = self
-            .inner
-            .list_routes(tenant_id)
-            .await
-            .map_err(internal_status)?;
+        let routes = <Self as crate::DistTransportService>::list_route_records(
+            self,
+            if request.tenant_id.is_empty() {
+                None
+            } else {
+                Some(request.tenant_id.as_str())
+            },
+        )
+        .await
+        .map_err(internal_status)?;
         Ok(Response::new(ListRoutesReply {
             routes: routes.iter().map(to_proto_route).collect(),
         }))
@@ -321,18 +327,22 @@ impl ProtoInboxService for InboxRpc {
     type StreamShardSnapshotStream = tonic::codegen::BoxStream<ShardSnapshotChunk>;
 
     async fn attach(&self, request: Request<InboxAttachRequest>) -> Result<Response<()>, Status> {
-        self.inner
-            .attach(&request.into_inner().session_id)
-            .await
-            .map_err(internal_status)?;
+        <Self as crate::InboxTransportService>::attach_session(
+            self,
+            &request.into_inner().session_id,
+        )
+        .await
+        .map_err(internal_status)?;
         Ok(Response::new(()))
     }
 
     async fn detach(&self, request: Request<InboxDetachRequest>) -> Result<Response<()>, Status> {
-        self.inner
-            .detach(&request.into_inner().session_id)
-            .await
-            .map_err(internal_status)?;
+        <Self as crate::InboxTransportService>::detach_session(
+            self,
+            &request.into_inner().session_id,
+        )
+        .await
+        .map_err(internal_status)?;
         Ok(Response::new(()))
     }
 
@@ -340,10 +350,12 @@ impl ProtoInboxService for InboxRpc {
         &self,
         request: Request<InboxPurgeSessionRequest>,
     ) -> Result<Response<()>, Status> {
-        self.inner
-            .purge_session(&request.into_inner().session_id)
-            .await
-            .map_err(internal_status)?;
+        <Self as crate::InboxTransportService>::purge_session_state(
+            self,
+            &request.into_inner().session_id,
+        )
+        .await
+        .map_err(internal_status)?;
         Ok(Response::new(()))
     }
 
@@ -538,10 +550,13 @@ impl ProtoInboxService for InboxRpc {
         request: Request<InboxAckInflightRequest>,
     ) -> Result<Response<()>, Status> {
         let request = request.into_inner();
-        self.inner
-            .ack_inflight(&request.session_id, request.packet_id as u16)
-            .await
-            .map_err(internal_status)?;
+        <Self as crate::InboxTransportService>::ack_inflight_packet(
+            self,
+            &request.session_id,
+            request.packet_id as u16,
+        )
+        .await
+        .map_err(internal_status)?;
         Ok(Response::new(()))
     }
 
@@ -750,8 +765,7 @@ impl RetainService for RetainRpc {
             .into_inner()
             .message
             .ok_or_else(|| Status::invalid_argument("missing retained message"))?;
-        self.inner
-            .retain(from_proto_retain(message))
+        <Self as crate::RetainTransportService>::retain_message(self, from_proto_retain(message))
             .await
             .map_err(internal_status)?;
         Ok(Response::new(()))
@@ -762,11 +776,13 @@ impl RetainService for RetainRpc {
         request: Request<RetainMatchRequest>,
     ) -> Result<Response<RetainMatchReply>, Status> {
         let request = request.into_inner();
-        let messages = self
-            .inner
-            .match_topic(&request.tenant_id, &request.topic_filter)
-            .await
-            .map_err(internal_status)?;
+        let messages = <Self as crate::RetainTransportService>::match_retained(
+            self,
+            &request.tenant_id,
+            &request.topic_filter,
+        )
+        .await
+        .map_err(internal_status)?;
         Ok(Response::new(RetainMatchReply {
             messages: messages.iter().map(to_proto_retain).collect(),
         }))
@@ -865,18 +881,16 @@ impl MetadataService for MetadataRpc {
         &self,
         request: Request<MemberRecordReply>,
     ) -> Result<Response<MemberRecordReply>, Status> {
-        let registry = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("metadata registry unavailable"))?;
         let member = request
             .into_inner()
             .member
             .ok_or_else(|| Status::invalid_argument("missing cluster member"))?;
-        let previous = registry
-            .upsert_member(from_proto_cluster_node_membership(member))
-            .await
-            .map_err(internal_status)?;
+        let previous = <Self as crate::MetadataTransportService>::upsert_member_record(
+            self,
+            from_proto_cluster_node_membership(member),
+        )
+        .await
+        .map_err(internal_status)?;
         Ok(Response::new(MemberRecordReply {
             member: previous.as_ref().map(to_proto_cluster_node_membership),
         }))
@@ -886,14 +900,12 @@ impl MetadataService for MetadataRpc {
         &self,
         request: Request<MemberLookupRequest>,
     ) -> Result<Response<MemberRecordReply>, Status> {
-        let registry = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("metadata registry unavailable"))?;
-        let member = registry
-            .resolve_member(request.into_inner().node_id)
-            .await
-            .map_err(internal_status)?;
+        let member = <Self as crate::MetadataTransportService>::lookup_member_record(
+            self,
+            request.into_inner().node_id,
+        )
+        .await
+        .map_err(internal_status)?;
         Ok(Response::new(MemberRecordReply {
             member: member.as_ref().map(to_proto_cluster_node_membership),
         }))
@@ -903,14 +915,12 @@ impl MetadataService for MetadataRpc {
         &self,
         request: Request<MemberLookupRequest>,
     ) -> Result<Response<MemberRecordReply>, Status> {
-        let registry = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("metadata registry unavailable"))?;
-        let member = registry
-            .remove_member(request.into_inner().node_id)
-            .await
-            .map_err(internal_status)?;
+        let member = <Self as crate::MetadataTransportService>::remove_member_record(
+            self,
+            request.into_inner().node_id,
+        )
+        .await
+        .map_err(internal_status)?;
         Ok(Response::new(MemberRecordReply {
             member: member.as_ref().map(to_proto_cluster_node_membership),
         }))
@@ -920,11 +930,9 @@ impl MetadataService for MetadataRpc {
         &self,
         _request: Request<()>,
     ) -> Result<Response<MemberListReply>, Status> {
-        let registry = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("metadata registry unavailable"))?;
-        let members = registry.list_members().await.map_err(internal_status)?;
+        let members = <Self as crate::MetadataTransportService>::list_member_records(self)
+            .await
+            .map_err(internal_status)?;
         Ok(Response::new(MemberListReply {
             members: members
                 .iter()
@@ -937,18 +945,16 @@ impl MetadataService for MetadataRpc {
         &self,
         request: Request<RangeUpsertRequest>,
     ) -> Result<Response<RangeRecordReply>, Status> {
-        let registry = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("metadata registry unavailable"))?;
         let descriptor = request
             .into_inner()
             .descriptor
             .ok_or_else(|| Status::invalid_argument("missing replicated range descriptor"))?;
-        let previous = registry
-            .upsert_range(from_proto_replicated_range(descriptor))
-            .await
-            .map_err(internal_status)?;
+        let previous = <Self as crate::MetadataTransportService>::upsert_range_record(
+            self,
+            from_proto_replicated_range(descriptor),
+        )
+        .await
+        .map_err(internal_status)?;
         Ok(Response::new(RangeRecordReply {
             descriptor: previous.as_ref().map(to_proto_replicated_range),
         }))
@@ -958,14 +964,12 @@ impl MetadataService for MetadataRpc {
         &self,
         request: Request<RangeLookupRequest>,
     ) -> Result<Response<RangeRecordReply>, Status> {
-        let registry = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("metadata registry unavailable"))?;
-        let descriptor = registry
-            .resolve_range(&request.into_inner().range_id)
-            .await
-            .map_err(internal_status)?;
+        let descriptor = <Self as crate::MetadataTransportService>::lookup_range_record(
+            self,
+            &request.into_inner().range_id,
+        )
+        .await
+        .map_err(internal_status)?;
         Ok(Response::new(RangeRecordReply {
             descriptor: descriptor.as_ref().map(to_proto_replicated_range),
         }))
@@ -975,14 +979,12 @@ impl MetadataService for MetadataRpc {
         &self,
         request: Request<RangeLookupRequest>,
     ) -> Result<Response<RangeRecordReply>, Status> {
-        let registry = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("metadata registry unavailable"))?;
-        let descriptor = registry
-            .remove_range(&request.into_inner().range_id)
-            .await
-            .map_err(internal_status)?;
+        let descriptor = <Self as crate::MetadataTransportService>::remove_range_record(
+            self,
+            &request.into_inner().range_id,
+        )
+        .await
+        .map_err(internal_status)?;
         Ok(Response::new(RangeRecordReply {
             descriptor: descriptor.as_ref().map(to_proto_replicated_range),
         }))
@@ -992,26 +994,20 @@ impl MetadataService for MetadataRpc {
         &self,
         request: Request<RangeListRequest>,
     ) -> Result<Response<RangeListReply>, Status> {
-        let registry = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("metadata registry unavailable"))?;
         let request = request.into_inner();
         let shard_kind = if request.shard_kind.is_empty() {
             None
         } else {
             Some(from_proto_shard_kind(&request.shard_kind))
         };
-        let mut descriptors = registry
-            .list_ranges(shard_kind)
-            .await
-            .map_err(internal_status)?;
-        if !request.tenant_id.is_empty() {
-            descriptors.retain(|descriptor| descriptor.shard.tenant_id == request.tenant_id);
-        }
-        if !request.scope.is_empty() {
-            descriptors.retain(|descriptor| descriptor.shard.scope == request.scope);
-        }
+        let descriptors = <Self as crate::MetadataTransportService>::list_range_records(
+            self,
+            shard_kind,
+            (!request.tenant_id.is_empty()).then_some(request.tenant_id.as_str()),
+            (!request.scope.is_empty()).then_some(request.scope.as_str()),
+        )
+        .await
+        .map_err(internal_status)?;
         Ok(Response::new(RangeListReply {
             descriptors: descriptors.iter().map(to_proto_replicated_range).collect(),
         }))
@@ -1021,22 +1017,18 @@ impl MetadataService for MetadataRpc {
         &self,
         request: Request<RouteRangeRequest>,
     ) -> Result<Response<RangeRecordReply>, Status> {
-        let registry = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("metadata registry unavailable"))?;
         let request = request.into_inner();
-        let descriptor = registry
-            .route_range_for_key(
-                &ServiceShardKey {
-                    kind: from_proto_shard_kind(&request.shard_kind),
-                    tenant_id: request.tenant_id,
-                    scope: request.scope,
-                },
-                &request.key,
-            )
-            .await
-            .map_err(internal_status)?;
+        let descriptor = <Self as crate::MetadataTransportService>::route_range_record(
+            self,
+            &ServiceShardKey {
+                kind: from_proto_shard_kind(&request.shard_kind),
+                tenant_id: request.tenant_id,
+                scope: request.scope,
+            },
+            &request.key,
+        )
+        .await
+        .map_err(internal_status)?;
         Ok(Response::new(RangeRecordReply {
             descriptor: descriptor.as_ref().map(to_proto_replicated_range),
         }))
@@ -1046,18 +1038,17 @@ impl MetadataService for MetadataRpc {
         &self,
         request: Request<BalancerStateUpsertRequest>,
     ) -> Result<Response<BalancerStateUpsertReply>, Status> {
-        let registry = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("metadata registry unavailable"))?;
         let request = request.into_inner();
         let state = request
             .state
             .ok_or_else(|| Status::invalid_argument("missing balancer state"))?;
-        let previous = registry
-            .upsert_balancer_state(&request.name, from_proto_balancer_state(state))
-            .await
-            .map_err(internal_status)?;
+        let previous = <Self as crate::MetadataTransportService>::upsert_balancer_state_record(
+            self,
+            &request.name,
+            from_proto_balancer_state(state),
+        )
+        .await
+        .map_err(internal_status)?;
         Ok(Response::new(BalancerStateUpsertReply {
             previous: previous.as_ref().map(to_proto_balancer_state),
         }))
@@ -1067,14 +1058,12 @@ impl MetadataService for MetadataRpc {
         &self,
         request: Request<BalancerStateRequest>,
     ) -> Result<Response<BalancerStateReply>, Status> {
-        let registry = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("metadata registry unavailable"))?;
-        let state = registry
-            .resolve_balancer_state(&request.into_inner().name)
-            .await
-            .map_err(internal_status)?;
+        let state = <Self as crate::MetadataTransportService>::lookup_balancer_state_record(
+            self,
+            &request.into_inner().name,
+        )
+        .await
+        .map_err(internal_status)?;
         Ok(Response::new(BalancerStateReply {
             state: state.as_ref().map(to_proto_balancer_state),
         }))
@@ -1084,14 +1073,12 @@ impl MetadataService for MetadataRpc {
         &self,
         request: Request<BalancerStateRequest>,
     ) -> Result<Response<BalancerStateReply>, Status> {
-        let registry = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("metadata registry unavailable"))?;
-        let state = registry
-            .remove_balancer_state(&request.into_inner().name)
-            .await
-            .map_err(internal_status)?;
+        let state = <Self as crate::MetadataTransportService>::remove_balancer_state_record(
+            self,
+            &request.into_inner().name,
+        )
+        .await
+        .map_err(internal_status)?;
         Ok(Response::new(BalancerStateReply {
             state: state.as_ref().map(to_proto_balancer_state),
         }))
@@ -1101,12 +1088,7 @@ impl MetadataService for MetadataRpc {
         &self,
         _request: Request<()>,
     ) -> Result<Response<BalancerStateListReply>, Status> {
-        let registry = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("metadata registry unavailable"))?;
-        let states = registry
-            .list_balancer_states()
+        let states = <Self as crate::MetadataTransportService>::list_balancer_state_records(self)
             .await
             .map_err(internal_status)?;
         Ok(Response::new(BalancerStateListReply {
@@ -1127,24 +1109,15 @@ impl KvRangeService for KvRangeRpc {
         &self,
         request: Request<KvRangeGetRequest>,
     ) -> Result<Response<KvRangeGetReply>, Status> {
-        let host = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("kv range host unavailable"))?;
         let request = request.into_inner();
-        let hosted = host
-            .open_range(&request.range_id)
-            .await
-            .map_err(internal_status)?
-            .ok_or_else(|| Status::not_found("range not found"))?;
-        validate_kv_request_fence(&hosted, request.expected_epoch)?;
-        hosted.raft.read_index().await.map_err(internal_status)?;
-        let value = hosted
-            .space
-            .reader()
-            .get(&request.key)
-            .await
-            .map_err(internal_status)?;
+        let value = <Self as crate::KvRangeTransportService>::get_value(
+            self,
+            &request.range_id,
+            &request.key,
+            request.expected_epoch,
+        )
+        .await
+        .map_err(crate::kv_range_transport_status)?;
         Ok(Response::new(KvRangeGetReply {
             value: value.clone().unwrap_or_default().to_vec(),
             found: value.is_some(),
@@ -1155,80 +1128,40 @@ impl KvRangeService for KvRangeRpc {
         &self,
         request: Request<KvRangeScanRequest>,
     ) -> Result<Response<KvRangeScanReply>, Status> {
-        let host = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("kv range host unavailable"))?;
         let request = request.into_inner();
-        let hosted = host
-            .open_range(&request.range_id)
-            .await
-            .map_err(internal_status)?
-            .ok_or_else(|| Status::not_found("range not found"))?;
-        validate_kv_request_fence(&hosted, request.expected_epoch)?;
-        hosted.raft.read_index().await.map_err(internal_status)?;
         let boundary = request
             .boundary
             .map(greenmqtt_proto::from_proto_range_boundary)
             .unwrap_or_else(greenmqtt_core::RangeBoundary::full);
-        let entries = hosted
-            .space
-            .reader()
-            .scan(&boundary, request.limit as usize)
-            .await
-            .map_err(internal_status)?;
+        let entries = <Self as crate::KvRangeTransportService>::scan_entries(
+            self,
+            &request.range_id,
+            Some(boundary),
+            request.limit as usize,
+            request.expected_epoch,
+        )
+        .await
+        .map_err(crate::kv_range_transport_status)?;
         Ok(Response::new(KvRangeScanReply {
             entries: entries.iter().map(to_proto_kv_entry).collect(),
         }))
     }
 
     async fn apply(&self, request: Request<KvRangeApplyRequest>) -> Result<Response<()>, Status> {
-        let host = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("kv range host unavailable"))?;
         let request = request.into_inner();
-        let hosted = host
-            .open_range(&request.range_id)
-            .await
-            .map_err(internal_status)?
-            .ok_or_else(|| Status::not_found("range not found"))?;
-        validate_kv_request_fence(&hosted, request.expected_epoch)?;
         let mutations = request
             .mutations
             .into_iter()
             .map(from_proto_kv_mutation)
             .collect::<Vec<_>>();
-        let proposed_index = hosted
-            .raft
-            .propose(Bytes::from(
-                bincode::serialize(&mutations)
-                    .map_err(|error| internal_status(anyhow::Error::from(error)))?,
-            ))
-            .await
-            .map_err(internal_status)?;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-        loop {
-            let _ = apply_committed_entries_for_range(&hosted)
-                .await
-                .map_err(internal_status)?;
-            if hosted
-                .raft
-                .status()
-                .await
-                .map_err(internal_status)?
-                .applied_index
-                >= proposed_index
-            {
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(Status::deadline_exceeded(
-                    "timed out waiting for raft command to apply",
-                ));
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        <Self as crate::KvRangeTransportService>::apply_mutations(
+            self,
+            &request.range_id,
+            mutations,
+            request.expected_epoch,
+        )
+        .await
+        .map_err(crate::kv_range_transport_status)?;
         Ok(Response::new(()))
     }
 
@@ -1236,23 +1169,15 @@ impl KvRangeService for KvRangeRpc {
         &self,
         request: Request<KvRangeCheckpointRequest>,
     ) -> Result<Response<KvRangeCheckpointReply>, Status> {
-        let host = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("kv range host unavailable"))?;
         let request = request.into_inner();
-        let hosted = host
-            .open_range(&request.range_id)
-            .await
-            .map_err(internal_status)?
-            .ok_or_else(|| Status::not_found("range not found"))?;
-        validate_kv_request_fence(&hosted, request.expected_epoch)?;
-        hosted.raft.read_index().await.map_err(internal_status)?;
-        let checkpoint = hosted
-            .space
-            .checkpoint(&request.checkpoint_id)
-            .await
-            .map_err(internal_status)?;
+        let checkpoint = <Self as crate::KvRangeTransportService>::checkpoint_range(
+            self,
+            &request.range_id,
+            &request.checkpoint_id,
+            request.expected_epoch,
+        )
+        .await
+        .map_err(crate::kv_range_transport_status)?;
         Ok(Response::new(to_proto_kv_range_checkpoint(&checkpoint)))
     }
 
@@ -1260,19 +1185,14 @@ impl KvRangeService for KvRangeRpc {
         &self,
         request: Request<KvRangeSnapshotRequest>,
     ) -> Result<Response<KvRangeSnapshotReply>, Status> {
-        let host = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("kv range host unavailable"))?;
         let request = request.into_inner();
-        let hosted = host
-            .open_range(&request.range_id)
-            .await
-            .map_err(internal_status)?
-            .ok_or_else(|| Status::not_found("range not found"))?;
-        validate_kv_request_fence(&hosted, request.expected_epoch)?;
-        hosted.raft.read_index().await.map_err(internal_status)?;
-        let snapshot = hosted.space.snapshot().await.map_err(internal_status)?;
+        let snapshot = <Self as crate::KvRangeTransportService>::snapshot_metadata(
+            self,
+            &request.range_id,
+            request.expected_epoch,
+        )
+        .await
+        .map_err(crate::kv_range_transport_status)?;
         Ok(Response::new(to_proto_kv_range_snapshot(&snapshot)))
     }
 }
@@ -1309,8 +1229,9 @@ impl RangeAdminService for RangeAdminRpc {
         &self,
         _request: Request<()>,
     ) -> Result<Response<RangeHealthListReply>, Status> {
-        let runtime = self.runtime()?;
-        let health = runtime.health_snapshot().await.map_err(internal_status)?;
+        let health = <Self as crate::RangeAdminTransportService>::list_range_health_snapshots(self)
+            .await
+            .map_err(internal_status)?;
         Ok(Response::new(RangeHealthListReply {
             entries: health.iter().map(to_proto_range_health).collect(),
         }))
@@ -1320,23 +1241,21 @@ impl RangeAdminService for RangeAdminRpc {
         &self,
         request: Request<RangeHealthRequest>,
     ) -> Result<Response<RangeHealthReply>, Status> {
-        let runtime = self.runtime()?;
         let range_id = request.into_inner().range_id;
-        let health = runtime
-            .health_snapshot()
-            .await
-            .map_err(internal_status)?
-            .into_iter()
-            .find(|entry| entry.range_id == range_id)
-            .ok_or_else(|| Status::not_found("range not found"))?;
+        let health =
+            <Self as crate::RangeAdminTransportService>::get_range_health_snapshot(self, &range_id)
+                .await
+                .map_err(internal_status)?
+                .ok_or_else(|| Status::not_found("range not found"))?;
         Ok(Response::new(RangeHealthReply {
             health: Some(to_proto_range_health(&health)),
         }))
     }
 
     async fn debug_dump(&self, _request: Request<()>) -> Result<Response<RangeDebugReply>, Status> {
-        let runtime = self.runtime()?;
-        let text = runtime.debug_dump().await.map_err(internal_status)?;
+        let text = <Self as crate::RangeAdminTransportService>::debug_dump_text(self)
+            .await
+            .map_err(internal_status)?;
         Ok(Response::new(RangeDebugReply { text }))
     }
 }
@@ -1347,20 +1266,15 @@ impl RangeControlService for RangeControlRpc {
         &self,
         request: Request<RangeBootstrapRequest>,
     ) -> Result<Response<RangeBootstrapReply>, Status> {
-        let runtime = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("range runtime unavailable"))?;
         let descriptor = request
             .into_inner()
             .descriptor
             .ok_or_else(|| Status::invalid_argument("missing descriptor"))
             .map(from_proto_replicated_range)?;
-        let range_id = runtime
-            .bootstrap_range(descriptor)
-            .await
-            .map_err(internal_status)?;
-        self.sync_reconfiguration_state(&range_id).await?;
+        let range_id =
+            <Self as crate::RangeControlTransportService>::bootstrap_range_action(self, descriptor)
+                .await
+                .map_err(internal_status)?;
         Ok(Response::new(RangeBootstrapReply { range_id }))
     }
 
@@ -1368,29 +1282,15 @@ impl RangeControlService for RangeControlRpc {
         &self,
         request: Request<RangeChangeReplicasRequest>,
     ) -> Result<Response<()>, Status> {
-        let runtime = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("range runtime unavailable"))?;
         let request = request.into_inner();
-        let result = runtime
-            .change_replicas(&request.range_id, request.voters, request.learners)
-            .await;
-        if result
-            .as_ref()
-            .err()
-            .map(|error| {
-                let message = error.to_string();
-                message.contains("blocked on catch-up")
-                    || message.contains("joint catch-up")
-                    || message.contains("entering joint config")
-            })
-            .unwrap_or(false)
-            || result.is_ok()
-        {
-            self.sync_reconfiguration_state(&request.range_id).await?;
-        }
-        result.map_err(internal_status)?;
+        <Self as crate::RangeControlTransportService>::change_replicas_action(
+            self,
+            &request.range_id,
+            request.voters,
+            request.learners,
+        )
+        .await
+        .map_err(internal_status)?;
         Ok(Response::new(()))
     }
 
@@ -1398,16 +1298,14 @@ impl RangeControlService for RangeControlRpc {
         &self,
         request: Request<RangeTransferLeadershipRequest>,
     ) -> Result<Response<()>, Status> {
-        let runtime = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("range runtime unavailable"))?;
         let request = request.into_inner();
-        runtime
-            .transfer_leadership(&request.range_id, request.target_node_id)
-            .await
-            .map_err(internal_status)?;
-        self.sync_reconfiguration_state(&request.range_id).await?;
+        <Self as crate::RangeControlTransportService>::transfer_leadership_action(
+            self,
+            &request.range_id,
+            request.target_node_id,
+        )
+        .await
+        .map_err(internal_status)?;
         Ok(Response::new(()))
     }
 
@@ -1415,16 +1313,14 @@ impl RangeControlService for RangeControlRpc {
         &self,
         request: Request<RangeRecoverRequest>,
     ) -> Result<Response<()>, Status> {
-        let runtime = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("range runtime unavailable"))?;
         let request = request.into_inner();
-        runtime
-            .recover_range(&request.range_id, request.new_leader_node_id)
-            .await
-            .map_err(internal_status)?;
-        self.sync_reconfiguration_state(&request.range_id).await?;
+        <Self as crate::RangeControlTransportService>::recover_range_action(
+            self,
+            &request.range_id,
+            request.new_leader_node_id,
+        )
+        .await
+        .map_err(internal_status)?;
         Ok(Response::new(()))
     }
 
@@ -1432,69 +1328,15 @@ impl RangeControlService for RangeControlRpc {
         &self,
         request: Request<RangeSplitRequest>,
     ) -> Result<Response<RangeSplitReply>, Status> {
-        let runtime = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("range runtime unavailable"))?;
         let request = request.into_inner();
-        let split_key = request.split_key.clone();
-        let source_descriptor = if let Some(registry) = self.registry.as_ref() {
-            registry
-                .resolve_range(&request.range_id)
-                .await
-                .map_err(internal_status)?
-        } else {
-            None
-        };
-        let (left_range_id, right_range_id) = runtime
-            .split_range(&request.range_id, split_key.clone())
+        let (left_range_id, right_range_id) =
+            <Self as crate::RangeControlTransportService>::split_range_action(
+                self,
+                &request.range_id,
+                request.split_key,
+            )
             .await
             .map_err(internal_status)?;
-        if let (Some(registry), Some(source)) = (self.registry.as_ref(), source_descriptor) {
-            let child_epoch = source.epoch + 2;
-            let left = ReplicatedRangeDescriptor::new(
-                left_range_id.clone(),
-                source.shard.clone(),
-                RangeBoundary::new(
-                    source.boundary.start_key.clone(),
-                    Some(split_key.clone()),
-                ),
-                child_epoch,
-                source.config_version,
-                source.leader_node_id,
-                source.replicas.clone(),
-                source.commit_index,
-                source.applied_index,
-                ServiceShardLifecycle::Serving,
-            );
-            let right = ReplicatedRangeDescriptor::new(
-                right_range_id.clone(),
-                source.shard,
-                RangeBoundary::new(Some(split_key), source.boundary.end_key.clone()),
-                child_epoch,
-                source.config_version,
-                source.leader_node_id,
-                source.replicas,
-                source.commit_index,
-                source.applied_index,
-                ServiceShardLifecycle::Serving,
-            );
-            let _ = registry
-                .remove_range(&request.range_id)
-                .await
-                .map_err(internal_status)?;
-            let _ = registry
-                .upsert_range(left)
-                .await
-                .map_err(internal_status)?;
-            let _ = registry
-                .upsert_range(right)
-                .await
-                .map_err(internal_status)?;
-        }
-        self.sync_reconfiguration_state(&request.range_id).await?;
-        self.sync_reconfiguration_state(&left_range_id).await?;
-        self.sync_reconfiguration_state(&right_range_id).await?;
         Ok(Response::new(RangeSplitReply {
             left_range_id,
             right_range_id,
@@ -1505,20 +1347,14 @@ impl RangeControlService for RangeControlRpc {
         &self,
         request: Request<RangeMergeRequest>,
     ) -> Result<Response<RangeMergeReply>, Status> {
-        let runtime = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("range runtime unavailable"))?;
         let request = request.into_inner();
-        let range_id = runtime
-            .merge_ranges(&request.left_range_id, &request.right_range_id)
-            .await
-            .map_err(internal_status)?;
-        self.sync_reconfiguration_state(&request.left_range_id)
-            .await?;
-        self.sync_reconfiguration_state(&request.right_range_id)
-            .await?;
-        self.sync_reconfiguration_state(&range_id).await?;
+        let range_id = <Self as crate::RangeControlTransportService>::merge_ranges_action(
+            self,
+            &request.left_range_id,
+            &request.right_range_id,
+        )
+        .await
+        .map_err(internal_status)?;
         Ok(Response::new(RangeMergeReply { range_id }))
     }
 
@@ -1526,16 +1362,10 @@ impl RangeControlService for RangeControlRpc {
         &self,
         request: Request<RangeDrainRequest>,
     ) -> Result<Response<()>, Status> {
-        let runtime = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("range runtime unavailable"))?;
         let range_id = request.into_inner().range_id;
-        runtime
-            .drain_range(&range_id)
+        <Self as crate::RangeControlTransportService>::drain_range_action(self, &range_id)
             .await
             .map_err(internal_status)?;
-        self.sync_reconfiguration_state(&range_id).await?;
         Ok(Response::new(()))
     }
 
@@ -1543,16 +1373,10 @@ impl RangeControlService for RangeControlRpc {
         &self,
         request: Request<RangeRetireRequest>,
     ) -> Result<Response<()>, Status> {
-        let runtime = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("range runtime unavailable"))?;
         let range_id = request.into_inner().range_id;
-        runtime
-            .retire_range(&range_id)
+        <Self as crate::RangeControlTransportService>::retire_range_action(self, &range_id)
             .await
             .map_err(internal_status)?;
-        self.sync_reconfiguration_state(&range_id).await?;
         Ok(Response::new(()))
     }
 
@@ -1560,14 +1384,10 @@ impl RangeControlService for RangeControlRpc {
         &self,
         _request: Request<()>,
     ) -> Result<Response<ZombieRangeListReply>, Status> {
-        let runtime = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("range runtime unavailable"))?;
-        let entries = runtime
-            .list_zombie_ranges()
-            .await
-            .map_err(internal_status)?;
+        let entries =
+            <Self as crate::RangeControlTransportService>::list_zombie_range_snapshots(self)
+                .await
+                .map_err(internal_status)?;
         Ok(Response::new(ZombieRangeListReply {
             entries: entries.iter().map(to_proto_zombie_range).collect(),
         }))
@@ -1609,6 +1429,13 @@ pub(crate) fn internal_status(error: anyhow::Error) -> Status {
 }
 
 impl RangeControlRpc {
+    fn runtime(&self) -> anyhow::Result<Arc<greenmqtt_kv_server::ReplicaRuntime>> {
+        self.inner
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("range runtime unavailable"))
+    }
+
     async fn sync_reconfiguration_state(&self, range_id: &str) -> Result<(), Status> {
         let Some(runtime) = self.inner.as_ref() else {
             return Ok(());
@@ -1633,20 +1460,892 @@ impl RangeControlRpc {
         }
         Ok(())
     }
+
+    async fn sync_reconfiguration_state_anyhow(&self, range_id: &str) -> anyhow::Result<()> {
+        self.sync_reconfiguration_state(range_id)
+            .await
+            .map_err(anyhow::Error::from)
+    }
+
+    pub(crate) async fn bootstrap_range_action(
+        &self,
+        descriptor: ReplicatedRangeDescriptor,
+    ) -> anyhow::Result<String> {
+        let range_id = self.runtime()?.bootstrap_range(descriptor).await?;
+        self.sync_reconfiguration_state_anyhow(&range_id).await?;
+        Ok(range_id)
+    }
+
+    pub(crate) async fn change_replicas_action(
+        &self,
+        range_id: &str,
+        voters: Vec<NodeId>,
+        learners: Vec<NodeId>,
+    ) -> anyhow::Result<()> {
+        let result = self
+            .runtime()?
+            .change_replicas(range_id, voters, learners)
+            .await;
+        if result
+            .as_ref()
+            .err()
+            .map(|error| {
+                let message = error.to_string();
+                message.contains("blocked on catch-up")
+                    || message.contains("joint catch-up")
+                    || message.contains("entering joint config")
+            })
+            .unwrap_or(false)
+            || result.is_ok()
+        {
+            self.sync_reconfiguration_state_anyhow(range_id).await?;
+        }
+        result?;
+        Ok(())
+    }
+
+    pub(crate) async fn transfer_leadership_action(
+        &self,
+        range_id: &str,
+        target_node_id: NodeId,
+    ) -> anyhow::Result<()> {
+        self.runtime()?
+            .transfer_leadership(range_id, target_node_id)
+            .await?;
+        self.sync_reconfiguration_state_anyhow(range_id).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn recover_range_action(
+        &self,
+        range_id: &str,
+        new_leader_node_id: NodeId,
+    ) -> anyhow::Result<()> {
+        self.runtime()?
+            .recover_range(range_id, new_leader_node_id)
+            .await?;
+        self.sync_reconfiguration_state_anyhow(range_id).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn split_range_action(
+        &self,
+        range_id: &str,
+        split_key: Vec<u8>,
+    ) -> anyhow::Result<(String, String)> {
+        let source_descriptor = if let Some(registry) = self.registry.as_ref() {
+            registry.resolve_range(range_id).await?
+        } else {
+            None
+        };
+        let (left_range_id, right_range_id) = self
+            .runtime()?
+            .split_range(range_id, split_key.clone())
+            .await?;
+        if let (Some(registry), Some(source)) = (self.registry.as_ref(), source_descriptor) {
+            let child_epoch = source.epoch + 2;
+            let left = ReplicatedRangeDescriptor::new(
+                left_range_id.clone(),
+                source.shard.clone(),
+                RangeBoundary::new(source.boundary.start_key.clone(), Some(split_key.clone())),
+                child_epoch,
+                source.config_version,
+                source.leader_node_id,
+                source.replicas.clone(),
+                source.commit_index,
+                source.applied_index,
+                ServiceShardLifecycle::Serving,
+            );
+            let right = ReplicatedRangeDescriptor::new(
+                right_range_id.clone(),
+                source.shard,
+                RangeBoundary::new(Some(split_key), source.boundary.end_key.clone()),
+                child_epoch,
+                source.config_version,
+                source.leader_node_id,
+                source.replicas,
+                source.commit_index,
+                source.applied_index,
+                ServiceShardLifecycle::Serving,
+            );
+            let _ = registry.remove_range(range_id).await?;
+            let _ = registry.upsert_range(left).await?;
+            let _ = registry.upsert_range(right).await?;
+        }
+        self.sync_reconfiguration_state_anyhow(range_id).await?;
+        self.sync_reconfiguration_state_anyhow(&left_range_id)
+            .await?;
+        self.sync_reconfiguration_state_anyhow(&right_range_id)
+            .await?;
+        Ok((left_range_id, right_range_id))
+    }
+
+    pub(crate) async fn merge_ranges_action(
+        &self,
+        left_range_id: &str,
+        right_range_id: &str,
+    ) -> anyhow::Result<String> {
+        let range_id = self
+            .runtime()?
+            .merge_ranges(left_range_id, right_range_id)
+            .await?;
+        self.sync_reconfiguration_state_anyhow(left_range_id)
+            .await?;
+        self.sync_reconfiguration_state_anyhow(right_range_id)
+            .await?;
+        self.sync_reconfiguration_state_anyhow(&range_id).await?;
+        Ok(range_id)
+    }
+
+    pub(crate) async fn drain_range_action(&self, range_id: &str) -> anyhow::Result<()> {
+        self.runtime()?.drain_range(range_id).await?;
+        self.sync_reconfiguration_state_anyhow(range_id).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn retire_range_action(&self, range_id: &str) -> anyhow::Result<()> {
+        self.runtime()?.retire_range(range_id).await?;
+        self.sync_reconfiguration_state_anyhow(range_id).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn list_zombie_range_snapshots(
+        &self,
+    ) -> anyhow::Result<Vec<ZombieRangeSnapshot>> {
+        self.runtime()?.list_zombie_ranges().await
+    }
 }
 
 impl RangeAdminRpc {
-    fn runtime(&self) -> Result<Arc<greenmqtt_kv_server::ReplicaRuntime>, Status> {
+    fn runtime(&self) -> anyhow::Result<Arc<greenmqtt_kv_server::ReplicaRuntime>> {
         if let Some(runtime) = self.runtime.as_ref() {
             return Ok(runtime.clone());
         }
         let host = self
             .host
             .as_ref()
-            .ok_or_else(|| Status::unavailable("kv range host unavailable"))?;
+            .ok_or_else(|| anyhow::anyhow!("kv range host unavailable"))?;
         Ok(Arc::new(greenmqtt_kv_server::ReplicaRuntime::new(
             host.clone(),
             Arc::new(crate::NoopReplicaTransport),
         )))
+    }
+
+    pub(crate) async fn list_range_health_snapshots(
+        &self,
+    ) -> anyhow::Result<Vec<RangeHealthSnapshot>> {
+        self.runtime()?.health_snapshot().await
+    }
+
+    pub(crate) async fn get_range_health_snapshot(
+        &self,
+        range_id: &str,
+    ) -> anyhow::Result<Option<RangeHealthSnapshot>> {
+        Ok(self
+            .list_range_health_snapshots()
+            .await?
+            .into_iter()
+            .find(|entry| entry.range_id == range_id))
+    }
+
+    pub(crate) async fn debug_dump_text(&self) -> anyhow::Result<String> {
+        self.runtime()?.debug_dump().await
+    }
+}
+
+impl SessionDictRpc {
+    pub(crate) async fn register_session_record(
+        &self,
+        record: SessionRecord,
+    ) -> anyhow::Result<Option<SessionRecord>> {
+        self.inner.register(record).await
+    }
+
+    pub(crate) async fn unregister_session_record(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Option<SessionRecord>> {
+        self.inner.unregister(session_id).await
+    }
+
+    pub(crate) async fn lookup_session_record_by_identity(
+        &self,
+        identity: &ClientIdentity,
+    ) -> anyhow::Result<Option<SessionRecord>> {
+        self.inner.lookup_identity(identity).await
+    }
+
+    pub(crate) async fn lookup_session_record_by_id(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Option<SessionRecord>> {
+        self.inner.lookup_session(session_id).await
+    }
+
+    pub(crate) async fn list_session_records(
+        &self,
+        tenant_id: Option<&str>,
+    ) -> anyhow::Result<Vec<SessionRecord>> {
+        self.inner.list_sessions(tenant_id).await
+    }
+}
+
+impl DistRpc {
+    pub(crate) async fn add_route_record(&self, route: RouteRecord) -> anyhow::Result<()> {
+        self.inner.add_route(route).await
+    }
+
+    pub(crate) async fn remove_route_record(&self, route: &RouteRecord) -> anyhow::Result<()> {
+        self.inner.remove_route(route).await
+    }
+
+    pub(crate) async fn list_session_route_records(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Vec<RouteRecord>> {
+        self.inner.list_session_routes(session_id).await
+    }
+
+    pub(crate) async fn match_route_records(
+        &self,
+        tenant_id: &str,
+        topic: &str,
+    ) -> anyhow::Result<Vec<RouteRecord>> {
+        self.inner.match_topic(tenant_id, &topic.to_string()).await
+    }
+
+    pub(crate) async fn list_route_records(
+        &self,
+        tenant_id: Option<&str>,
+    ) -> anyhow::Result<Vec<RouteRecord>> {
+        self.inner.list_routes(tenant_id).await
+    }
+}
+
+impl InboxRpc {
+    pub(crate) async fn attach_session(&self, session_id: &str) -> anyhow::Result<()> {
+        self.inner.attach(&session_id.to_string()).await
+    }
+
+    pub(crate) async fn detach_session(&self, session_id: &str) -> anyhow::Result<()> {
+        self.inner.detach(&session_id.to_string()).await
+    }
+
+    pub(crate) async fn purge_session_state(&self, session_id: &str) -> anyhow::Result<()> {
+        self.inner.purge_session(&session_id.to_string()).await
+    }
+
+    pub(crate) async fn ack_inflight_packet(
+        &self,
+        session_id: &str,
+        packet_id: u16,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .ack_inflight(&session_id.to_string(), packet_id)
+            .await
+    }
+}
+
+impl KvRangeRpc {
+    pub(crate) async fn get_value(
+        &self,
+        range_id: &str,
+        key: &[u8],
+        expected_epoch: u64,
+    ) -> Result<Option<Bytes>, crate::KvRangeTransportError> {
+        let host = self.inner.as_ref().ok_or_else(|| {
+            crate::KvRangeTransportError::Unavailable("kv range host unavailable".into())
+        })?;
+        let hosted = host
+            .open_range(range_id)
+            .await
+            .map_err(crate::KvRangeTransportError::Internal)?
+            .ok_or_else(|| crate::KvRangeTransportError::NotFound("range not found".into()))?;
+        validate_kv_request_fence(&hosted, expected_epoch).map_err(|status| {
+            crate::KvRangeTransportError::Internal(anyhow::anyhow!(status.to_string()))
+        })?;
+        hosted
+            .raft
+            .read_index()
+            .await
+            .map_err(crate::KvRangeTransportError::Internal)?;
+        hosted
+            .space
+            .reader()
+            .get(key)
+            .await
+            .map_err(crate::KvRangeTransportError::Internal)
+    }
+
+    pub(crate) async fn scan_entries(
+        &self,
+        range_id: &str,
+        boundary: Option<RangeBoundary>,
+        limit: usize,
+        expected_epoch: u64,
+    ) -> Result<Vec<(Bytes, Bytes)>, crate::KvRangeTransportError> {
+        let host = self.inner.as_ref().ok_or_else(|| {
+            crate::KvRangeTransportError::Unavailable("kv range host unavailable".into())
+        })?;
+        let hosted = host
+            .open_range(range_id)
+            .await
+            .map_err(crate::KvRangeTransportError::Internal)?
+            .ok_or_else(|| crate::KvRangeTransportError::NotFound("range not found".into()))?;
+        validate_kv_request_fence(&hosted, expected_epoch).map_err(|status| {
+            crate::KvRangeTransportError::Internal(anyhow::anyhow!(status.to_string()))
+        })?;
+        hosted
+            .raft
+            .read_index()
+            .await
+            .map_err(crate::KvRangeTransportError::Internal)?;
+        hosted
+            .space
+            .reader()
+            .scan(&boundary.unwrap_or_else(RangeBoundary::full), limit)
+            .await
+            .map_err(crate::KvRangeTransportError::Internal)
+    }
+
+    pub(crate) async fn apply_mutations(
+        &self,
+        range_id: &str,
+        mutations: Vec<KvMutation>,
+        expected_epoch: u64,
+    ) -> Result<(), crate::KvRangeTransportError> {
+        let host = self.inner.as_ref().ok_or_else(|| {
+            crate::KvRangeTransportError::Unavailable("kv range host unavailable".into())
+        })?;
+        let hosted = host
+            .open_range(range_id)
+            .await
+            .map_err(crate::KvRangeTransportError::Internal)?
+            .ok_or_else(|| crate::KvRangeTransportError::NotFound("range not found".into()))?;
+        validate_kv_request_fence(&hosted, expected_epoch).map_err(|status| {
+            crate::KvRangeTransportError::Internal(anyhow::anyhow!(status.to_string()))
+        })?;
+        let proposed_index = hosted
+            .raft
+            .propose(Bytes::from(
+                bincode::serialize(&mutations)
+                    .map_err(anyhow::Error::from)
+                    .map_err(crate::KvRangeTransportError::Internal)?,
+            ))
+            .await
+            .map_err(crate::KvRangeTransportError::Internal)?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let _ = apply_committed_entries_for_range(&hosted)
+                .await
+                .map_err(crate::KvRangeTransportError::Internal)?;
+            if hosted
+                .raft
+                .status()
+                .await
+                .map_err(crate::KvRangeTransportError::Internal)?
+                .applied_index
+                >= proposed_index
+            {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(crate::KvRangeTransportError::DeadlineExceeded(
+                    "timed out waiting for raft command to apply".into(),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn checkpoint_range(
+        &self,
+        range_id: &str,
+        checkpoint_id: &str,
+        expected_epoch: u64,
+    ) -> Result<KvRangeCheckpoint, crate::KvRangeTransportError> {
+        let host = self.inner.as_ref().ok_or_else(|| {
+            crate::KvRangeTransportError::Unavailable("kv range host unavailable".into())
+        })?;
+        let hosted = host
+            .open_range(range_id)
+            .await
+            .map_err(crate::KvRangeTransportError::Internal)?
+            .ok_or_else(|| crate::KvRangeTransportError::NotFound("range not found".into()))?;
+        validate_kv_request_fence(&hosted, expected_epoch).map_err(|status| {
+            crate::KvRangeTransportError::Internal(anyhow::anyhow!(status.to_string()))
+        })?;
+        hosted
+            .raft
+            .read_index()
+            .await
+            .map_err(crate::KvRangeTransportError::Internal)?;
+        hosted
+            .space
+            .checkpoint(checkpoint_id)
+            .await
+            .map_err(crate::KvRangeTransportError::Internal)
+    }
+
+    pub(crate) async fn snapshot_metadata(
+        &self,
+        range_id: &str,
+        expected_epoch: u64,
+    ) -> Result<KvRangeSnapshot, crate::KvRangeTransportError> {
+        let host = self.inner.as_ref().ok_or_else(|| {
+            crate::KvRangeTransportError::Unavailable("kv range host unavailable".into())
+        })?;
+        let hosted = host
+            .open_range(range_id)
+            .await
+            .map_err(crate::KvRangeTransportError::Internal)?
+            .ok_or_else(|| crate::KvRangeTransportError::NotFound("range not found".into()))?;
+        validate_kv_request_fence(&hosted, expected_epoch).map_err(|status| {
+            crate::KvRangeTransportError::Internal(anyhow::anyhow!(status.to_string()))
+        })?;
+        hosted
+            .raft
+            .read_index()
+            .await
+            .map_err(crate::KvRangeTransportError::Internal)?;
+        hosted
+            .space
+            .snapshot()
+            .await
+            .map_err(crate::KvRangeTransportError::Internal)
+    }
+}
+
+impl MetadataRpc {
+    fn registry(&self) -> anyhow::Result<Arc<dyn MetadataRegistry>> {
+        self.inner
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("metadata registry unavailable"))
+    }
+
+    pub(crate) async fn upsert_member_record(
+        &self,
+        member: ClusterNodeMembership,
+    ) -> anyhow::Result<Option<ClusterNodeMembership>> {
+        self.registry()?.upsert_member(member).await
+    }
+
+    pub(crate) async fn lookup_member_record(
+        &self,
+        node_id: NodeId,
+    ) -> anyhow::Result<Option<ClusterNodeMembership>> {
+        self.registry()?.resolve_member(node_id).await
+    }
+
+    pub(crate) async fn remove_member_record(
+        &self,
+        node_id: NodeId,
+    ) -> anyhow::Result<Option<ClusterNodeMembership>> {
+        self.registry()?.remove_member(node_id).await
+    }
+
+    pub(crate) async fn list_member_records(&self) -> anyhow::Result<Vec<ClusterNodeMembership>> {
+        self.registry()?.list_members().await
+    }
+
+    pub(crate) async fn upsert_balancer_state_record(
+        &self,
+        name: &str,
+        state: BalancerState,
+    ) -> anyhow::Result<Option<BalancerState>> {
+        self.registry()?.upsert_balancer_state(name, state).await
+    }
+
+    pub(crate) async fn lookup_balancer_state_record(
+        &self,
+        name: &str,
+    ) -> anyhow::Result<Option<BalancerState>> {
+        self.registry()?.resolve_balancer_state(name).await
+    }
+
+    pub(crate) async fn remove_balancer_state_record(
+        &self,
+        name: &str,
+    ) -> anyhow::Result<Option<BalancerState>> {
+        self.registry()?.remove_balancer_state(name).await
+    }
+
+    pub(crate) async fn list_balancer_state_records(
+        &self,
+    ) -> anyhow::Result<BTreeMap<String, BalancerState>> {
+        self.registry()?.list_balancer_states().await
+    }
+
+    pub(crate) async fn upsert_range_record(
+        &self,
+        descriptor: ReplicatedRangeDescriptor,
+    ) -> anyhow::Result<Option<ReplicatedRangeDescriptor>> {
+        self.registry()?.upsert_range(descriptor).await
+    }
+
+    pub(crate) async fn lookup_range_record(
+        &self,
+        range_id: &str,
+    ) -> anyhow::Result<Option<ReplicatedRangeDescriptor>> {
+        self.registry()?.resolve_range(range_id).await
+    }
+
+    pub(crate) async fn remove_range_record(
+        &self,
+        range_id: &str,
+    ) -> anyhow::Result<Option<ReplicatedRangeDescriptor>> {
+        self.registry()?.remove_range(range_id).await
+    }
+
+    pub(crate) async fn list_range_records(
+        &self,
+        shard_kind: Option<ServiceShardKind>,
+        tenant_id: Option<&str>,
+        scope: Option<&str>,
+    ) -> anyhow::Result<Vec<ReplicatedRangeDescriptor>> {
+        let mut descriptors = self.registry()?.list_ranges(shard_kind).await?;
+        if let Some(tenant_id) = tenant_id {
+            descriptors.retain(|descriptor| descriptor.shard.tenant_id == tenant_id);
+        }
+        if let Some(scope) = scope {
+            descriptors.retain(|descriptor| descriptor.shard.scope == scope);
+        }
+        Ok(descriptors)
+    }
+
+    pub(crate) async fn route_range_record(
+        &self,
+        shard: &ServiceShardKey,
+        key: &[u8],
+    ) -> anyhow::Result<Option<ReplicatedRangeDescriptor>> {
+        self.registry()?.route_range_for_key(shard, key).await
+    }
+}
+
+#[async_trait]
+impl crate::SessionDictTransportService for SessionDictRpc {
+    async fn register_session_record(
+        &self,
+        record: SessionRecord,
+    ) -> anyhow::Result<Option<SessionRecord>> {
+        SessionDictRpc::register_session_record(self, record).await
+    }
+
+    async fn unregister_session_record(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Option<SessionRecord>> {
+        SessionDictRpc::unregister_session_record(self, session_id).await
+    }
+
+    async fn lookup_session_record_by_identity(
+        &self,
+        identity: &ClientIdentity,
+    ) -> anyhow::Result<Option<SessionRecord>> {
+        SessionDictRpc::lookup_session_record_by_identity(self, identity).await
+    }
+
+    async fn lookup_session_record_by_id(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Option<SessionRecord>> {
+        SessionDictRpc::lookup_session_record_by_id(self, session_id).await
+    }
+
+    async fn list_session_records(
+        &self,
+        tenant_id: Option<&str>,
+    ) -> anyhow::Result<Vec<SessionRecord>> {
+        SessionDictRpc::list_session_records(self, tenant_id).await
+    }
+}
+
+#[async_trait]
+impl crate::DistTransportService for DistRpc {
+    async fn add_route_record(&self, route: RouteRecord) -> anyhow::Result<()> {
+        DistRpc::add_route_record(self, route).await
+    }
+
+    async fn remove_route_record(&self, route: &RouteRecord) -> anyhow::Result<()> {
+        DistRpc::remove_route_record(self, route).await
+    }
+
+    async fn list_session_route_records(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Vec<RouteRecord>> {
+        DistRpc::list_session_route_records(self, session_id).await
+    }
+
+    async fn match_route_records(
+        &self,
+        tenant_id: &str,
+        topic: &str,
+    ) -> anyhow::Result<Vec<RouteRecord>> {
+        DistRpc::match_route_records(self, tenant_id, topic).await
+    }
+
+    async fn list_route_records(
+        &self,
+        tenant_id: Option<&str>,
+    ) -> anyhow::Result<Vec<RouteRecord>> {
+        DistRpc::list_route_records(self, tenant_id).await
+    }
+}
+
+#[async_trait]
+impl crate::InboxTransportService for InboxRpc {
+    async fn attach_session(&self, session_id: &str) -> anyhow::Result<()> {
+        InboxRpc::attach_session(self, session_id).await
+    }
+
+    async fn detach_session(&self, session_id: &str) -> anyhow::Result<()> {
+        InboxRpc::detach_session(self, session_id).await
+    }
+
+    async fn purge_session_state(&self, session_id: &str) -> anyhow::Result<()> {
+        InboxRpc::purge_session_state(self, session_id).await
+    }
+
+    async fn ack_inflight_packet(&self, session_id: &str, packet_id: u16) -> anyhow::Result<()> {
+        InboxRpc::ack_inflight_packet(self, session_id, packet_id).await
+    }
+}
+
+#[async_trait]
+impl crate::KvRangeTransportService for KvRangeRpc {
+    async fn get_value(
+        &self,
+        range_id: &str,
+        key: &[u8],
+        expected_epoch: u64,
+    ) -> Result<Option<Bytes>, crate::KvRangeTransportError> {
+        KvRangeRpc::get_value(self, range_id, key, expected_epoch).await
+    }
+
+    async fn scan_entries(
+        &self,
+        range_id: &str,
+        boundary: Option<RangeBoundary>,
+        limit: usize,
+        expected_epoch: u64,
+    ) -> Result<Vec<(Bytes, Bytes)>, crate::KvRangeTransportError> {
+        KvRangeRpc::scan_entries(self, range_id, boundary, limit, expected_epoch).await
+    }
+
+    async fn apply_mutations(
+        &self,
+        range_id: &str,
+        mutations: Vec<KvMutation>,
+        expected_epoch: u64,
+    ) -> Result<(), crate::KvRangeTransportError> {
+        KvRangeRpc::apply_mutations(self, range_id, mutations, expected_epoch).await
+    }
+
+    async fn checkpoint_range(
+        &self,
+        range_id: &str,
+        checkpoint_id: &str,
+        expected_epoch: u64,
+    ) -> Result<KvRangeCheckpoint, crate::KvRangeTransportError> {
+        KvRangeRpc::checkpoint_range(self, range_id, checkpoint_id, expected_epoch).await
+    }
+
+    async fn snapshot_metadata(
+        &self,
+        range_id: &str,
+        expected_epoch: u64,
+    ) -> Result<KvRangeSnapshot, crate::KvRangeTransportError> {
+        KvRangeRpc::snapshot_metadata(self, range_id, expected_epoch).await
+    }
+}
+
+#[async_trait]
+impl crate::RetainTransportService for RetainRpc {
+    async fn retain_message(&self, message: RetainedMessage) -> anyhow::Result<()> {
+        self.inner.retain(message).await
+    }
+
+    async fn match_retained(
+        &self,
+        tenant_id: &str,
+        topic_filter: &str,
+    ) -> anyhow::Result<Vec<RetainedMessage>> {
+        self.inner.match_topic(tenant_id, topic_filter).await
+    }
+}
+
+#[async_trait]
+impl crate::RangeAdminTransportService for RangeAdminRpc {
+    async fn list_range_health_snapshots(&self) -> anyhow::Result<Vec<RangeHealthSnapshot>> {
+        RangeAdminRpc::list_range_health_snapshots(self).await
+    }
+
+    async fn get_range_health_snapshot(
+        &self,
+        range_id: &str,
+    ) -> anyhow::Result<Option<RangeHealthSnapshot>> {
+        RangeAdminRpc::get_range_health_snapshot(self, range_id).await
+    }
+
+    async fn debug_dump_text(&self) -> anyhow::Result<String> {
+        RangeAdminRpc::debug_dump_text(self).await
+    }
+}
+
+#[async_trait]
+impl crate::MetadataTransportService for MetadataRpc {
+    async fn upsert_member_record(
+        &self,
+        member: ClusterNodeMembership,
+    ) -> anyhow::Result<Option<ClusterNodeMembership>> {
+        MetadataRpc::upsert_member_record(self, member).await
+    }
+
+    async fn lookup_member_record(
+        &self,
+        node_id: NodeId,
+    ) -> anyhow::Result<Option<ClusterNodeMembership>> {
+        MetadataRpc::lookup_member_record(self, node_id).await
+    }
+
+    async fn remove_member_record(
+        &self,
+        node_id: NodeId,
+    ) -> anyhow::Result<Option<ClusterNodeMembership>> {
+        MetadataRpc::remove_member_record(self, node_id).await
+    }
+
+    async fn list_member_records(&self) -> anyhow::Result<Vec<ClusterNodeMembership>> {
+        MetadataRpc::list_member_records(self).await
+    }
+
+    async fn upsert_balancer_state_record(
+        &self,
+        name: &str,
+        state: BalancerState,
+    ) -> anyhow::Result<Option<BalancerState>> {
+        MetadataRpc::upsert_balancer_state_record(self, name, state).await
+    }
+
+    async fn lookup_balancer_state_record(
+        &self,
+        name: &str,
+    ) -> anyhow::Result<Option<BalancerState>> {
+        MetadataRpc::lookup_balancer_state_record(self, name).await
+    }
+
+    async fn remove_balancer_state_record(
+        &self,
+        name: &str,
+    ) -> anyhow::Result<Option<BalancerState>> {
+        MetadataRpc::remove_balancer_state_record(self, name).await
+    }
+
+    async fn list_balancer_state_records(&self) -> anyhow::Result<BTreeMap<String, BalancerState>> {
+        MetadataRpc::list_balancer_state_records(self).await
+    }
+
+    async fn upsert_range_record(
+        &self,
+        descriptor: ReplicatedRangeDescriptor,
+    ) -> anyhow::Result<Option<ReplicatedRangeDescriptor>> {
+        MetadataRpc::upsert_range_record(self, descriptor).await
+    }
+
+    async fn lookup_range_record(
+        &self,
+        range_id: &str,
+    ) -> anyhow::Result<Option<ReplicatedRangeDescriptor>> {
+        MetadataRpc::lookup_range_record(self, range_id).await
+    }
+
+    async fn remove_range_record(
+        &self,
+        range_id: &str,
+    ) -> anyhow::Result<Option<ReplicatedRangeDescriptor>> {
+        MetadataRpc::remove_range_record(self, range_id).await
+    }
+
+    async fn list_range_records(
+        &self,
+        shard_kind: Option<ServiceShardKind>,
+        tenant_id: Option<&str>,
+        scope: Option<&str>,
+    ) -> anyhow::Result<Vec<ReplicatedRangeDescriptor>> {
+        MetadataRpc::list_range_records(self, shard_kind, tenant_id, scope).await
+    }
+
+    async fn route_range_record(
+        &self,
+        shard: &ServiceShardKey,
+        key: &[u8],
+    ) -> anyhow::Result<Option<ReplicatedRangeDescriptor>> {
+        MetadataRpc::route_range_record(self, shard, key).await
+    }
+}
+
+#[async_trait]
+impl crate::RangeControlTransportService for RangeControlRpc {
+    async fn bootstrap_range_action(
+        &self,
+        descriptor: ReplicatedRangeDescriptor,
+    ) -> anyhow::Result<String> {
+        RangeControlRpc::bootstrap_range_action(self, descriptor).await
+    }
+
+    async fn change_replicas_action(
+        &self,
+        range_id: &str,
+        voters: Vec<NodeId>,
+        learners: Vec<NodeId>,
+    ) -> anyhow::Result<()> {
+        RangeControlRpc::change_replicas_action(self, range_id, voters, learners).await
+    }
+
+    async fn transfer_leadership_action(
+        &self,
+        range_id: &str,
+        target_node_id: NodeId,
+    ) -> anyhow::Result<()> {
+        RangeControlRpc::transfer_leadership_action(self, range_id, target_node_id).await
+    }
+
+    async fn recover_range_action(
+        &self,
+        range_id: &str,
+        new_leader_node_id: NodeId,
+    ) -> anyhow::Result<()> {
+        RangeControlRpc::recover_range_action(self, range_id, new_leader_node_id).await
+    }
+
+    async fn split_range_action(
+        &self,
+        range_id: &str,
+        split_key: Vec<u8>,
+    ) -> anyhow::Result<(String, String)> {
+        RangeControlRpc::split_range_action(self, range_id, split_key).await
+    }
+
+    async fn merge_ranges_action(
+        &self,
+        left_range_id: &str,
+        right_range_id: &str,
+    ) -> anyhow::Result<String> {
+        RangeControlRpc::merge_ranges_action(self, left_range_id, right_range_id).await
+    }
+
+    async fn drain_range_action(&self, range_id: &str) -> anyhow::Result<()> {
+        RangeControlRpc::drain_range_action(self, range_id).await
+    }
+
+    async fn retire_range_action(&self, range_id: &str) -> anyhow::Result<()> {
+        RangeControlRpc::retire_range_action(self, range_id).await
+    }
+
+    async fn list_zombie_range_snapshots(&self) -> anyhow::Result<Vec<ZombieRangeSnapshot>> {
+        RangeControlRpc::list_zombie_range_snapshots(self).await
     }
 }

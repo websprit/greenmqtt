@@ -8,6 +8,7 @@ members = [
     "crates/greenmqtt-kv-server",
     "crates/greenmqtt-kv-balance",
     "crates/greenmqtt-broker",
+    "crates/greenmqtt-capnp",
     "crates/greenmqtt-proto",
     "crates/greenmqtt-rpc",
     "crates/greenmqtt-sessiondict",
